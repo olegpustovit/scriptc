@@ -26,10 +26,6 @@ process.env.SCRIPTC_RUNTIME_PACK_CONFIG = JSON.stringify({
   },
   targetArgs: ["-target", "x86_64-linux-musl"],
   compileFlags: ["-ffunction-sections", "-fdata-sections"],
-  // scr_unwind_raise: Zig's libunwind.
-  systemLibraries: [
-    { name: "m", predicate: true },
-    { name: "unwind", predicate: true },
-  ],
+  systemLibraries: [{ name: "m", predicate: true }],
 });
 await import("../../runtime-pack-common/scripts/build.mjs");

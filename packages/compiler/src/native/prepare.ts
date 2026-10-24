@@ -408,7 +408,6 @@ export function prepareNativeExecutable(
           pointerBits: toolchain.target.pointerBits,
           wasi: toolchain.target.platform === "wasi",
           runtimeAbiMarker: outputKind === "obj" || outputKind === "exe",
-          unwindAbi: outputKind === "exe" && toolchain.target.platform === "linux",
           objectAudit: options.sanitize === true,
           lowRegion: lowRegionTarget(toolchain.target.platform, options.sanitize === true),
           functionWorkers: emitWorkers(),

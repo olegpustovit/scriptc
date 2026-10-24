@@ -1,6 +1,0 @@
-{
-  "entry": "workloads/throw-chains.ts",
-  "args": [
-    "1"
-  ]
-}
