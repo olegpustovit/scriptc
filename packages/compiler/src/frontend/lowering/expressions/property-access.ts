@@ -759,6 +759,13 @@ export function lowerPropertyAccessExpr(
       }
     }
   }
+  // Replacing `module.exports` leaves `exports` on its original object.
+  // Check before export-global lookup: the checker may give this read the
+  // replacement's member symbol, despite the objects being different.
+  {
+    const ex = lowerReplacedExportsRead(lowerer, expr);
+    if (ex) return ex;
+  }
   // `module.exports.Sub` / `exports.Sub` READ in the same module: an
   // EXPRESSION-valued member rides its pre-registered export global —
   // exactly what requirers see through `require('./x').Sub`, and the
@@ -804,18 +811,6 @@ export function lowerPropertyAccessExpr(
       const t = ambientUndefReadType(lowerer, expr);
       if (t) return nsUndefRead(lowerer, ambientRoot.text, expr, t);
     }
-  }
-  // `exports.<name>` READS in a module whose export object was
-  // REPLACED (`module.exports = ...`): `exports` still references the
-  // ORIGINAL object — Node's aliasing rule — so when nothing ever
-  // attached this name to it (`exports.<name> =` nowhere in the
-  // file), the honest answer is undefined. tsc types the read off the
-  // REPLACEMENT (its CJS model is identity-blind), which is exactly
-  // the undiagnosed divergence this lowering closes. Reads in modules with
-  // real `exports.<name> =` attachments keep their fences.
-  {
-    const ex = lowerReplacedExportsRead(lowerer, expr);
-    if (ex) return ex;
   }
   // `this.<name>` inside a CJS export-table getter: Node binds the
   // receiver to module.exports — the read is the sibling getter's
@@ -2541,8 +2536,8 @@ function runtimeOptionalClassField(
  * file: the read observes the ORIGINAL (empty-here) exports object, so
  * the honest value is undefined (Node's object identity exactly; tsc's
  * CJS model types the read off the replacement — identity-blind). Null
- * everywhere else: no replacement, a real attachment of this name, a
- * shadowing binding named `exports`, or write position. */
+ * everywhere else: no replacement, a rebinding of `exports`, a real
+ * attachment of this name, a shadowing binding, or write position. */
 function lowerReplacedExportsRead(
   lowerer: Lowerer,
   expr: ts.PropertyAccessExpression,
@@ -2565,7 +2560,11 @@ function lowerReplacedExportsRead(
   for (const stmt of sf.statements.nodes) {
     const cjs = cjsExportAssignmentOf(stmt);
     if (!cjs) continue;
-    if (cjs.kind === "table" && cjsExportDiscardReason(stmt) === null) replaced = true;
+    if (cjs.kind === "table" && cjsExportDiscardReason(stmt) === null) {
+      // `exports = module.exports = value` updates both bindings.
+      if (cjs.rebindsExports) return null;
+      replaced = true;
+    }
     if (cjs.kind === "member" && ts.isIdentifier(cjs.name) && cjs.name.text === expr.name.text) {
       return null; // a real attachment of this name exists somewhere
     }

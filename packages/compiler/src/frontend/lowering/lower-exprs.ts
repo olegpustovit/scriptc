@@ -30,6 +30,7 @@ import {
   F64,
   type IrExpr,
   type IrFunction,
+  type IrGlobal,
   type IrLocal,
   type IrRecordShape,
   type IrStmt,
@@ -51,9 +52,12 @@ import {
   cjsExportAssignmentOf,
   cjsExportDiscardReason,
   cjsExportTargetLiteral,
+  isCjsJsFile,
   isJsSourceFile,
   locOf,
+  orderedImportsOf,
 } from "../program.js";
+import { cjsExportChangesAfterInit } from "./cjs-inline-require.js";
 import { npmStaticLexerVisibleNames } from "../npm-static.js";
 import {
   type CompoundOp,
@@ -2520,20 +2524,93 @@ export function cjsAccessorSnapshotOf(
   if (hit !== undefined) return hit;
   if (!lexerVisibleAccessors(ts.getSourceFileOfNode(getter)).includes(getter)) return null;
   const call = cjsAccessorCall(lowerer, getter, locOf(getter));
-  if (call === null) return null;
-  const at = locOf(getter);
+  return call === null ? null : cjsLinkSnapshot(lowerer, getter, call.type);
+}
+
+function cjsLinkSnapshot(
+  lowerer: Lowerer,
+  decl: ts.Node,
+  type: IrType,
+): { id: string; type: IrType } {
+  const hit = lowerer.cjsAccessorSnapshots.get(decl);
+  if (hit !== undefined) return hit;
+  const at = locOf(decl);
   const snapshot = {
     id: keyedHelperName(lowerer, "%g.cjsSnapshot", `${at.file}:${at.start}:${at.end}`),
-    type: call.type,
+    type,
   };
-  lowerer.globalsList.push({
-    id: snapshot.id,
-    name: "%cjsSnapshot",
-    type: call.type,
-    mutable: true,
-  });
-  lowerer.cjsAccessorSnapshots.set(getter, snapshot);
+  lowerer.globalsList.push({ id: snapshot.id, name: "%cjsSnapshot", type, mutable: true });
+  lowerer.cjsAccessorSnapshots.set(decl, snapshot);
   return snapshot;
+}
+
+/** The export global and link-time snapshot of a CommonJS data export
+ * that can change after its module initialized. ES-module import bindings
+ * keep the value Node copied at link; stable exports alias the global. */
+function cjsLinkedDataExport(
+  lowerer: Lowerer,
+  symbol: ts.Symbol,
+): { global: IrGlobal; snapshot: { id: string; type: IrType } } | null {
+  const decl = symbol.declarations[0];
+  const global = lowerer.globalsBySymbol.get(symbol);
+  if (
+    decl === undefined ||
+    global === undefined ||
+    !isCjsJsFile(ts.getSourceFileOfNode(decl), lowerer.program) ||
+    symbol.declarations.some(ts.isGetAccessorDeclaration) ||
+    !cjsExportChangesAfterInit(lowerer, symbol)
+  )
+    return null;
+  return { global, snapshot: cjsLinkSnapshot(lowerer, decl, global.type) };
+}
+
+/** The snapshot an ES-module import binding of a changing CommonJS data
+ * export reads, or null when the binding aliases live storage. */
+export function cjsImportedDataSnapshotOf(
+  lowerer: Lowerer,
+  ident: ts.Identifier,
+): { id: string; type: IrType } | null {
+  const raw = lowerer.checker.getSymbolAtLocation(ident);
+  const binding = raw?.declarations[0];
+  if (
+    raw === undefined ||
+    binding === undefined ||
+    !(ts.isImportSpecifier(binding) || ts.isExportSpecifier(binding)) ||
+    isCjsJsFile(ts.getSourceFileOfNode(binding), lowerer.program)
+  )
+    return null;
+  return cjsLinkedDataExport(lowerer, lowerer.checker.getAliasedSymbol(raw))?.snapshot ?? null;
+}
+
+/** Per CommonJS module, the export names ES-module importers bind by name
+ * (`import { n }`, `export { n } from`); null for `export *`, which binds
+ * them all. Only those bindings read link-time copies. */
+function esmBoundNamesOf(lowerer: Lowerer, dep: ts.SourceFile): ReadonlySet<string> | null {
+  if (lowerer.cjsEsmBoundNames === null) {
+    const bound = new Map<ts.SourceFile, Set<string> | null>();
+    for (const sf of lowerer.fileTag.keys()) {
+      if (sf.isDeclarationFile || isCjsJsFile(sf, lowerer.program)) continue;
+      for (const { stmt, dep: target } of orderedImportsOf(lowerer.program, sf)) {
+        if (target === null || !isCjsJsFile(target, lowerer.program)) continue;
+        const clause = ts.isImportDeclaration(stmt)
+          ? stmt.importClause?.namedBindings
+          : ts.isExportDeclaration(stmt)
+            ? stmt.exportClause
+            : undefined;
+        if (clause === undefined && ts.isImportDeclaration(stmt)) continue;
+        if (clause === undefined || !(ts.isNamedImports(clause) || ts.isNamedExports(clause))) {
+          bound.set(target, null);
+          continue;
+        }
+        let names = bound.get(target);
+        if (names === null) continue;
+        if (names === undefined) bound.set(target, (names = new Set()));
+        for (const e of clause.elements.nodes) names.add((e.propertyName ?? e.name).text);
+      }
+    }
+    lowerer.cjsEsmBoundNames = bound;
+  }
+  return lowerer.cjsEsmBoundNames.get(dep) ?? new Set();
 }
 
 /** Node's ES-module loader reads every lexer-visible export of a CommonJS
@@ -2547,7 +2624,20 @@ export function cjsAccessorSnapshotStores(
   loc: SrcLoc,
 ): IrStmt[] {
   const getters = lexerVisibleAccessors(dep);
-  if (getters.length === 0) return [];
+  const moduleSym = lowerer.checker.getSymbolAtLocation(dep);
+  const bound = esmBoundNamesOf(lowerer, dep);
+  const data = (moduleSym ? lowerer.checker.getExportsOfModule(moduleSym) : []).flatMap(
+    (exported) => {
+      if (bound !== null && !bound.has(ts.symbolName(exported))) return [];
+      const symbol =
+        exported.flags & ts.SymbolFlags.Alias
+          ? lowerer.checker.getAliasedSymbol(exported)
+          : exported;
+      const linked = cjsLinkedDataExport(lowerer, symbol);
+      return linked === null ? [] : [linked];
+    },
+  );
+  if (getters.length === 0 && data.length === 0) return [];
   let readyId = lowerer.cjsSnapshotReady.get(dep);
   if (readyId === undefined) {
     readyId = keyedHelperName(lowerer, "%g.cjsSnapshotReady", dep.fileName);
@@ -2567,6 +2657,14 @@ export function cjsAccessorSnapshotStores(
     const call = cjsAccessorCall(lowerer, getter, loc);
     if (snapshot === null || call === null) return [];
     stores.push({ kind: "assign", localId: snapshot.id, value: call, loc });
+  }
+  for (const { global, snapshot } of data) {
+    stores.push({
+      kind: "assign",
+      localId: snapshot.id,
+      value: varRef(global.id, global.type, loc),
+      loc,
+    });
   }
   return [
     {
