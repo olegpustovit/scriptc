@@ -1859,6 +1859,8 @@ class Analyzer {
         if (!forwarding) fn.usesArguments = true;
         const arr = this.syntheticArray(id, "arguments");
         for (const p of fn.params) this.edge(p, this.element(arr));
+        // Arguments past the declared parameters are not tracked.
+        this.add(this.element(arr), this.top);
         return this.constNode(arr);
       }
     }
