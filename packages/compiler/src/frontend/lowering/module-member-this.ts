@@ -284,9 +284,9 @@ function readsOwnThis(lowerer: Lowerer, fn: ts.Node): boolean {
   return !ts.isArrowFunction(fn) && !ignoresOwnThis(lowerer, fn, noBindings, 0);
 }
 
-/** Whether an exported callable ignores the receiver supplied by a member
- * call. Inline requires and module bindings share the same function and
- * lexical-this analysis. */
+/** Whether an exported callable provably ignores the receiver supplied by
+ * a member call: the proof behind inline `require(...).f()` and
+ * `exports.f()` calls (cjsExportCallIgnoresThis). */
 export function moduleExportIgnoresThis(
   lowerer: Lowerer,
   value: ts.Expression | ts.FunctionDeclaration | ts.MethodDeclaration,
