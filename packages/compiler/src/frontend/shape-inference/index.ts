@@ -66,6 +66,7 @@ export function shapeOverlayAnnotationCount(): number {
 }
 
 export function resetShapeOverlay(): void {
+  renderedFiles = new Set();
   staticRewriteFiles = new Set();
   staticObjectStats = {
     classes: 0,
@@ -109,7 +110,7 @@ export function beginShapeOverlayBuild(): void {
 /** Whether the current load has overlay files or structural rewrites. */
 export function shapeOverlayActive(): boolean {
   const { classes, functions } = staticObjectStats;
-  return overlayFiles.size > 0 || classes + functions > 0;
+  return overlayFiles.size > 0 || renderedFiles.size > 0 || classes + functions > 0;
 }
 
 /** The overlay's answer to refused lowering diagnostics: it excludes what
@@ -127,7 +128,7 @@ export function excludeRefusedOverlay(
   level: "annotations" | "files" | "all" | "fences",
 ): boolean {
   if (overlayDropped) return false;
-  const files = new Set(overlayFiles);
+  const files = new Set([...overlayFiles, ...renderedFiles]);
   // Files with structural rewrites only also count as overlay files.
   for (const f of staticRewriteFiles) files.add(f);
   if (level === "all") {
@@ -166,6 +167,8 @@ export function excludeRefusedOverlay(
 }
 
 let staticRewriteFiles: ReadonlySet<string> = new Set();
+/** Every file the typed round rewrote (typed or only neutralized). */
+let renderedFiles: ReadonlySet<string> = new Set();
 
 function overlayExclusions(): OverlayExclusions {
   return exclusions;
@@ -270,7 +273,8 @@ export function shapeOverlayer(
     });
   }
   const overlay = renderShapeOverlay(entry.plan, overlayExclusions());
-  overlayFiles = new Set(overlay.files.keys());
+  overlayFiles = new Set(overlay.typed);
+  renderedFiles = new Set(overlay.files.keys());
   overlayAnnotations = overlay.annotations;
   overlayDeadBranches = overlay.deadBranches;
   if (process.env["SCRIPTC_DEBUG_SHAPE_OVERLAY"] !== undefined) {

@@ -28,6 +28,9 @@ export interface ShapeOverlay {
   readonly annotations: number;
   /** Branches the analysis proved unreachable, replaced by checks. */
   readonly deadBranches: number;
+  /** The files with annotations or dead-branch checks (the others only
+   * have their package JSDoc neutralized). */
+  readonly typed: ReadonlySet<string>;
 }
 
 interface Edit {
@@ -614,7 +617,12 @@ export function planShapeOverlay(
       edits.length = 0;
       edits.push(...kept);
     }
-    if (edits.length === 0) continue;
+    // A package file without annotations still has its JSDoc type tags
+    // neutralized: package JSDoc is a hint, and a documented type that the
+    // package's own data contradicts (ms documents `@return {String|Number}`
+    // and returns undefined) would throw once the values reaching it are
+    // typed by the overlay.
+    if (edits.length === 0 && !(isPackageFile(sf.fileName) && hasDocTypeTags(sf.text))) continue;
     parts.set(sf.fileName, { text: sf.text, edits, suffix: typedefText.join(""), docRanges });
   }
   // Type aliases other files name these files' classes through.
@@ -643,6 +651,7 @@ export function renderShapeOverlay(
   exclusions: OverlayExclusions = NO_EXCLUSIONS,
 ): ShapeOverlay {
   const files = new Map<string, string>();
+  const typed = new Set<string>();
   let annotations = 0;
   let deadBranches = 0;
   for (const [file, part] of plan.parts) {
@@ -654,13 +663,18 @@ export function renderShapeOverlay(
       else annotations++;
     }
     if (edits.length === 0 && part.suffix === "") continue;
-    let text = part.text;
-    for (const r of part.docRanges)
-      if (dropped?.has(r.id) !== true)
-        text = text.slice(0, r.lo) + neutralizeDocTags(text.slice(r.lo, r.hi)) + text.slice(r.hi);
-    files.set(file, applyEdits(text, edits) + part.suffix);
+    files.set(file, neutralizeDocTags(applyEdits(part.text, edits)) + part.suffix);
+    if (edits.some((e) => e.id !== undefined)) typed.add(file);
   }
-  return { files, annotations, deadBranches };
+  return { files, typed, annotations, deadBranches };
+}
+
+function isPackageFile(fileName: string): boolean {
+  return fileName.includes("/node_modules/");
+}
+
+function hasDocTypeTags(text: string): boolean {
+  return /@(param|type|typedef|returns?|template|this|callback|property|prop|enum)\b/.test(text);
 }
 
 /** The `typeof` results the values can have. */
