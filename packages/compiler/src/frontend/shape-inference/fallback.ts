@@ -16,9 +16,7 @@
  * overlay of every file involved, then the whole overlay for the build. */
 import * as ts from "../ts7/adapter.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
-import { OVERLAY_DOC_MARK, OVERLAY_MARK, overlayAnnotationIds } from "./overlay.js";
-
-const DOC_MARKS = /@scriptcDoc #\d+/g;
+import { OVERLAY_MARK, overlayAnnotationIds } from "./overlay.js";
 
 export interface OverlayAttribution {
   /** Annotation ids per overlay file. */
@@ -61,18 +59,12 @@ export function attributeOverlayRefusals(
     set.add(id);
     addFile(file);
   };
-  // The ids in the trivia before a node (where the overlay writes them):
-  // its annotations, and for failing refusals the neutralized package
-  // JSDoc, which the next load restores (a declaration the lowering refuses
-  // without its documented types compiles as it does without the overlay).
+  // The ids in the trivia before a node (where the overlay writes them).
   const marksOf = (node: ts.Node): number[] => {
     const sf = node.getSourceFile();
     if (!overlayFiles.has(sf.fileName)) return [];
     const trivia = sf.text.slice(node.pos, ts.tokenStartOfNode(node));
-    if (!trivia.includes(OVERLAY_MARK) && !(wholeFunctions && trivia.includes(OVERLAY_DOC_MARK)))
-      return [];
-    const ids = overlayAnnotationIds(wholeFunctions ? trivia : trivia.replace(DOC_MARKS, ""));
-    return ids;
+    return trivia.includes(OVERLAY_MARK) ? overlayAnnotationIds(trivia) : [];
   };
   const blameNode = (node: ts.Node): boolean => {
     const ids = marksOf(node);
@@ -243,7 +235,7 @@ function visitReturns(body: ts.Node, f: (e: ts.Expression) => void): void {
 }
 
 /** The innermost node whose token span covers [start, end). */
-function innermostNodeAt(sf: ts.SourceFile, start: number, end: number): ts.Node {
+export function innermostNodeAt(sf: ts.SourceFile, start: number, end: number): ts.Node {
   let node: ts.Node = sf;
   for (;;) {
     let next: ts.Node | undefined;

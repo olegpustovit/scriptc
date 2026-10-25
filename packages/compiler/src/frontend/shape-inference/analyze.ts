@@ -634,6 +634,15 @@ class Analyzer {
    * key may be absent when read (flow-insensitively, before its write). */
   private readonly literalOwnKeys = new Map<Atom, ReadonlySet<string>>();
   private readonly protoReads = new Set<string>();
+  /** Arrays whose elements an index read inside its bounds may still miss:
+   * shrunk (pop, shift, splice, a length write), holey (`new Array(n)`, a
+   * delete, a store at an index that is not proven in bounds or the end). */
+  private readonly unsafeArrays = new Set<Atom>();
+  /** Index reads proven in bounds by their loop (`for (let i = 0; i <
+   * a.length; i++) a[i]`): undefined joins them only if the array turns
+   * out unsafe (finish). */
+  private readonly guardedIndexReads: { recv: Atom; dst: number; done: boolean }[] = [];
+  private readonly boundsMemo = new Map<Node, boolean>();
   dictProto(d: Atom): number {
     let id = this.dictProtos.get(d);
     if (id === undefined) this.dictProtos.set(d, (id = this.newNode()));
@@ -1613,6 +1622,13 @@ class Analyzer {
   varDecl(d: ts.VariableDeclaration): void {
     const b = this.binding(d);
     if (d.initializer !== undefined) this.edge(this.expr(d.initializer), b);
+    else {
+      // `let x;` holds undefined until it is assigned (a for-in/for-of
+      // binding gets its values from the loop).
+      const loop = d.parent?.parent;
+      if (loop === undefined || !(ts.isForOfStatement(loop) || ts.isForInStatement(loop)))
+        this.add(b, this.prim("undefined"));
+    }
     this.bindPattern(d.name, b);
   }
 
@@ -1803,15 +1819,19 @@ class Analyzer {
     }
     if (ts.isPrefixUnaryExpression(e) || ts.isPostfixUnaryExpression(e)) {
       const operand = e.operand;
-      this.expr(operand);
+      const value = this.expr(operand);
+      if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.ExclamationToken)
+        return this.constNode(this.prim("boolean"));
+      // `+x` is a number (a bigint throws); `-x`, `~x`, `++`/`--` keep a bigint.
+      if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.PlusToken)
+        return this.constNode(this.prim("number"));
+      const result = this.numericResult([value]);
       if (
         e.operator === ts.SyntaxKind.PlusPlusToken ||
         e.operator === ts.SyntaxKind.MinusMinusToken
       )
-        this.assignTo(operand, this.constNode(this.prim("number")));
-      if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.ExclamationToken)
-        return this.constNode(this.prim("boolean"));
-      return this.constNode(this.prim("number"));
+        this.assignTo(operand, result);
+      return result;
     }
     if (ts.isSpreadElement(e)) return this.expr(e.expression);
     if (ts.isTaggedTemplateExpression(e)) return this.taggedTemplate(e);
@@ -2343,16 +2363,11 @@ class Analyzer {
       return n;
     }
     if (op >= ts.SyntaxKind.FirstCompoundAssignment && op <= ts.SyntaxKind.LastCompoundAssignment) {
-      this.expr(e.left);
-      this.expr(e.right);
-      const result = this.constNode(
-        op === ts.SyntaxKind.PlusEqualsToken ? this.top : this.prim("number"),
-      );
-      if (op === ts.SyntaxKind.PlusEqualsToken) {
-        this.nodes[result]!.atoms.clear();
-        this.add(result, this.prim("string"));
-        this.add(result, this.prim("number"));
-      }
+      const lv = this.expr(e.left);
+      const rv = this.expr(e.right);
+      // Arithmetic on bigints answers bigints; `+=` may also concatenate.
+      const result = this.numericResult([lv, rv]);
+      if (op === ts.SyntaxKind.PlusEqualsToken) this.add(result, this.prim("string"));
       this.assignTo(e.left, result);
       return result;
     }
@@ -2399,13 +2414,15 @@ class Analyzer {
           )
             this.add(n, this.prim("number"));
           if (a.kind === "top") this.add(n, this.prim("number"));
+          if (a.kind === "top" || (a.kind === "prim" && a.label === "bigint"))
+            this.add(n, this.prim("bigint"));
         };
         this.on(l, strOrNum);
         this.on(r, strOrNum);
         return n;
       }
       default:
-        return this.constNode(this.prim("number"));
+        return this.numericResult([l, r]);
     }
   }
 
@@ -2579,8 +2596,7 @@ class Analyzer {
         else if (/^\d+$/.test(name)) {
           this.edge(this.element(a), dst);
           this.add(dst, this.prim("undefined"));
-        }
-        else {
+        } else {
           // A named property, written by name or under an unknown key; an own field shadows a method.
           if (ARRAY_METHODS.has(name)) {
             this.add(dst, this.builtin(`array.${name}`, a));
@@ -2721,6 +2737,7 @@ class Analyzer {
           this.edge(value, this.field(a, name));
           return;
         case "array":
+          if (/^\d+$/.test(name) || name === "length") this.unsafeArrays.add(a);
           if (/^\d+$/.test(name)) this.edge(value, this.element(a));
           else if (name !== "length") this.edge(value, this.field(a, name));
           return;
@@ -2739,9 +2756,11 @@ class Analyzer {
           this.add(dst, this.top);
           return;
         case "array":
-          // An index past the end (or a hole) reads undefined.
+          // An index past the end (or a hole) reads undefined, unless the
+          // loop proves the index in bounds of an array without holes.
           this.edge(this.element(a), dst);
-          this.add(dst, this.prim("undefined"));
+          if (this.indexInBounds(site)) this.guardedIndexReads.push({ recv: a, dst, done: false });
+          else this.add(dst, this.prim("undefined"));
           return;
         case "collection":
           this.edge(this.element(a), dst);
@@ -2749,7 +2768,7 @@ class Analyzer {
         case "prim":
           if (a.label === "string") {
             this.add(dst, this.prim("string"));
-            this.add(dst, this.prim("undefined"));
+            if (!this.indexInBounds(site)) this.add(dst, this.prim("undefined"));
           }
           return;
         case "object":
@@ -2791,6 +2810,7 @@ class Analyzer {
           // An index, or a named property under an unknown key.
           this.edge(value, this.element(a));
           this.edge(value, this.anyField(a));
+          if (!this.indexInBounds(site) && !isAppendIndex(site)) this.unsafeArrays.add(a);
           return;
         case "prim":
           return;
@@ -3030,6 +3050,8 @@ class Analyzer {
         case "builtin":
           this.constructBuiltin(a.path ?? "", args, dst, e);
           return;
+        case "prim":
+          return; // `new` of a primitive throws
         default:
           for (const x of args) this.sink(x, `argument of ⊤ constructor at ${locLabel(e)}`);
           this.add(dst, this.top);
@@ -3086,7 +3108,10 @@ class Analyzer {
         this.add(dst, this.builtin("RegExp.instance"));
         return;
       case "Array": {
-        this.add(dst, this.syntheticArray(site, "Array"));
+        const arr = this.syntheticArray(site, "Array");
+        // `new Array(n)` has holes.
+        this.unsafeArrays.add(arr);
+        this.add(dst, arr);
         return;
       }
       case "Proxy":
@@ -3152,6 +3177,7 @@ class Analyzer {
           case "pop":
           case "shift":
           case "at":
+            if (method !== "at") this.unsafeArrays.add(recv);
             this.edge(el, dst);
             this.add(dst, this.prim("undefined"));
             return;
@@ -3204,6 +3230,7 @@ class Analyzer {
           case "toSorted":
           case "toReversed":
           case "flat": {
+            if (method === "splice") this.unsafeArrays.add(recv);
             if (method === "filter") callback(0, [el, num, recvN], null);
             if (method === "sort" || method === "toSorted") callback(0, [el, el], null);
             if (method === "reverse" || method === "sort") {
@@ -3666,11 +3693,184 @@ class Analyzer {
     escapeAll();
   }
 
+  /** Whether an index access `x[i]` reads inside the bounds of `x` on
+   * every evaluation: an enclosing `for (let i = <n ≥ 0>; i < x.length;
+   * i++ | ++i | i += <n > 0>)` whose body assigns neither `i` nor `x`.
+   * (The array's own length may still shrink or have holes: unsafeArrays.) */
+  indexInBounds(site: Node): boolean {
+    if (!ts.isElementAccessExpression(site) || site.questionDotToken !== undefined) return false;
+    const memo = this.boundsMemo.get(site);
+    if (memo !== undefined) return memo;
+    const out = this.indexInBoundsUncached(site);
+    this.boundsMemo.set(site, out);
+    return out;
+  }
+
+  private indexInBoundsUncached(site: ts.ElementAccessExpression): boolean {
+    const obj = unparen(site.expression);
+    const key = unparen(site.argumentExpression);
+    if (!ts.isIdentifier(obj) || !ts.isIdentifier(key)) return false;
+    const objDecl = this.resolve(obj);
+    const keyDecl = this.resolve(key);
+    if (objDecl === undefined || keyDecl === undefined) return false;
+    const names = (id: Node, decl: Node): boolean =>
+      ts.isIdentifier(id) && this.resolve(id) === decl;
+    for (let n: Node | undefined = site.parent; n !== undefined; n = n.parent) {
+      if (ts.isFunctionLike(n) || ts.isSourceFile(n)) return false;
+      if (!ts.isForStatement(n) || n.statement === undefined) continue;
+      if (!(site.pos >= n.statement.pos && site.end <= n.statement.end)) continue;
+      const cond = n.condition !== undefined ? unparen(n.condition) : undefined;
+      if (
+        cond === undefined ||
+        !ts.isBinaryExpression(cond) ||
+        cond.operatorToken.kind !== ts.SyntaxKind.LessThanToken ||
+        !names(unparen(cond.left), keyDecl)
+      )
+        continue;
+      const bound = unparen(cond.right);
+      if (
+        !ts.isPropertyAccessExpression(bound) ||
+        bound.name.text !== "length" ||
+        !names(unparen(bound.expression), objDecl)
+      )
+        continue;
+      // The index starts at a non-negative integer literal ...
+      const init = n.initializer;
+      let start: ts.Expression | undefined;
+      // (declared by the loop, so only the loop's own code can write it)
+      if (
+        init !== undefined &&
+        ts.isVariableDeclarationList(init) &&
+        (init.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0
+      ) {
+        const d = init.declarations.nodes.find((x) => x === keyDecl);
+        start = d !== undefined ? (d as ts.VariableDeclaration).initializer : undefined;
+      }
+      if (start === undefined || !nonNegativeIntegerLiteral(start)) continue;
+      if (!this.neverReassigned(objDecl)) continue;
+      // ... and only grows by integers,
+      const inc = n.incrementor !== undefined ? unparen(n.incrementor) : undefined;
+      const grows =
+        inc !== undefined &&
+        (((ts.isPostfixUnaryExpression(inc) || ts.isPrefixUnaryExpression(inc)) &&
+          inc.operator === ts.SyntaxKind.PlusPlusToken &&
+          names(unparen(inc.operand), keyDecl)) ||
+          (ts.isBinaryExpression(inc) &&
+            inc.operatorToken.kind === ts.SyntaxKind.PlusEqualsToken &&
+            names(unparen(inc.left), keyDecl) &&
+            positiveIntegerLiteral(inc.right)));
+      if (!grows) continue;
+      // ... and the body writes neither the index nor the array binding.
+      let written = false;
+      const visit = (m: Node): void => {
+        if (written) return;
+        if (
+          ts.isBinaryExpression(m) &&
+          m.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+          m.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+          (names(unparen(m.left), keyDecl) || names(unparen(m.left), objDecl))
+        )
+          written = true;
+        else if (
+          (ts.isPostfixUnaryExpression(m) || ts.isPrefixUnaryExpression(m)) &&
+          (m.operator === ts.SyntaxKind.PlusPlusToken ||
+            m.operator === ts.SyntaxKind.MinusMinusToken) &&
+          (names(unparen(m.operand), keyDecl) || names(unparen(m.operand), objDecl))
+        )
+          written = true;
+        ts.forEachChild(m, (c) => {
+          visit(c);
+          return undefined;
+        });
+      };
+      visit(n.statement);
+      if (!written) return true;
+    }
+    return false;
+  }
+
+  private readonly reassignMemo = new Map<Node, boolean>();
+  /** Whether a binding keeps the value it is declared with: a `const`, or a
+   * parameter or variable that no code in its scope assigns. */
+  neverReassigned(decl: Node): boolean {
+    const memo = this.reassignMemo.get(decl);
+    if (memo !== undefined) return memo;
+    let out = false;
+    if (ts.isVariableDeclaration(decl) || ts.isParameter(decl)) {
+      const list = decl.parent;
+      if (
+        ts.isVariableDeclaration(decl) &&
+        list !== undefined &&
+        ts.isVariableDeclarationList(list) &&
+        (list.flags & ts.NodeFlags.Const) !== 0
+      )
+        out = true;
+      else {
+        let scope: Node | undefined = decl.parent;
+        while (scope !== undefined && !ts.isFunctionLike(scope) && !ts.isSourceFile(scope))
+          scope = scope.parent;
+        if (scope !== undefined && ts.isIdentifier((decl as ts.VariableDeclaration).name)) {
+          const text = ((decl as ts.VariableDeclaration).name as ts.Identifier).text;
+          let written = false;
+          const target = (e: ts.Expression): boolean => {
+            const u = unparen(e);
+            return ts.isIdentifier(u) && u.text === text && this.resolve(u) === decl;
+          };
+          const visit = (m: Node): void => {
+            if (written) return;
+            if (
+              (ts.isBinaryExpression(m) &&
+                m.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+                m.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+                target(m.left)) ||
+              ((ts.isPostfixUnaryExpression(m) || ts.isPrefixUnaryExpression(m)) &&
+                (m.operator === ts.SyntaxKind.PlusPlusToken ||
+                  m.operator === ts.SyntaxKind.MinusMinusToken) &&
+                target(m.operand))
+            )
+              written = true;
+            ts.forEachChild(m, (c) => {
+              visit(c);
+              return undefined;
+            });
+          };
+          visit(scope);
+          out = !written;
+        }
+      }
+    }
+    this.reassignMemo.set(decl, out);
+    return out;
+  }
+
+  /** The result of arithmetic over the operands: a number, or a bigint
+   * where an operand may be one. */
+  numericResult(operands: number[]): number {
+    const n = this.newNode();
+    this.add(n, this.prim("number"));
+    for (const o of operands)
+      this.on(o, (a) => {
+        if (a.kind === "top" || (a.kind === "prim" && a.label === "bigint"))
+          this.add(n, this.prim("bigint"));
+      });
+    return n;
+  }
+
   /** Re-run deferred field copies until nothing new flows. */
   finish(): void {
     for (;;) {
       const before = this.steps;
       for (const c of this.lateCopies) c();
+      this.solve();
+      for (const o of this.ops)
+        if (o.kind === "delete" || o.kind === "lengthWrite")
+          for (const a of this.nodes[o.recv]!.atoms)
+            if (a.kind === "array") this.unsafeArrays.add(a);
+      for (const g of this.guardedIndexReads)
+        if (!g.done && this.unsafeArrays.has(g.recv)) {
+          g.done = true;
+          this.add(g.dst, this.prim("undefined"));
+        }
       this.solve();
       // A condition with no values at the fixpoint is one the analysis
       // could not evaluate: walk both of its branches.
@@ -3690,6 +3890,30 @@ class Analyzer {
       if (this.steps === before || this.budgetExceeded) return;
     }
   }
+}
+
+function nonNegativeIntegerLiteral(e: ts.Expression): boolean {
+  const u = unparen(e);
+  return ts.isNumericLiteral(u) && Number.isInteger(Number(u.text)) && Number(u.text) >= 0;
+}
+
+function positiveIntegerLiteral(e: ts.Expression): boolean {
+  const u = unparen(e);
+  return ts.isNumericLiteral(u) && Number.isInteger(Number(u.text)) && Number(u.text) > 0;
+}
+
+/** `x[x.length] = v`: a store at the end, which appends without a hole. */
+function isAppendIndex(site: Node): boolean {
+  if (!ts.isElementAccessExpression(site)) return false;
+  const obj = unparen(site.expression);
+  const key = unparen(site.argumentExpression);
+  return (
+    ts.isIdentifier(obj) &&
+    ts.isPropertyAccessExpression(key) &&
+    key.name.text === "length" &&
+    ts.isIdentifier(unparen(key.expression)) &&
+    (unparen(key.expression) as ts.Identifier).text === obj.text
+  );
 }
 
 /** The export name of a CommonJS export declaration the checker resolves

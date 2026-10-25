@@ -11,8 +11,10 @@
  * meets an inferred type therefore fails only when the analysis is wrong;
  * such checks carry the inferred-fact failure message.
  *
- * The package's own JSDoc is a hint, not a declaration: its tags are
- * neutralized in the rewritten file, so only the analysis's types remain.
+ * The package's own JSDoc is a declaration (maintainer decision
+ * 2026-10-25): it stays as written, and the overlay adds a type only where
+ * the package's JSDoc declares none (a documented parameter, return or
+ * binding keeps its documented type, as in the default build).
  *
  * Every edit is inline: no line breaks are added or removed, so positions
  * keep their lines. */
@@ -28,8 +30,7 @@ export interface ShapeOverlay {
   readonly annotations: number;
   /** Branches the analysis proved unreachable, replaced by checks. */
   readonly deadBranches: number;
-  /** The files with annotations or dead-branch checks (the others only
-   * have their package JSDoc neutralized). */
+  /** The files with annotations or dead-branch checks. */
   readonly typed: ReadonlySet<string>;
 }
 
@@ -54,17 +55,10 @@ interface OverlayPart {
   readonly text: string;
   readonly edits: Edit[];
   readonly suffix: string;
-  /** The package's JSDoc comments with type tags, by id (their position):
-   * each is neutralized (package JSDoc is a hint, not a declaration) unless
-   * the build dropped its id because the lowering refused the declaration
-   * without it. */
-  readonly docs: readonly { lo: number; hi: number }[];
 }
 
 /** Marks the overlay's own comments (an unknown JSDoc tag, ignored). */
 export const OVERLAY_MARK = "@scriptcShape";
-/** Marks a neutralized package JSDoc comment with its id. */
-export const OVERLAY_DOC_MARK = "@scriptcDoc";
 const MARK = OVERLAY_MARK;
 
 /** Above 1, values of several record key sets type as one merged record
@@ -90,11 +84,10 @@ export interface OverlayExclusions {
 
 export const NO_EXCLUSIONS: OverlayExclusions = { annotations: new Map(), files: new Set() };
 
-/** The ids of the overlay annotations (and neutralized package JSDoc
- * comments) in a comment or trivia text. */
+/** The ids of the overlay annotations in a comment or trivia text. */
 export function overlayAnnotationIds(text: string): number[] {
   const ids: number[] = [];
-  for (const m of text.matchAll(/@scriptc(?:Shape|Doc) #(\d+)/g)) ids.push(Number(m[1]));
+  for (const m of text.matchAll(/@scriptcShape #(\d+)/g)) ids.push(Number(m[1]));
   return ids;
 }
 
@@ -150,13 +143,7 @@ export function planShapeOverlay(
       }
     }
   for (const sf of packageFiles) {
-    // The package's JSDoc stays neutralized in a file whose overlay the
-    // build dropped: package JSDoc is a hint, not a declaration.
-    const docs = isPackageFile(sf.fileName) ? docTypeComments(sf) : [];
-    if (exclusions.files.has(sf.fileName)) {
-      if (docs.length > 0) parts.set(sf.fileName, { text: sf.text, edits: [], suffix: "", docs });
-      continue;
-    }
+    if (exclusions.files.has(sf.fileName)) continue;
     const typedefs = new Map<string, string>();
     const typedefText: string[] = [];
     const edits: Edit[] = [];
@@ -288,6 +275,9 @@ export function planShapeOverlay(
       // Arms, not atoms: per-site allocations of one record shape are one
       // typedef.
       if (arms.size > MAX_ARMS) return inner ? "any" : null;
+      // Arithmetic on unknown values may answer a number or a bigint: the
+      // lowering has no useful mixed representation, so those stay untyped.
+      if (arms.has("number") && arms.has("bigint")) return inner ? "any" : null;
       if (arms.has("any")) return inner ? "any" : null;
       return [...arms].join(" | ");
     };
@@ -479,7 +469,11 @@ export function planShapeOverlay(
 
     const paramTags = (fn: ts.FunctionLikeDeclaration): string | null => {
       const tags: string[] = [];
-      if (!ts.isConstructorDeclaration(fn)) {
+      // The package's JSDoc declares types: the overlay adds none where it
+      // has one, and none at all for a signature it types as a whole.
+      const doc = packageDocOf(fn);
+      if (doc.whole) return null;
+      if (!ts.isConstructorDeclaration(fn) && !doc.returns) {
         const ret = returnValues(fn);
         const t = ret !== undefined && ret.size > 0 ? typeOf(ret, false, 0) : null;
         const why = process.env["SCRIPTC_DEBUG_SHAPE_OVERLAY_WHY"];
@@ -510,6 +504,7 @@ export function planShapeOverlay(
         // narrow the typed parameter to never inside the branch, which the
         // lowering refuses: such a parameter stays untyped.
         if (t !== null && typeofTestsOutside(fn, p.name.text, values)) return;
+        if (doc.params.has(p.name.text)) return;
         if (t !== null) tags.push(`@param {${t}} ${p.name.text}`);
       });
       return tags.length > 0 ? tags.join(" ") : null;
@@ -553,7 +548,8 @@ export function planShapeOverlay(
             if (seen.has(name)) continue;
             seen.add(name);
             const t = cls !== undefined ? fieldType(cls, name) : null;
-            if (t !== null) annotate(ts.tokenStartOfNode(st), `@type {${t}}`);
+            if (t !== null && !packageDocOf(st).type)
+              annotate(ts.tokenStartOfNode(st), `@type {${t}}`);
           }
         }
       }
@@ -573,7 +569,8 @@ export function planShapeOverlay(
             process.stderr.write(
               `[shape-overlay-why] ${d.name.text}@${sf.getLineAndCharacterOfPosition(ts.tokenStartOfNode(d)).line + 1}: ${t} <- ${[...analysis.declValues(d)].map((a) => `${a.kind}:${a.label}`).join(" | ")}\n`,
             );
-          if (t !== null) annotate(ts.tokenStartOfNode(node), `@type {${t}}`);
+          if (t !== null && !packageDocOf(node).type)
+            annotate(ts.tokenStartOfNode(node), `@type {${t}}`);
         }
       }
       ts.forEachChild(node, (c) => {
@@ -639,14 +636,8 @@ export function planShapeOverlay(
       edits.length = 0;
       edits.push(...kept);
     }
-    // A package file without annotations still has its JSDoc type tags
-    // neutralized: package JSDoc is a hint, and a documented type that the
-    // package's own data contradicts (ms documents `@return {String|Number}`
-    // and returns undefined) would throw once the values reaching it are
-    // typed by the overlay. Comments inside dead branches go with them.
-    const liveDocs = docs.filter((d) => !ranges.some(([lo, hi]) => d.lo >= lo && d.lo < hi));
-    if (edits.length === 0 && liveDocs.length === 0 && typedefText.length === 0) continue;
-    parts.set(sf.fileName, { text: sf.text, edits, suffix: typedefText.join(""), docs: liveDocs });
+    if (edits.length === 0 && typedefText.length === 0) continue;
+    parts.set(sf.fileName, { text: sf.text, edits, suffix: typedefText.join("") });
   }
   // Type aliases other files name these files' classes through.
   for (const [other, names] of exportedClasses) {
@@ -662,7 +653,6 @@ export function planShapeOverlay(
         text: other.text,
         edits: [],
         suffix: `\n${aliases}`,
-        docs: [],
       });
   }
   return { parts };
@@ -685,21 +675,8 @@ export function renderShapeOverlay(
       if (e.end !== undefined) deadBranches++;
       else annotations++;
     }
-    // Package JSDoc comments are neutralized (and marked with their ids)
-    // unless the build dropped them; a file without annotations is still
-    // rendered when it has such comments.
-    const docEdits: Edit[] = [];
-    for (const d of part.docs) {
-      if (dropped?.has(d.lo) === true) continue;
-      const comment = part.text.slice(d.lo, d.hi);
-      docEdits.push({
-        pos: d.lo,
-        end: d.hi,
-        text: `/** ${OVERLAY_DOC_MARK} #${d.lo}${neutralizeDocTags(comment).slice(3)}`,
-      });
-    }
-    if (edits.length === 0 && docEdits.length === 0 && part.suffix === "") continue;
-    const text = applyEdits(part.text, [...edits, ...docEdits]) + part.suffix;
+    if (edits.length === 0 && part.suffix === "") continue;
+    const text = applyEdits(part.text, edits) + part.suffix;
     files.set(file, text);
     if (edits.some((e) => e.id !== undefined)) typed.add(file);
   }
@@ -747,47 +724,66 @@ function dynHeldSites(analysis: ShapeAnalysis, verdicts: readonly SiteVerdict[])
   return held;
 }
 
-function isPackageFile(fileName: string): boolean {
-  return fileName.includes("/node_modules/");
+interface PackageDoc {
+  /** Documented parameter names. */
+  readonly params: ReadonlySet<string>;
+  readonly returns: boolean;
+  readonly type: boolean;
+  /** A tag that types the whole declaration (`@type`, `@template`,
+   * `@this`, `@overload`, `@callback`). */
+  readonly whole: boolean;
 }
 
-const DOC_TYPE_TAGS =
-  /@(param|type|typedef|returns?|template|this|callback|property|prop|arg|argument|enum|implements|extends|augments|satisfies|overload|import)\b/g;
-
-/** The JSDoc comments of a file that carry type tags: those in the leading
- * trivia of its nodes (trivia holds only whitespace and comments, so a
- * `/**` inside a string or template is never taken for one). */
-function docTypeComments(sf: ts.SourceFile): { lo: number; hi: number }[] {
-  const text = sf.text;
-  const seen = new Set<number>();
-  const found = new Set<number>();
-  const out: { lo: number; hi: number }[] = [];
-  const take = (base: number, trivia: string): void => {
-    for (const m of trivia.matchAll(/\/\*\*[\s\S]*?\*\//g)) {
-      DOC_TYPE_TAGS.lastIndex = 0;
-      if (m[0].includes(MARK) || !DOC_TYPE_TAGS.test(m[0])) continue;
-      const lo = base + m.index;
-      if (found.has(lo)) continue;
-      found.add(lo);
-      out.push({ lo, hi: lo + m[0].length });
+/** The type tags of the package's own JSDoc for a declaration: in its
+ * leading trivia and in that of the statement or property holding it
+ * (`/** … *\/ const f = function (…) {}`, `exports.f = function …`). */
+function packageDocOf(node: ts.Node): PackageDoc {
+  let text = "";
+  for (let n: ts.Node | undefined = node; n !== undefined; n = n.parent) {
+    const sf = n.getSourceFile();
+    for (const m of sf.text.slice(n.pos, ts.tokenStartOfNode(n)).matchAll(/\/\*\*[\s\S]*?\*\//g))
+      if (!m[0].includes(MARK)) text += m[0];
+    const p: ts.Node | undefined = n.parent;
+    if (
+      p === undefined ||
+      !(
+        ts.isVariableDeclaration(p) ||
+        ts.isVariableDeclarationList(p) ||
+        ts.isVariableStatement(p) ||
+        ts.isPropertyAssignment(p) ||
+        ts.isParenthesizedExpression(p) ||
+        ts.isExpressionStatement(p) ||
+        ts.isExportAssignment(p) ||
+        (ts.isBinaryExpression(p) &&
+          p.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+          p.right === n)
+      )
+    )
+      break;
+  }
+  const params = new Set<string>();
+  for (const m of text.matchAll(/@(?:param|arg|argument)\b/g)) {
+    let i = m.index + m[0].length;
+    while (i < text.length && /\s/.test(text[i]!)) i++;
+    if (text[i] === "{") {
+      let depth = 0;
+      for (; i < text.length; i++) {
+        if (text[i] === "{") depth++;
+        else if (text[i] === "}" && --depth === 0) {
+          i++;
+          break;
+        }
+      }
     }
+    const name = /^\s*\[?\s*([A-Za-z_$][\w$]*)/.exec(text.slice(i));
+    if (name !== null) params.add(name[1]!);
+  }
+  return {
+    params,
+    returns: /@returns?\b/.test(text),
+    type: /@type\b/.test(text),
+    whole: /@(?:type|template|this|overload|callback)\b/.test(text),
   };
-  const visit = (node: ts.Node): void => {
-    const start = ts.tokenStartOfNode(node);
-    if (start > node.pos && !seen.has(node.pos)) {
-      seen.add(node.pos);
-      take(node.pos, text.slice(node.pos, start));
-    }
-    ts.forEachChild(node, (c) => {
-      visit(c);
-      return undefined;
-    });
-  };
-  visit(sf);
-  // The trivia after the last statement.
-  const tailStart = sf.statements.nodes.at(-1)?.end ?? 0;
-  take(tailStart, text.slice(tailStart));
-  return out.sort((a, b) => a.lo - b.lo);
 }
 
 /** The `typeof` results the values can have. */
@@ -870,19 +866,6 @@ function applyEdits(text: string, edits: readonly Edit[]): string {
     at = e.end ?? e.pos;
   }
   return out + text.slice(at);
-}
-
-/** The package's JSDoc type tags become plain text: package JSDoc is a
- * hint, not a declaration. The overlay's own comments carry MARK and are
- * kept. Lengths are unchanged. */
-export function neutralizeDocTags(text: string): string {
-  return text.replace(/\/\*\*[\s\S]*?\*\//g, (comment) => {
-    if (comment.includes(MARK)) return comment;
-    return comment.replace(
-      /@(param|type|typedef|returns?|template|this|callback|property|prop|arg|argument|enum|implements|extends|augments|satisfies|overload|import)\b/g,
-      "-$1",
-    );
-  });
 }
 
 /** A record site's keys: its static keys, or for a literal with spreads its

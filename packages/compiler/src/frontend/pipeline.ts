@@ -4,10 +4,12 @@ import {
   beginShapeOverlayBuild,
   excludeRefusedOverlay,
   restoreShapeOverlayState,
+  setShapeOverlayDropped,
   shapeOverlayActive,
   shapeOverlayReport,
 } from "./shape-inference/index.js";
 import type { ScrDiagnostic } from "../diagnostics/diagnostic.js";
+import type { IrModule } from "../ir/ir.js";
 import type { SrcLoc } from "../ir/ir.js";
 import type { NpmStaticStatus } from "../coverage/report.js";
 import { entryFunctionExports, type EntryExportInfo } from "./lib-exports.js";
@@ -105,7 +107,9 @@ export interface Frontend {
    * dispose — it reads the ts7 AST). */
   entryContract: () => ContractFacts;
   sourceTexts: () => Map<string, string>;
-  lower: (opts: LowerOptions) => LowerResult;
+  /** `valid`: the caller's IR validation; a module it rejects with the
+   * shape overlay on is lowered again without the overlay. */
+  lower: (opts: LowerOptions, valid?: (module: IrModule) => boolean) => LowerResult;
   /** Each requested or detected package's native compilation outcome,
    * including the first refusal reason for ineligible packages. */
   npmStatic: NpmStaticStatus[];
@@ -536,6 +540,32 @@ function loadFrontend(
   // and library builds with a package-specific diagnostic.
   let load = reusableScout ?? loadProgram(entryPath, { npmStatic: requested, externalTypes });
   let preflight = reusablePreflight ?? checkPreflight(load);
+  // Shape inference never makes the preflight fail: when the overlay's
+  // program reports diagnostics the program without it does not (its type
+  // references can load package files the program would not), the build
+  // continues without the overlay.
+  if (preflight.length > 0 && load.shapeOverlayState !== undefined) {
+    restoreShapeOverlayState(load.shapeOverlayState);
+    if (shapeOverlayActive()) {
+      const key = (d: ScrDiagnostic): string => `${d.code}|${d.loc.file}|${d.loc.start}`;
+      setShapeOverlayDropped(true);
+      const plain = loadProgram(entryPath, { npmStatic: requested, externalTypes });
+      const plainPreflight = checkPreflight(plain);
+      const known = new Set(plainPreflight.map(key));
+      if (preflight.some((d) => !known.has(key(d)))) {
+        load.dispose();
+        load = plain;
+        preflight = plainPreflight;
+        if (process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] !== undefined)
+          process.stderr.write(
+            `[shape-fallback] preflight: the overlay's program failed; overlay off\n`,
+          );
+      } else {
+        plain.dispose();
+        setShapeOverlayDropped(false);
+      }
+    }
+  }
   // Library mode's fixpoint: the opted-in packages' files joined the
   // program just now, and THEIR bare edges (import statements and
   // top-level requires) name packages the scout could not see. Judge each
@@ -700,21 +730,21 @@ function loadFrontend(
           ...finalLoad.program.getImplementationSourceFiles().filter((sf) => !sf.isDeclarationFile),
         ].map((sf) => [sf.fileName, sf.text]),
       ),
-    lower: (opts) => {
-      const lowerOnce = (): LowerResult => {
-        if (finalLoad.shapeOverlayState !== undefined)
-          restoreShapeOverlayState(finalLoad.shapeOverlayState);
-        return lowerToIr(finalLoad.program, finalLoad.entry, finalLoad.moduleOrder, {
+    lower: (opts, valid) => {
+      const lowerLoad = (l: typeof finalLoad): LowerResult => {
+        if (l.shapeOverlayState !== undefined) restoreShapeOverlayState(l.shapeOverlayState);
+        return lowerToIr(l.program, l.entry, l.moduleOrder, {
           ...opts,
-          frontendServices: finalLoad.services,
-          startupCrash: finalLoad.startupCrash ?? null,
-          inlineRequireCycleCalls: finalLoad.inlineRequireCycleCalls,
-          moduleEdges: finalLoad.moduleEdges,
-          projectCheckJs: finalLoad.typeWorld?.projectCheckJs ?? false,
-          externalTypes: finalLoad.externalTypes,
-          externalTypeSpecifiersByFile: finalLoad.externalTypeSpecifiersByFile,
+          frontendServices: l.services,
+          startupCrash: l.startupCrash ?? null,
+          inlineRequireCycleCalls: l.inlineRequireCycleCalls,
+          moduleEdges: l.moduleEdges,
+          projectCheckJs: l.typeWorld?.projectCheckJs ?? false,
+          externalTypes: l.externalTypes,
+          externalTypeSpecifiersByFile: l.externalTypeSpecifiersByFile,
         });
       };
+      const lowerOnce = (): LowerResult => lowerLoad(finalLoad);
       let lowered = lowerOnce();
       // Shape inference never breaks compilation (shape-inference/
       // fallback.ts): refusals drop the overlay annotations they depend on
@@ -763,7 +793,10 @@ function loadFrontend(
           process.stderr.write(
             `[shape-fallback] round ${round} level ${level}: ${refusals.length} refusals (${refusals
               .slice(0, process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] === "all" ? undefined : 3)
-              .map((d) => `${d.loc.file.split("/").pop()}:${d.loc.start} ${process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] === "all" ? d.message : d.message.slice(0, 60)}`)
+              .map(
+                (d) =>
+                  `${d.loc.file.split("/").pop()}:${d.loc.start} ${process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] === "all" ? d.message : d.message.slice(0, 60)}`,
+              )
               .join("; ")}), changed ${changed}\n`,
           );
         if (!changed) break;
@@ -782,6 +815,64 @@ function loadFrontend(
           process.stderr.write(
             `[shape-fallback] reload ${(t1 - t0).toFixed(0)} ms, preflight ${(t2 - t1).toFixed(0)} ms, lower ${(performance.now() - t2).toFixed(0)} ms\n`,
           );
+      }
+      // Deferred refusals the program without the overlay does not have
+      // mean the overlay changed what runs: the build compiles without it
+      // (the overlay must not add failures the default build lacks).
+      if (shapeOverlayActive() && lowered.diagnostics.length === 0) {
+        const fences = fencesOf(lowered);
+        if (fences.length > 0) {
+          const keyOf = (l: typeof finalLoad, d: ScrDiagnostic): string => {
+            const sf = l.program.getSourceFile(d.loc.file);
+            const line = sf === undefined ? -1 : sf.getLineAndCharacterOfPosition(d.loc.start).line;
+            return `${d.code}|${d.loc.file}|${line}`;
+          };
+          const overlayState = finalLoad.shapeOverlayState;
+          setShapeOverlayDropped(true);
+          const plainLoad = loadProgram(entryPath, { npmStatic: finalNpmStatic, externalTypes });
+          const plainPreflight = checkPreflight(plainLoad);
+          const plain = plainPreflight.length === 0 ? lowerLoad(plainLoad) : null;
+          const known = new Set(
+            plain === null ? [] : fencesOf(plain).map((d) => keyOf(plainLoad, d)),
+          );
+          const added = fences.filter((d) => !known.has(keyOf(finalLoad, d)));
+          if (plain !== null && plain.diagnostics.length === 0 && added.length > 0) {
+            if (process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] !== undefined)
+              process.stderr.write(
+                `[shape-fallback] ${added.length} deferred refusals the default build lacks (${added
+                  .slice(0, 3)
+                  .map((d) => `${d.loc.file.split("/").pop()}: ${d.message.slice(0, 60)}`)
+                  .join("; ")}); overlay off\n`,
+              );
+            finalLoad.dispose();
+            finalLoad = plainLoad;
+            lowered = plain;
+          } else {
+            plainLoad.dispose();
+            setShapeOverlayDropped(false);
+            if (overlayState !== undefined) restoreShapeOverlayState(overlayState);
+          }
+        }
+      }
+      // A module the caller's IR validator rejects (a lowering bug the
+      // overlay's types reach) compiles without the overlay.
+      if (
+        shapeOverlayActive() &&
+        lowered.module !== null &&
+        valid !== undefined &&
+        !valid(lowered.module)
+      ) {
+        if (process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] !== undefined)
+          process.stderr.write(
+            `[shape-fallback] the IR validator rejected the module; overlay off\n`,
+          );
+        setShapeOverlayDropped(true);
+        finalLoad.dispose();
+        finalLoad = loadProgram(entryPath, { npmStatic: finalNpmStatic, externalTypes });
+        const reloadPreflight = checkPreflight(finalLoad);
+        if (reloadPreflight.length > 0)
+          return { ...lowered, module: null, diagnostics: reloadPreflight };
+        lowered = lowerOnce();
       }
       // The declaration-typed boundary's notes (SC6102) join the
       // performance warnings; they never fail a build.

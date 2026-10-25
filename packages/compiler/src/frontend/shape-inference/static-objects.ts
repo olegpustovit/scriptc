@@ -343,9 +343,11 @@ export function planStaticObjectRewrites(
       }
       // A nullish receiver makes the read throw, so the rewrites decide on
       // the other receivers (absent keys read undefined in the analysis:
-      // `ns.util` before `ns.util = {…}` runs).
+      // `ns.util` before `ns.util = {…}` runs). In an optional chain a
+      // nullish receiver short-circuits instead, so it counts.
+      const optional = (op.node.flags & ts.NodeFlags.OptionalChain) !== 0;
       for (const a of analysis.nodes[op.recv]!.atoms)
-        if (!(a.kind === "prim" && (a.label === "undefined" || a.label === "null")))
+        if (optional || !(a.kind === "prim" && (a.label === "undefined" || a.label === "null")))
           entry.atoms.add(a);
     }
   }
@@ -764,9 +766,19 @@ export function planStaticObjectRewrites(
     const node = op.node;
     if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) continue;
     if (!isPlainRead(node) || topStatement(node) === null) continue;
+    // An element key needs no parentheses (and a parenthesized literal key
+    // would read as a computed one).
+    const key =
+      node.parent !== undefined &&
+      ts.isElementAccessExpression(node.parent) &&
+      node.parent.argumentExpression === node;
     callEdits.push({
       sf: node.getSourceFile(),
-      edit: { start: ts.tokenStartOfNode(node), end: node.end, text: `(${literal})` },
+      edit: {
+        start: ts.tokenStartOfNode(node),
+        end: node.end,
+        text: key ? literal : `(${literal})`,
+      },
     });
     foldedReads++;
   }
