@@ -42,6 +42,7 @@ function fixture(windows = true) {
     compiler_version: identity.version,
     target,
     ts7: asset(`../lib/typescript/lib/tsc${windows ? ".exe" : ""}`),
+    tsc_ts: asset(`../lib/tsc-ts/lib/tsc-ts${windows ? ".exe" : ""}`),
     llvm_package: asset("../lib/llvm"),
     runtime_pack: asset("../lib/runtime"),
     runtime_sources: asset("../lib/runtime-sources"),
@@ -54,7 +55,12 @@ function fixture(windows = true) {
   write(join(distribution, "bin", executable), Buffer.alloc(2048, 1));
   chmodSync(join(distribution, "bin", executable), 0o755);
   write(manifestPath, JSON.stringify(manifest));
-  for (const path of [manifest.ts7, manifest.comptime, manifest.wasi_node_runner]) {
+  for (const path of [
+    manifest.ts7,
+    manifest.tsc_ts,
+    manifest.comptime,
+    manifest.wasi_node_runner,
+  ]) {
     write(join(distribution, "bin", path.replaceAll("\\", "/")), "fixture");
   }
   write(
@@ -112,6 +118,7 @@ test.each([true, false])(
       readFileSync(join(unpacked, "bin", f.executable + ".json"), "utf8"),
     );
     expect(manifest.ts7).toBe(f.manifest.ts7);
+    expect(manifest.tsc_ts).toBe(f.manifest.tsc_ts);
     const runtime = manifest.runtime_packs[0];
     expect(
       JSON.parse(

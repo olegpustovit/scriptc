@@ -40,6 +40,36 @@ function queue(n: number): string {
   }
   return `${s} ${q.length}`;
 }
+function spliceFront(n: number): string {
+  const a = make(n);
+  let s = 0;
+  while (a.length > 0) s += a.splice(0, 1)[0]!;
+  return `${s}`;
+}
+function queueGrow(n: number): string {
+  // BFS over a binary tree: the frontier grows to ~n/2 entries.
+  const q: number[] = [1];
+  let s = 0;
+  let seen = 1;
+  while (q.length > 0) {
+    const v = q.shift()!;
+    s += v;
+    if (seen < n) { q.push(v * 2); seen++; }
+    if (seen < n) { q.push(v * 2 + 1); seen++; }
+  }
+  return `${s % 1000000007} ${seen}`;
+}
+function deque(n: number): string {
+  // Values enter and leave at both ends; ~n/3 stay live.
+  const d: number[] = [];
+  let s = 0;
+  for (let i = 0; i < n; i++) {
+    if (i & 1) d.unshift(i);
+    else d.push(i);
+    if (i % 3 === 0) s += d.shift()!;
+  }
+  return `${s} ${d.length} ${d[0]} ${d[d.length - 1]}`;
+}
 function unshift(n: number): string {
   const a: number[] = [];
   for (let i = 0; i < n; i++) a.unshift(i);
@@ -216,6 +246,9 @@ switch (which) {
   case "shift": out = shift(n); break;
   case "queue": out = queue(n); break;
   case "unshift": out = unshift(n); break;
+  case "splice-front": out = spliceFront(n); break;
+  case "queue-grow": out = queueGrow(n); break;
+  case "deque": out = deque(n); break;
   case "splice-tail": out = spliceTail(n); break;
   case "splice-mid": out = spliceMid(n); break;
   case "slice-small": out = sliceSmall(n); break;

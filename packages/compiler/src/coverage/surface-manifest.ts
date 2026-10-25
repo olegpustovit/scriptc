@@ -38,7 +38,7 @@ import { InternalCompilerError } from "../errors.js";
  * harness asserts refusals match entry codes. renderSurfaceManifest is
  * byte-deterministic: entries sort by id, keys are emitted in one fixed
  * order, and the output carries no timestamps or absolute paths. */
-import { FENCE_CODES, UNSUPPORTED } from "../diagnostics/diagnostic.js";
+import { FENCE_CODES, UNSUPPORTED, webAssemblyDiag } from "../diagnostics/diagnostic.js";
 import { NODE24_FETCH_COMPAT_PROFILE } from "../compat/fetch-profile.js";
 import { SUPPORTED_BUILTIN_MODULES, SUPPORTED_NODE_MODULES } from "../frontend/builtin-modules.js";
 import {
@@ -275,7 +275,7 @@ export function generateSurfaceManifest(compilerVersion: string): SurfaceManifes
       status: "static",
       ...(COLLECTION_ITERATOR_METHODS.has(name)
         ? {
-            note: "live native iterators support next(), for...of, and drains; iterator helper methods are refused",
+            note: "live native iterators support next(), for...of, drains, and the iterator helper methods",
           }
         : {}),
     });
@@ -288,7 +288,7 @@ export function generateSurfaceManifest(compilerVersion: string): SurfaceManifes
       status: "static",
       ...(COLLECTION_ITERATOR_METHODS.has(name)
         ? {
-            note: "live native iterators support next(), for...of, and drains; iterator helper methods are refused",
+            note: "live native iterators support next(), for...of, drains, and the iterator helper methods",
           }
         : {}),
     });
@@ -442,6 +442,20 @@ export function generateSurfaceManifest(compilerVersion: string): SurfaceManifes
         ...(hint !== undefined ? { note: hint } : {}),
       });
     }
+  }
+
+  // ── the WebAssembly global (builtins/webassembly.ts, wasm/translate.ts):
+  // the core API lowers over modules translated at build time; the rest
+  // refuses at each use (webAssemblyDiag) ─
+  {
+    const refusal = webAssemblyDiag("WebAssembly", { file: "", start: 0, end: 0 });
+    add({
+      id: "stdlib.webassembly",
+      kind: "stdlib",
+      name: "globalThis.WebAssembly",
+      status: "static",
+      note: `compile, instantiate, validate, the Module, Instance, Memory, Table and Global constructors, Module.imports, exports and customSections, instanceof, the error classes, exports, imports and Module transfer to workers, over the modules translated at build time; the rest refuses with ${refusal.code} (${refusal.hint ?? ""})`,
+    });
   }
 
   // ── fetch/Web platform: one explicit, versioned compatibility profile ─

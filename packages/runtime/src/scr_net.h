@@ -36,6 +36,10 @@ typedef struct {
 } ScrNetLs;
 
 void scr_net_ls_add(ScrNetLs *l, ScrClosure *cb, void *fn, bool once);
+/* The AsyncLocalStorage context a socket's events run in from now on
+ * (borrowed; scr_net.c keeps the creation context otherwise). */
+struct ScrAlsCtx;
+void scr_net_sock_set_context(ScrNetSocket *s, struct ScrAlsCtx *ctx);
 ScrNetOnce *scr_net_once_new(void); /* +1 */
 ScrNetOnce *scr_net_once_retain(ScrNetOnce *once); /* +1 */
 void scr_net_once_release(ScrNetOnce *once);
@@ -138,6 +142,7 @@ void scr_net_listen_opts_reuse_port(ScrNetServer *s, double port, ScrStr *host /
 double scr_net_server_port(ScrNetServer *s); /* address().port */
 bool scr_net_server_listening(ScrNetServer *s);
 void scr_net_sock_set_ref(ScrNetSocket *s, bool ref);
+void scr_net_sock_move_writes(ScrNetSocket *from, ScrNetSocket *to);
 void scr_net_server_set_ref(ScrNetServer *s, bool ref);
 bool scr_net_sock_has_ref(ScrNetSocket *s);
 double scr_net_server_keep_alive_ms(ScrNetServer *s);
@@ -163,6 +168,11 @@ void scr_net_server_timeout_option_set(ScrNetServer *s, double field, const stru
 ScrStr *scr_net_server_addr_ip(ScrNetServer *s);     /* +1 — address().address */
 ScrStr *scr_net_server_addr_family(ScrNetServer *s); /* +1 — address().family */
 void scr_net_server_close(ScrNetServer *s, ScrClosure *cb /*moves, nullable*/);
+void scr_net_server_close_dyn(ScrNetServer *s, const ScrDyn *listener /*borrowed*/);
+void scr_net_sock_on_lookup(ScrNetSocket *s, const ScrDyn *listener /*borrowed*/, bool once);
+void scr_net_lookup_install(void);
+ScrStr *scr_net_server_unix_path(ScrNetServer *s); /* +1, "" unless listening on a path */
+void scr_net_server_address_check(ScrNetServer *s);  /* throws for a Unix-socket server */
 void scr_net_server_close_all_connections(ScrNetServer *s);
 void scr_net_server_close_idle_connections(ScrNetServer *s);
 ScrDyn *scr_net_server_max_connections_get(ScrNetServer *s); /* +1 */
@@ -226,6 +236,7 @@ void scr_net_sock_destroy(ScrNetSocket *s);
  * counters/flags the compat surface reads. */
 ScrNetSocket *scr_net_sock_pause(ScrNetSocket *s);            /* +1: chaining */
 ScrNetSocket *scr_net_sock_resume(ScrNetSocket *s);           /* +1: chaining */
+void scr_net_sock_hold(ScrNetSocket *s, bool hold); /* protocol read hold (not pause) */
 ScrNetSocket *scr_net_sock_set_nodelay(ScrNetSocket *s, bool enable); /* +1: chaining */
 void scr_net_sock_set_keepalive(ScrNetSocket *s, bool enable, double delay_ms);
 void scr_net_sock_destroy_soon(ScrNetSocket *s);
@@ -236,6 +247,12 @@ bool scr_net_sock_readable(ScrNetSocket *s);
 /* The deferred dial (the http agent's maxSockets queue): the socket
  * registers "connecting" and buffers writes; dial_start runs the dial. */
 ScrNetSocket *scr_net_connect_deferred(double port, ScrStr *host /*borrowed, nullable*/); /* +1 */
+ScrNetSocket *scr_net_connect_lookup_dyn(double port, ScrStr *host /*borrowed*/, const ScrDyn *lookup /*borrowed*/); /* +1, NULL on throw */
+/* A client socket for the Unix socket at `path`, dialed now or (deferred)
+ * by scr_net_sock_dial_start. A failure is the deferred 'error'. */
+ScrNetSocket *scr_net_connect_path(ScrStr *path /*borrowed*/, bool deferred); /* +1 */
+/* server.listen(path[, cb]): a Unix-socket server, its file removed at close. */
+void scr_net_listen_path(ScrNetServer *s, ScrStr *path /*borrowed*/, ScrClosure *cb /*moves, nullable*/);
 void scr_net_sock_dial_start(ScrNetSocket *s);
 void scr_net_sock_set_timeout(ScrNetSocket *s, double ms);
 void scr_net_sock_on_timeout(ScrNetSocket *s, ScrClosure *cb /*moves*/, bool once);
@@ -249,6 +266,15 @@ ScrDyn *scr_net_sock_address(ScrNetSocket *s);       /* +1: socket.address() */
 /* socket.resetAndDestroy(): RST close (deferred to 'connect' while
  * connecting); throws ERR_INVALID_HANDLE_TYPE on TLS. +1: chaining. */
 ScrNetSocket *scr_net_sock_reset_and_destroy(ScrNetSocket *s);
+/* net.SocketAddress and net.BlockList: native handles. The constructors
+ * take the argument array; parse answers undefined when the input is not
+ * a socket address. All +1, borrowed arguments; may throw. */
+ScrDyn *scr_net_socket_address_new(const ScrDyn *args);
+ScrDyn *scr_net_socket_address_parse(const ScrDyn *input);
+bool scr_net_is_socket_address(const ScrDyn *value);
+ScrDyn *scr_net_block_list_new(const ScrDyn *args);
+bool scr_net_is_block_list(const ScrDyn *value);
+ScrDyn *scr_net_block_list_private_ranges(void);
 /* server.dropMaxConnection: a stored value (+1 get, borrowed set). */
 ScrDyn *scr_net_server_drop_max_connection_get(ScrNetServer *s);
 void scr_net_server_drop_max_connection_set(ScrNetServer *s, const ScrDyn *value);
@@ -330,9 +356,38 @@ typedef struct ScrNetTransportOps {
   bool (*pending)(void *tctx);
   void (*shutdown_write)(void *tctx);
   void (*free)(void *tctx);
+  /* nullable: runs after the established socket's 'connect' listeners
+   * (the TLS 'secure' event, which Node emits after secureConnect) */
+  void (*after_established)(void *tctx);
+  /* nullable: runs when the closed socket settles, after its own
+   * listeners drop; the transport drops the listeners it holds */
+  void (*settle)(void *tctx);
 } ScrNetTransportOps;
 void scr_net_sock_set_transport(ScrNetSocket *s, const ScrNetTransportOps *ops, void *tctx);
+/* new tls.TLSSocket(socket) and tls.connect({ socket }): a fresh socket
+ * takes over an open connection (fd, buffered bytes, peer identity); the
+ * old socket stays open without I/O, forwards end() and destroy(), and
+ * fires 'close' just before the new one. +1, or NULL when the socket has
+ * no open, idle connection to give. Set the transport on the result, then
+ * call scr_net_sock_adopt_start. */
+ScrNetSocket *scr_net_sock_adopt(ScrNetSocket *raw);
+void scr_net_sock_adopt_start(ScrNetSocket *t);
+/* Routes a client socket through an HTTP CONNECT proxy. Call it right
+ * after the dial (scr_net_connect to the proxy) and before any transport
+ * is set: once TCP is up, `request` (the CONNECT head, copied) is sent
+ * and the proxy's response head is read. A 200 status starts the
+ * transport handshake, or fires 'connect'; any other status fails the
+ * socket with "Proxy response (<status>) !== 200 when HTTP Tunneling". */
+void scr_net_sock_set_tunnel(ScrNetSocket *s, const char *request, size_t len);
+/* The status code of a CONNECT response head (head[0..len) ends with the
+ * blank line), or -1 when it does not start with an HTTP/1.x status
+ * line; and undici's message for a status other than 200 (or -1). */
+int scr_net_tunnel_status(const char *head, size_t len);
+void scr_net_tunnel_failure(int status, char *msg, size_t cap);
 int scr_net_sock_fd(ScrNetSocket *s);
+/* The host a client socket was told to dial (Node's socket._host). +1;
+ * NULL on server sockets. */
+ScrStr *scr_net_sock_dial_name(ScrNetSocket *s);
 /* Drain up to n bytes of the socket's receive buffer (peeked/unshifted
  * bytes — the demux path); consumers call it before the fd. */
 size_t scr_net_sock_take_buffered(ScrNetSocket *s, char *buf, size_t n);
@@ -352,6 +407,16 @@ void scr_net_sock_replay(ScrNetSocket *s, const char *data, size_t len);
  * 'error' + teardown to the sweep; NULL tears down without an 'error'
  * event, Node's default for an unhandled server-side handshake failure. */
 void scr_net_sock_transport_error(ScrNetSocket *s, const char *msg);
+/* The same with the error's code given (static storage), for messages
+ * whose text does not name it. */
+void scr_net_sock_transport_error_code(ScrNetSocket *s, const char *msg, const char *code);
+/* The peer closed before the handshake finished on a wrapped socket:
+ * 'end', then 'close' without an error. */
+void scr_net_sock_transport_eof(ScrNetSocket *s);
+/* Registers a listener that fires when the transport establishes, once
+ * TCP is up (a socket that took over an open connection is up from the
+ * start). */
+void scr_net_sock_on_established(ScrNetSocket *s, ScrClosure *cb /*moves*/, bool once);
 /* Defer the server's 'connection' listeners to handshake completion —
  * tls.createServer's handler is the 'secureConnection' event, fired with
  * the socket only once the TLS layer stands (Node's timing). */

@@ -27,6 +27,13 @@ export const ADOPTED_OPTIONS = [
   // SC1012 "not supported yet" beats a raw TS1259 at the same site.
   "esModuleInterop",
   "allowSyntheticDefaultImports",
+  // JSX: the checker types JSX as the project's tsc does, and the JSX
+  // lowering (jsx-source.ts) emits the calls that setting selects.
+  "jsx",
+  "jsxFactory",
+  "jsxFragmentFactory",
+  "jsxImportSource",
+  "reactNamespace",
 ] as const;
 
 export const JS_RELAXED_TSC_CODES: ReadonlySet<number> = new Set([
@@ -121,10 +128,20 @@ export const JS_RELAXED_TSC_CODES: ReadonlySet<number> = new Set([
   // JavaScript subclasses may widen fields or add method parameters.
   // Class lowering checks native storage and override ABIs at each use.
   2415,
+  // a private or protected constructor (`new readline.Interface(...)`,
+  // whose declaration is protected): JavaScript has no constructor
+  // accessibility, and Node constructs the class. Each `new` meets the
+  // lowerer's per-site constructor fences.
+  2673,
+  2674,
   // unresolvable modules: Node throws WHEN the require executes — the
   // binding types as any and reached uses fence instead of passing unchecked
   2307,
   2792,
+  // `delete` of a property the inference typed required (2790): JS deletes
+  // any configurable property, and the lowering checks each delete's
+  // receiver itself
+  2790,
   // useUnknownInCatchVariables' annotation demand ("'e' is of type
   // 'unknown'", "Object is of type 'unknown'"): a JS catch clause CANNOT
   // annotate its variable, so the demand is unsatisfiable in source —

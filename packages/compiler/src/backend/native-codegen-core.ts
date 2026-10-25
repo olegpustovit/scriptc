@@ -6,19 +6,29 @@ export const NATIVE_CODEGEN_LLVM_VERSION = "22.1.8";
 
 export type NativeCodegenOutputKind = "asm" | "obj";
 
-/** LLVM text per partition, and the most partitions one executable uses. */
+/** LLVM text that stays one module, LLVM text per partition, the fewest
+ * partitions (MIN_PROGRAM_PARTITIONS, of at least MIN_PARTITION_BYTES each)
+ * a divided module gets, and the most one executable uses. */
+const SINGLE_PARTITION_BYTES = 1024 * 1024;
 const PROGRAM_PARTITION_BYTES = 4 * 1024 * 1024;
+const MIN_PARTITION_BYTES = 512 * 1024;
+const MIN_PROGRAM_PARTITIONS = 8;
 const MAX_PROGRAM_PARTITIONS = 64;
 
-/** Executable objects this large are divided into partitions that the helper
- * simplifies, optimizes and compiles concurrently, importing small functions
- * across partitions for inlining, and reuses individually across builds. The
+/** Executable objects larger than SINGLE_PARTITION_BYTES are divided into
+ * partitions that the helper simplifies, optimizes and compiles concurrently,
+ * importing small functions across partitions for inlining, and reuses
+ * individually across builds. A divided module gets at least
+ * MIN_PROGRAM_PARTITIONS so that mid-size programs use several cores. The
  * count is a power of two that depends only on the module's size, on every
  * target, so artifacts never vary with the host and ordinary edits keep every
  * function in its partition. */
 export function nativeProgramPartitions(llvmBytes: number): number {
-  const required = Math.ceil(llvmBytes / PROGRAM_PARTITION_BYTES);
-  if (required < 2) return 1;
+  if (llvmBytes <= SINGLE_PARTITION_BYTES) return 1;
+  const required = Math.max(
+    Math.ceil(llvmBytes / PROGRAM_PARTITION_BYTES),
+    Math.min(MIN_PROGRAM_PARTITIONS, Math.ceil(llvmBytes / MIN_PARTITION_BYTES)),
+  );
   return Math.min(MAX_PROGRAM_PARTITIONS, 2 ** Math.ceil(Math.log2(required)));
 }
 

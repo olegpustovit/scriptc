@@ -11,6 +11,7 @@ import {
   rawBytes,
   requestHandler,
 } from "./lib-abi.js";
+import { sniCallbackArgs } from "./lib-http2.js";
 import { emitAlwaysThrowLibCall } from "./lib-shared.js";
 
 export function emitTlsLibCall(host: LlvmEmitterContext, e: LibCallExpr): LlValue {
@@ -42,6 +43,27 @@ export function emitTlsLibCall(host: LlvmEmitterContext, e: LibCallExpr): LlValu
         e.fn === "https.createServer" ? "scr_https_create_server" : "scr_tls_create_server",
         [...rawBytes(host, args[0]!), ...rawBytes(host, args[1]!), ...handler],
       );
+    }
+    case "tls.createServerSni":
+    case "tls.createServerSniCb": {
+      const cb = args[3];
+      const handler =
+        cb === undefined
+          ? [ptr(), ptr()]
+          : callbackAdapter(
+              host,
+              cb,
+              callbackType(cb).params.length === 0
+                ? "scr_net_conn_thunk0"
+                : "scr_net_conn_thunk_sock",
+              ["ptr", "ptr"],
+            );
+      return finishRuntimeCall(host, e, "scr_tls_create_server_sni", [
+        ...rawBytes(host, args[0]!),
+        ...rawBytes(host, args[1]!),
+        ...handler,
+        ...sniCallbackArgs(host, args[2]!),
+      ]);
     }
     case "tls.createServerDyn":
     case "tls.createServerDynCb":
@@ -94,11 +116,18 @@ export function emitTlsLibCall(host: LlvmEmitterContext, e: LibCallExpr): LlValu
     }
     case "tls.connect":
     case "tls.connectCb":
-      if (args[3] !== undefined) host.moveTemp(args[3]);
+      if (args[3] !== undefined) host.toHeap(args[3]);
       return finishRuntimeCall(host, e, "scr_tls_connect_dyn", [...a.slice(0, 3), a[3] ?? ptr()]);
     case "tls.sockOnSecureConnect":
-      host.moveTemp(args[1]!);
+      host.toHeap(args[1]!);
       return finishRuntimeCall(host, e, "scr_tls_sock_on_secure_connect", a);
+    case "tls.sockOnSecure":
+      host.toHeap(args[1]!);
+      return finishRuntimeCall(host, e, "scr_tls_sock_on_secure", a);
+    case "tls.wrapSocket":
+      return finishRuntimeCall(host, e, "scr_tls_wrap_socket", [a[0]!, a[1]!, ptr()]);
+    case "tls.wrapSocketCtx":
+      return finishRuntimeCall(host, e, "scr_tls_wrap_socket", a);
     case "tls.sockOnSession": {
       const cb = args[1]!,
         type = callbackType(cb);
@@ -164,13 +193,8 @@ export function emitTlsLibCall(host: LlvmEmitterContext, e: LibCallExpr): LlValu
       ]);
       B.br(done);
       B.startBlock(plain);
-      const insecure = callRuntime(host, "scr_http_request_ex", "ptr", [
-        ...a.slice(1, 8),
-        ...handler,
-        { type: "i32", name: "80" },
-        ptr(),
-        ptr(),
-      ]);
+      // The plain arm is http.request: Node's global agent serves it.
+      const insecure = callRuntime(host, "scr_http_request", "ptr", [...a.slice(1, 8), ...handler]);
       B.br(done);
       B.startBlock(done);
       const result = B.tmp();

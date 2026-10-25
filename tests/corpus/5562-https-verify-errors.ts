@@ -1,4 +1,5 @@
-// https.request verifies the server certificate against `ca`. A failed
+// https.request verifies the server certificate against `ca`, using
+// `servername` (when given) for SNI and the name check. A failed
 // verification reports Node's message and openssl code, and
 // rejectUnauthorized: false skips the check. Requests through an
 // https.Agent take their TLS options from the request.
@@ -42,6 +43,22 @@ server.listen(0, "127.0.0.1", async () => {
       res.on("end", () => resolve(`${res.statusCode}`));
     });
     req.on("error", (err: NodeJS.ErrnoException) => resolve(`error ${err.code} ${err.message}`));
+    req.end();
+  });
+  await settle("servername", (resolve) => {
+    const req = https.request({ host: "127.0.0.1", port, path: "/sni", ca: ca, servername: "localhost" }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(`${res.statusCode}`));
+    });
+    req.on("error", (err: NodeJS.ErrnoException) => resolve(`error ${err.code}`));
+    req.end();
+  });
+  await settle("wrong servername", (resolve) => {
+    const req = https.request({ host: "localhost", port, path: "/sni", ca: ca, servername: "other.example" }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(`${res.statusCode}`));
+    });
+    req.on("error", (err: NodeJS.ErrnoException) => resolve(`error ${err.code}`));
     req.end();
   });
   await settle("agent", (resolve) => {

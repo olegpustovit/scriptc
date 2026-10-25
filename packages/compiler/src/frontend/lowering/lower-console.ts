@@ -67,11 +67,11 @@ type OptionRole = "stdout" | "stderr" | "ignoreErrors";
 export function lowerConsoleNew(lowerer: Lowerer, expr: ts.NewExpression): IrExpr | null {
   if (!isConsoleCtor(lowerer, expr.expression)) return null;
   const loc = locOf(expr);
-  const args = expr.arguments ?? [];
+  const args = expr.arguments?.nodes ?? [];
   const entries: { role: OptionRole; node: ts.Expression | undefined }[] = [];
   const first = args[0];
   if (first && ts.isObjectLiteralExpression(first)) {
-    for (const prop of first.properties) {
+    for (const prop of first.properties.nodes) {
       let name: string | null = null;
       let value: ts.Expression | null = null;
       if (
@@ -209,7 +209,7 @@ export function lowerConsoleInstanceCall(
   if (access.questionDotToken) return null;
   const recvType = lowerer.typeOf(access.expression);
   const sym = recvType.getAliasSymbol() ?? recvType.getSymbol();
-  if (!sym || sym.name !== "Console" || !lowerer.isStdlibSymbol(sym)) return null;
+  if (!sym || ts.symbolName(sym) !== "Console" || !lowerer.isStdlibSymbol(sym)) return null;
   const toStderr = OUTPUT_MEMBERS.get(access.name.text);
   if (toStderr === undefined) {
     lowerer.noLowering(
@@ -249,7 +249,8 @@ export function lowerConsoleArg(
   // inspect at the rest-args depth 2 (formatWithOptions) — scalar
   // kinds byte-exactly, boxed functions as [Function: name] /
   // [Function (anonymous)], composites through the dyn walk
-  // (insp.dyn). Never throws — Node's console.log never does.
+  // (insp.dyn). A value the inspector does not render throws the
+  // 'not supported yet' Error before anything is written.
   if (lowered.type.kind === "dyn") {
     return {
       kind: "libCall",
@@ -349,11 +350,15 @@ export function lowerConsoleOutput(
   // formatter IS util.format — route through the format lowering and
   // print its one string. Specifier-free first strings keep the
   // plain space-joined path below (identical output, cheaper).
-  const first = expr.arguments[0];
-  if (expr.arguments.length > 1 && isStringLiteralLike(first) && hasFormatSpecifier(first.text)) {
+  const first = expr.arguments.nodes[0];
+  if (
+    expr.arguments.nodes.length > 1 &&
+    isStringLiteralLike(first) &&
+    hasFormatSpecifier(first.text)
+  ) {
     return consoleWrite(stdout, [lowerFormatCall(lowerer, expr, loc, false)], loc);
   }
-  const args = expr.arguments.map((a) =>
+  const args = expr.arguments.nodes.map((a) =>
     lowerConsoleArg(lowerer, a, lowerer.lowerExpr(a), surface, loc),
   );
   return consoleWrite(stdout, args, loc);
@@ -479,9 +484,9 @@ function lowerConsoleTimeLog(
   loc: SrcLoc,
 ): IrExpr {
   const stmts: IrStmt[] = [];
-  const raw = rawLabel(lowerer, member, expr.arguments[0]);
+  const raw = rawLabel(lowerer, member, expr.arguments.nodes[0]);
   const rawRef = raw === null ? null : hoist(lowerer, stmts, "%consoleLabel", raw, loc);
-  const data = expr.arguments.slice(1);
+  const data = expr.arguments.nodes.slice(1);
   const dataRefs: { node: ts.Expression; value: IrExpr }[] = [];
   if (member === "timeLog") {
     for (const node of data) {
@@ -546,7 +551,7 @@ function lowerConsoleTimeLog(
  * so a format string still formats. */
 function lowerConsoleAssert(lowerer: Lowerer, expr: ts.CallExpression, loc: SrcLoc): IrExpr {
   const stmts: IrStmt[] = [];
-  const [valueNode, ...args] = expr.arguments;
+  const [valueNode, ...args] = expr.arguments.nodes;
   const ok =
     valueNode === undefined
       ? boolLit(false, loc)
@@ -635,7 +640,7 @@ function lowerConsoleAssert(lowerer: Lowerer, expr: ts.CallExpression, loc: SrcL
  * in the runtime (cli_table's layout over util.inspect cells). */
 function lowerConsoleTable(lowerer: Lowerer, expr: ts.CallExpression, loc: SrcLoc): IrExpr {
   const stmts: IrStmt[] = [];
-  const [dataNode, propsNode, ...rest] = expr.arguments;
+  const [dataNode, propsNode, ...rest] = expr.arguments.nodes;
   if (dataNode === undefined) return consoleWrite(true, [strLit("undefined", loc)], loc);
   let data = lowerer.lowerExpr(dataNode);
   let props =
@@ -707,7 +712,7 @@ export function lowerConsoleMethodCall(
   member: ConsoleMethodMember,
   loc: SrcLoc,
 ): IrExpr {
-  const args = expr.arguments;
+  const args = expr.arguments.nodes;
   switch (member) {
     case "dirxml":
       return lowerConsoleOutput(lowerer, expr, true, "console.dirxml", loc);

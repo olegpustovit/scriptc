@@ -1,6 +1,8 @@
+import { keyedHelperName } from "../stable-names.js";
 import * as ts from "../../ts7/adapter.js";
 import {
   BOOL,
+  DYN,
   F64,
   REGEX,
   STRING,
@@ -13,7 +15,7 @@ import {
   type IrType,
   type SrcLoc,
 } from "../../../ir/ir.js";
-import { numLit, strLit, varRef } from "../../../ir/build.js";
+import { dynUndefinedExpr, numLit, strLit, varRef } from "../../../ir/build.js";
 import { InternalCompilerError } from "../../../errors.js";
 import { locOf } from "../../program.js";
 import type { Lowerer } from "../lowerer.js";
@@ -64,14 +66,14 @@ export function lowerStringReplacement(
   const search = argument(args[0], false);
   const replacement = argument(args[1], true);
   if (search.type.kind === "dyn" || replacement.type.kind === "dyn") {
-    if (replacement.type.kind === "func") {
-      lowerer.noLowering(`string .${method} with checked search values and callbacks`, call);
-    }
     // Evaluate all inputs once before choosing the search protocol. Regexes
     // retain their native pattern; plain values use the string-search helper.
+    // A typed callback receives the regex match's arguments or the plain
+    // search's (match, offset, subject).
     const values = [receiver, search, replacement];
     const locals = values.map((value) => lowerer.declareHiddenLocal("%replaceArg", value.type));
     const refs = locals.map((local) => varRef(local.id, local.type, loc));
+    const callback = replacement.type.kind === "func";
     const checkedReplacement =
       replacement.type.kind === "dyn"
         ? lowerer.coerceInto(args[1] ?? call, refs[2]!, STRING)
@@ -90,14 +92,27 @@ export function lowerStringReplacement(
         ? {
             kind: "ternary",
             cond: { kind: "libCall", fn: "dyn.nativeRegexIs", args: [refs[1]!], type: BOOL, loc },
-            then: {
-              kind: "regexIntrinsic",
-              method,
-              receiver: refs[0]!,
-              args: [lowerer.coerceInto(args[0] ?? call, refs[1]!, REGEX), checkedReplacement],
-              type: STRING,
-              loc,
-            },
+            then: callback
+              ? {
+                  kind: "libCall",
+                  fn: "regex.replaceCallback",
+                  args: [
+                    refs[0]!,
+                    lowerer.coerceInto(args[0] ?? call, refs[1]!, REGEX),
+                    lowerer.coerceToExpected(refs[2]!, DYN),
+                    { kind: "boolLit", value: method === "replaceAll", type: BOOL, loc },
+                  ],
+                  type: STRING,
+                  loc,
+                }
+              : {
+                  kind: "regexIntrinsic",
+                  method,
+                  receiver: refs[0]!,
+                  args: [lowerer.coerceInto(args[0] ?? call, refs[1]!, REGEX), checkedReplacement],
+                  type: STRING,
+                  loc,
+                },
             else_: plain,
             type: STRING,
             loc,
@@ -147,22 +162,28 @@ function lowerStringReplacementValues(
   if (callback.kind !== "func") {
     throw new InternalCompilerError(`string .${method} replacement of type ${callback.kind}`);
   }
+  // A checked parameter receives the boxed argument (undefined after the
+  // subject), and a checked, number or boolean result converts with
+  // ToString.
   const full = [STRING, F64, STRING];
+  const ret = callback.ret.kind;
   if (
-    callback.ret.kind !== "string" ||
-    callback.params.length > full.length ||
-    !callback.params.every((type, index) => typeEquals(type, full[index]!))
+    (ret !== "string" && ret !== "dyn" && ret !== "f64" && ret !== "bool") ||
+    !callback.params.every(
+      (type, index) =>
+        type.kind === "dyn" || (index < full.length && typeEquals(type, full[index]!)),
+    )
   ) {
     lowerer.noLowering(
       `string .${method} callback signature`,
-      call.arguments[1] ?? call,
+      call.arguments.nodes[1] ?? call,
       "use a callback returning string with a prefix of (match: string, offset: number, subject: string)",
     );
   }
   const key = `str.${method}:${typeKey(replacement.type)}`;
   let helper = lowerer.valueHelpers.get(key);
   if (!helper) {
-    helper = `%str.${method}.${lowerer.valueHelpers.size}`;
+    helper = keyedHelperName(lowerer, `%str.${method}`, key);
     lowerer.valueHelpers.set(key, helper);
     const subject = varRef("s.0", STRING, loc);
     const needle = varRef("search.0", STRING, loc);
@@ -174,13 +195,21 @@ function lowerStringReplacementValues(
     const chunksType = arrayOf(STRING);
     const chunks = varRef("chunks.0", chunksType, loc);
     const builder = stringBuilder(loc, chunks);
-    const value: IrExpr = {
+    const result: IrExpr = {
       kind: "callValue",
       callee: replace,
-      args: [needle, match, subject].slice(0, callback.params.length),
-      type: STRING,
+      args: callback.params.map((type, index) => {
+        const arg = [needle, match, subject][index];
+        if (arg === undefined) return dynUndefinedExpr(loc);
+        return type.kind === "dyn" ? lowerer.coerceToExpected(arg, DYN) : arg;
+      }),
+      type: callback.ret,
       loc,
     };
+    const value: IrExpr =
+      ret === "dyn"
+        ? { kind: "libCall", fn: "dyn.toStringCoerce", args: [result], type: STRING, loc }
+        : lowerer.ensureString(result, call);
     const stop: IrStmt = { kind: "break", loc };
     const body: IrStmt[] = [
       builder.declare("chunks.0", { kind: "arrayLit", elems: [], type: chunksType, loc }),

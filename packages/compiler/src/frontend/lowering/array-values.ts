@@ -1,3 +1,4 @@
+import { keyedHelperName } from "./stable-names.js";
 import { InternalCompilerError } from "../../errors.js";
 import { dynUndefinedExpr, helperLoc, varRef } from "../../ir/build.js";
 import {
@@ -8,11 +9,13 @@ import {
   type IrType,
   isIntegerBytesElem,
   type SrcLoc,
+  STRING,
   UNDEFINED_T,
   typeEquals,
   typeKey,
   unionContainerArmsOk,
 } from "../../ir/ir.js";
+import { everyExpr } from "../../ir/traverse.js";
 import type { Lowerer } from "./lowerer.js";
 import type * as ts from "../ts7/adapter.js";
 
@@ -84,29 +87,54 @@ export function arrayValueRead(
   };
 }
 
-/** Read a stabilized union of native arrays without copying either the
- * receiver or its elements. Every arm contributes its missing-value case. */
+/** Read one position of a stabilized union of native arrays and tuples
+ * (`const [a, b] = re.exec(s) || ["", ""]`) without copying the receiver
+ * or its elements. Every array arm contributes its missing-value case; a
+ * tuple arm answers its field, or undefined past its end. Tuple arms need
+ * a constant position. With `stringChars` (the string iterator's code
+ * points as a fresh string[]), a string arm (`re.exec(s) || ""`) answers
+ * its code point at the position, or undefined past its end. */
 export function unionArrayValueRead(
   lowerer: Lowerer,
   value: IrExpr,
   index: IrExpr,
   loc: SrcLoc,
+  stringChars?: (text: IrExpr) => IrExpr,
 ): IrExpr | null {
   if (value.type.kind !== "union") return null;
   const unionId = value.type.unionId;
   const arms = lowerer.unions.get(unionId)?.arms;
   if (!arms?.length) return null;
+  const position = index.kind === "numLit" ? String(index.value) : null;
+  // A tuple arm's answer at the position: its field, or undefined past
+  // its end. Null when the arm is neither an array nor a tuple.
+  const tupleField = (arm: IrType): { name: string; type: IrType } | "past" | null => {
+    if (arm.kind !== "record" || position === null) return null;
+    const shape = lowerer.shapes.get(arm.shapeId);
+    if (!shape?.tuple) return null;
+    return shape.fields.find((f) => f.name === position) ?? "past";
+  };
   // Keep the collection's IrType union layout and narrow each element at
   // its use; an inferred array predicate changes the collection's ABI.
-  for (const arm of arms) if (arm.kind !== "array") return null;
+  const stringArm = (arm: IrType): boolean => arm.kind === "string" && stringChars !== undefined;
+  for (const arm of arms)
+    if (arm.kind !== "array" && !stringArm(arm) && tupleField(arm) === null) return null;
   const answers = new Map<string, IrType>();
   for (const arm of arms) {
-    if (arm.kind !== "array") return null;
-    const answer = arrayValueType(lowerer, arm.elem);
+    const field = arm.kind === "array" || stringArm(arm) ? null : tupleField(arm);
+    const answer =
+      arm.kind === "array"
+        ? arrayValueType(lowerer, arm.elem)
+        : stringArm(arm)
+          ? arrayValueType(lowerer, STRING)
+          : field === "past"
+            ? UNDEFINED_T
+            : field!.type;
     const parts = answer.kind === "union" ? lowerer.unions.get(answer.unionId)!.arms : [answer];
     for (const part of parts) answers.set(typeKey(part), part);
   }
   const joined = [...answers.values()].sort((a, b) => (typeKey(a) < typeKey(b) ? -1 : 1));
+  if (joined.length === 1 && joined[0]!.kind === "undefinedT") return null;
   if (
     joined.length > 1 &&
     (!unionContainerArmsOk(joined) ||
@@ -118,12 +146,39 @@ export function unionArrayValueRead(
   let result: IrExpr | null = null;
   for (let tag = arms.length - 1; tag >= 0; tag--) {
     const arm = arms[tag]!;
-    if (arm.kind !== "array") return null;
     const receiver: IrExpr = { kind: "unionNarrow", unionId, tag, value, type: arm, loc };
-    const read = lowerer.coerceToExpected(
-      arrayValueRead(lowerer, receiver, index, arm.elem, loc),
-      type,
-    );
+    let read: IrExpr;
+    if (arm.kind === "array") {
+      read = lowerer.coerceToExpected(
+        arrayValueRead(lowerer, receiver, index, arm.elem, loc),
+        type,
+      );
+    } else if (stringArm(arm)) {
+      read = lowerer.coerceToExpected(
+        arrayValueRead(lowerer, stringChars!(receiver), index, STRING, loc),
+        type,
+      );
+    } else {
+      const field = tupleField(arm);
+      if (field === null) return null;
+      if (field === "past") {
+        const missing = lowerer.wrappedUndefined(type, loc);
+        if (!missing) return null;
+        read = missing;
+      } else {
+        read = lowerer.coerceToExpected(
+          {
+            kind: "recordGet",
+            obj: receiver,
+            shapeId: (arm as IrType & { kind: "record" }).shapeId,
+            field: field.name,
+            type: field.type,
+            loc,
+          },
+          type,
+        );
+      }
+    }
     result =
       result === null
         ? read
@@ -137,6 +192,81 @@ export function unionArrayValueRead(
           };
   }
   return result;
+}
+
+/** Expression kinds that evaluate without running other code or writing
+ * a binding. */
+const PURE_KINDS = new Set<IrExpr["kind"]>([
+  "varRef",
+  "numLit",
+  "strLit",
+  "boolLit",
+  "unitLit",
+  "bin",
+  "unary",
+  "logical",
+  "ternary",
+  "toBool",
+  "fieldGet",
+  "recordGet",
+  "arrayGet",
+  "arrayState",
+  "arrayHas",
+  "unionIsTag",
+  "unionNarrow",
+  "unionWrap",
+]);
+
+/** The locals evaluating `value` may assign, and whether it may run other
+ * code (anything but the pure kinds and the read-only element helpers),
+ * which can assign locals and fields through closures. */
+function valueEffects(lowerer: Lowerer, value: IrExpr): { writes: Set<string>; opaque: boolean } {
+  const readers = new Set<string>();
+  for (const [key, name] of lowerer.arrHofHelpers) if (key.startsWith("idxOr:")) readers.add(name);
+  const writes = new Set<string>();
+  let opaque = false;
+  everyExpr(value, {
+    expr: (e) => {
+      if (e.kind === "assignExpr" || e.kind === "incDec") writes.add(e.localId);
+      else if (e.kind === "call" ? !readers.has(e.callee) : !PURE_KINDS.has(e.kind)) opaque = true;
+      return true;
+    },
+    stmt: (s) => {
+      if (s.kind === "varDecl" || s.kind === "assign") writes.add(s.localId);
+      else opaque = true;
+      return true;
+    },
+  });
+  return { writes, opaque };
+}
+
+/** Whether evaluating `e` after `value` gives what it gives before it: a
+ * literal, or a local and field read `value` cannot change. */
+function unaffectedBy(e: IrExpr, effects: { writes: Set<string>; opaque: boolean }): boolean {
+  switch (e.kind) {
+    case "numLit":
+    case "strLit":
+      return true;
+    case "varRef":
+      return !effects.writes.has(e.localId);
+    case "bin":
+      return unaffectedBy(e.left, effects) && unaffectedBy(e.right, effects);
+    case "fieldGet":
+    case "recordGet":
+      return !effects.opaque && unaffectedBy(e.obj, effects);
+    default:
+      return false;
+  }
+}
+
+/** Whether `e` reads a `let` or `var` binding, which code the value runs
+ * can assign through a closure. */
+function readsMutableLocal(lowerer: Lowerer, e: IrExpr): boolean {
+  return !everyExpr(e, {
+    expr: (x) =>
+      x.kind !== "varRef" || lowerer.ctx.locals.find((l) => l.id === x.localId)?.mutable === false,
+    stmt: () => true,
+  });
 }
 
 /** Store a stabilized value without changing the array's element ABI. */
@@ -156,10 +286,31 @@ export function arrayValueStore(
     // owned union temporary to release on every path.
     const unionId = value.type.unionId;
     let stable = value;
-    let prefix: IrStmt[] = [];
+    const prefix: IrStmt[] = [];
+    // The stores below evaluate the receiver and the index after the value.
+    // JavaScript evaluates them first (`out[n++] = src[n]` reads src[1]), so
+    // either may need its value held before the value runs.
+    if (value.kind !== "varRef") {
+      const valueFx = valueEffects(lowerer, value);
+      const hold = (e: IrExpr, name: string, effects: typeof valueFx): IrExpr => {
+        if (unaffectedBy(e, effects) && !(effects.opaque && readsMutableLocal(lowerer, e)))
+          return e;
+        const temp = lowerer.declareHiddenLocal(name, e.type);
+        prefix.push({ kind: "varDecl", localId: temp.id, init: e, loc });
+        return varRef(temp.id, temp.type, loc);
+      };
+      // The receiver runs before the index and the value, so the index's
+      // effects can change it too (`a[(a = b, 0)] = c[0]!`).
+      const indexFx = valueEffects(lowerer, index);
+      arr = hold(arr, "%arrayTarget", {
+        writes: new Set([...valueFx.writes, ...indexFx.writes]),
+        opaque: valueFx.opaque || indexFx.opaque,
+      });
+      index = hold(index, "%arrayIndex", valueFx);
+    }
     if (value.kind !== "varRef") {
       const temp = lowerer.declareHiddenLocal("%arrayValue", value.type);
-      prefix = [{ kind: "varDecl", localId: temp.id, init: value, loc }];
+      prefix.push({ kind: "varDecl", localId: temp.id, init: value, loc });
       stable = varRef(temp.id, temp.type, loc);
     }
     const write: IrStmt = {
@@ -199,7 +350,7 @@ export function lowerSafeIndexRead(
   let name = lowerer.arrHofHelpers.get(key);
   if (!name) {
     const at = helperLoc(loc);
-    name = `%arr.idxOr.${lowerer.arrHofHelpers.size}`;
+    name = keyedHelperName(lowerer, "%arr.idxOr", key);
     lowerer.arrHofHelpers.set(key, name);
     const arrT = arr.type;
     lowerer.liftedFns.push({
@@ -245,7 +396,7 @@ export function lowerSafeBytesRead(
   let name = lowerer.arrHofHelpers.get(key);
   if (!name) {
     const at = helperLoc(loc);
-    name = `%bytes.idxOr.${lowerer.arrHofHelpers.size}`;
+    name = keyedHelperName(lowerer, "%bytes.idxOr", key);
     lowerer.arrHofHelpers.set(key, name);
     const b = varRef("b.0", bytesT, at);
     const i = varRef("i.0", F64, at);

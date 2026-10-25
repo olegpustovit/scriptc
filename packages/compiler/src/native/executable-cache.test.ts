@@ -40,6 +40,11 @@ function fixture(debug = false) {
   const library = join(sdk, "libSystem.tbd");
   writeFileSync(runtime, "runtime");
   writeFileSync(library, "system library");
+  // A directory's identity is its stat. Where the file system stamps times
+  // at the kernel tick, a file added within the tick of the last write
+  // leaves the directory's times unchanged; an old time makes every later
+  // change to the SDK directory visible.
+  utimesSync(sdk, 0, 0);
   const cache = new NativeCache(join(root, "cache"));
   const key = contentDigest("llvm and options");
   const open = () => new NativeExecutableCache(cache, key, "clang", debug, [runtime]);
@@ -216,4 +221,82 @@ test("a failed or empty link trace cannot publish a completed executable", () =>
     stderr: "failed",
   });
   expect(entry.trace([], f.stage)).toBe(false);
+});
+
+test.each(["ld", "crt", "libc"] as const)(
+  "a Linux key's first link records the linker, startup objects and libc; replacing the %s misses",
+  (input) => {
+    const f = fixture();
+    const lib = join(f.root, "lib");
+    mkdirSync(lib);
+    const paths = {
+      ld: join(f.root, "ld"),
+      crt: join(lib, "Scrt1.o"),
+      libc: join(lib, "libc.so.6"),
+    };
+    writeFileSync(paths.ld, "linker");
+    writeFileSync(paths.crt, "startup object");
+    writeFileSync(paths.libc, "c library");
+    const nonshared = join(lib, "libc_nonshared.a");
+    writeFileSync(nonshared, "archive");
+    const program = join(f.stage, "program.o");
+    writeFileSync(program, "program");
+    // With -v, clang prints the linker job it runs, as -### would; GNU ld's
+    // -t names each file it loads, and an archive member as archive(member).
+    const job = ` "${paths.ld}" "-pie" "-o" "${f.output}" "${paths.crt}" "-L${lib}" "${program}" "-lc"`;
+    const loaded = [paths.crt, program, paths.libc, `${nonshared}(atexit.oS)`].join("\n");
+    vi.mocked(spawnSync).mockImplementation((_command, args) => {
+      const verbose = (args as string[]).includes("-v");
+      return {
+        pid: 1,
+        status: 0,
+        signal: null,
+        output: [],
+        stdout: verbose ? loaded + "\n" : "",
+        stderr: verbose ? job + "\n" : "",
+      };
+    });
+    const open = () => new NativeExecutableCache(f.cache, f.key, "clang", false, [f.runtime], true);
+    // A key's first link traces the driver and the linker in one run, and
+    // records the output it leaves instead of storing the executable.
+    const entry = open();
+    expect(entry.trace(["-o", f.output], f.stage)).toBe(true);
+    expect(spawnSync).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(spawnSync).mock.calls[0]![1]).toEqual(["-o", f.output, "-v", "-Wl,-t"]);
+    entry.publish(f.output);
+    expect(f.cache.read("executable", f.key)).toBeNull();
+    entry.recordOutput(f.output);
+    expect(open().keep(f.output)).toBe(true);
+    const recorded = (
+      JSON.parse(f.cache.read("kept", f.key)!.toString()) as { inputs: { path: string }[] }
+    ).inputs.map((saved) => saved.path);
+    expect(recorded).toEqual(expect.arrayContaining([...Object.values(paths), nonshared, lib]));
+    expect(recorded).not.toContain(program);
+    const before = statSync(paths[input]);
+    writeFileSync(paths[input] + ".new", "x".repeat(before.size));
+    utimesSync(paths[input] + ".new", before.atime, before.mtime);
+    renameSync(paths[input] + ".new", paths[input]);
+    expect(open().keep(f.output)).toBe(false);
+  },
+);
+
+test("a Linux build whose output changed links again, and then stores the executable", () => {
+  const f = fixture();
+  const open = () => new NativeExecutableCache(f.cache, f.key, "clang", false, [f.runtime], true);
+  const first = open();
+  expect(first.trace(["-o", f.output], f.stage)).toBe(true);
+  first.publish(f.output);
+  first.recordOutput(f.output);
+  // The output is overwritten: it is not kept, and the next link publishes.
+  writeFileSync(f.output, Buffer.from([1, 2, 3, 4]));
+  expect(open().keep(f.output)).toBe(false);
+  const second = open();
+  expect(second.restore(f.destination)).toBe(false);
+  expect(second.trace(["-o", f.output], f.stage)).toBe(true);
+  second.publish(f.output);
+  second.recordOutput(f.output);
+  expect(open().keep(f.output)).toBe(true);
+  // The stored executable restores at another path.
+  expect(open().restore(f.destination)).toBe(true);
+  expect(readFileSync(f.destination)).toEqual(readFileSync(f.output));
 });

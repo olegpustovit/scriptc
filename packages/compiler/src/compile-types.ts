@@ -1,8 +1,11 @@
+import type { TargetCpu } from "./backend/target-cpu.js";
 import type { WindowsSubsystem } from "./backend/targets.js";
 import type { NativeLinkInfo } from "./backend/native-link-info.js";
 import type { NativeOptimization } from "./backend/optimization.js";
+import type { NativeProfileMatch } from "./backend/native-profile.js";
 import type { ScrDiagnostic } from "./diagnostics/diagnostic.js";
 import type { CoverageInput } from "./coverage/report.js";
+import type { TierMode } from "./frontend/tier-analysis.js";
 
 export type CompileOutputKind = "ir" | "llvm" | "asm" | "obj" | "exe";
 
@@ -35,6 +38,21 @@ export interface CompileBaseOptions {
    * executable mapped and the memory charged for up to ~100 ms after exit.
    * Executables only; no effect on other platforms. */
   detachedExit?: boolean;
+  /** The x86-64 microarchitecture level the executable's code may require
+   * (`x86-64-v2` to `x86-64-v4`). The program's functions are compiled for
+   * that level, and the executable then runs only on CPUs that support it.
+   * Unset or `baseline`, the code runs on any x86-64 CPU. x86-64 targets
+   * only; the runtime pack keeps its baseline code. */
+  targetCpu?: TargetCpu;
+  /** Instrument the executable for profile-guided optimization. Each run
+   * writes a raw profile to this path pattern (`%p` expands to the process
+   * id; `LLVM_PROFILE_FILE` overrides the pattern at run time). Linux
+   * executables only. */
+  profileGenerate?: string;
+  /** Optimize the executable with this indexed profile (`scriptc
+   * merge-profiles`). Code the profile does not describe, or describes
+   * from an older version of the program, is optimized as without one. */
+  profileUse?: string;
 
   /** Eligible packages compile automatically. Explicit names override automatic selection heuristics. */
   npmStatic?: readonly string[] | "auto";
@@ -45,6 +63,10 @@ export interface CompileBaseOptions {
   /** Attach the machine-readable external link recipe to an object result.
    * Valid only with outputKind "obj"; it never invokes a linker. */
   nativeLinkInfo?: boolean;
+  /** `--tier` (frontend/tier-analysis.ts). "static-only" keeps every demotion
+   * request a refusal (design invariant I2). Until demotion lands both modes
+   * compile exactly as before. */
+  tier?: TierMode;
 }
 
 /** Executable compile options. This remains the compatibility type for the
@@ -79,6 +101,8 @@ export type CompileArtifact =
       path: string;
       translationUnitPath: string;
       backend: "llvm";
+      /** How a `profileUse` build's profile matched the program's functions. */
+      profileMatch?: NativeProfileMatch;
     };
 
 export type CompileFailure = {
@@ -161,6 +185,14 @@ export interface AnalyzeOptions {
    * to analyze project code, but imported runtime values remain explicit
    * SC1010 blockers rather than being counted as executable. */
   externalTypes?: Readonly<Record<string, string>>;
+  /** `--tier` (see CompileBaseOptions.tier). */
+  tier?: TierMode;
+  /** `--explain-dynamic`: attach the tier-assignment report
+   * (CoverageInput.tiers). Such analyses bypass the verdict cache. */
+  explainDynamic?: boolean;
+  /** `--wasm <file>`: WebAssembly module files the program loads that its
+   * sources do not name (absolute paths); reported with the discovered ones. */
+  wasm?: readonly string[];
 }
 
 export interface AnalyzeResult {

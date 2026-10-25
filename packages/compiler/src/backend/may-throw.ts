@@ -3,7 +3,8 @@
 import type { IrExpr, IrStmt, IrModule, IrType, SrcLoc } from "../ir/ir.js";
 import { isFfiCallbackParam, MAY_THROW_ARR_METHODS, MAY_THROW_BYTES_METHODS } from "../ir/ir.js";
 import { MAY_THROW_LIB_FNS } from "../ir/builtin-effects.js";
-import { everyExprChild, everyStmtChild, everyStmtList } from "../ir/traverse.js";
+import { everyExprChild, everyStmtChild } from "../ir/traverse.js";
+import { eachNodeOfKinds, type IrNodeIndex } from "../ir/node-index.js";
 import { hasRetainedFfiCallback } from "./ffi-callbacks.js";
 import { computePublishedTypes, writesPublished } from "./publication.js";
 
@@ -35,7 +36,14 @@ export type MayThrowReason =
  * and a generator's `.return()` unwind through `catch`. */
 export function computeMayThrow(
   mod: IrModule,
-  options: { stackChecks?: boolean; explain?: boolean } = {},
+  options: {
+    stackChecks?: boolean;
+    explain?: boolean;
+    /** computePublishedTypes(mod), when the caller already has it. */
+    published?: ReturnType<typeof computePublishedTypes>;
+    /** The module's node index, read instead of walking the bodies. */
+    nodes?: IrNodeIndex;
+  } = {},
 ): {
   fns: Set<string>;
   /** With `explain`: the reason each may-throw function was marked. */
@@ -47,10 +55,12 @@ export function computeMayThrow(
    * entry (and may therefore throw the stack-overflow RangeError). */
   stackChecks?: Set<string>;
 } {
-  const terminations = mod.workers === true ? workerTerminationPolls(mod) : null;
-  const stackChecks = options.stackChecks === true ? stackCheckedFunctions(mod) : null;
+  const terminations = mod.workers === true ? workerTerminationPolls(mod, options.nodes) : null;
+  const stackChecks =
+    options.stackChecks === true ? stackCheckedFunctions(mod, options.nodes) : null;
   // Stores that can reach a published object throw the frozen TypeError.
-  const published = computePublishedTypes(mod);
+  const published =
+    options.published !== undefined ? options.published : computePublishedTypes(mod);
   interface Facts {
     throws: boolean;
     callees: string[];
@@ -83,7 +93,7 @@ export function computeMayThrow(
   const classes = new Map((mod.classes ?? []).map((cls) => [cls.name, cls]));
   const constructorClasses = new Map<string, string>();
   const classValueCallers = new Map<string, Set<string>>();
-  const tdzGlobals = (mod.globals ?? []).filter((g) => g.tdz).map((g) => g.id);
+  const tdzGlobals = new Set((mod.globals ?? []).filter((g) => g.tdz).map((g) => g.id));
   for (const cls of mod.classes ?? []) {
     constructorClasses.set(`%${cls.name}.constructor`, cls.name);
     for (const m of cls.methods ?? []) {
@@ -103,11 +113,10 @@ export function computeMayThrow(
     if (explain) f.calleeLocs = new Map();
     // TDZ reads and non-initializing writes can throw ReferenceError.
     // Capture locals carry the same flag as the declaring binding.
-    const tdzIds = new Set([...tdzGlobals, ...fn.locals.filter((l) => l.tdz).map((l) => l.id)]);
-    const mutableTdzIds = new Set([
-      ...tdzGlobals,
-      ...fn.locals.filter((l) => l.tdz && l.mutable).map((l) => l.id),
-    ]);
+    // Every TDZ global counts for both reads and writes; the module's set is
+    // shared by every function.
+    const tdzLocals = new Set(fn.locals.filter((l) => l.tdz).map((l) => l.id));
+    const mutableTdzLocals = new Set(fn.locals.filter((l) => l.tdz && l.mutable).map((l) => l.id));
     // Traverse typed executable nodes without copying the IR into unknown.
     const visit = (rec: IrExpr | IrStmt): boolean => {
       const threw = f.throws;
@@ -123,13 +132,17 @@ export function computeMayThrow(
         case "varRef":
         case "incDec":
         case "assignExpr":
-          if (tdzIds.has(rec.localId)) f.throws = true;
+          if (tdzGlobals.has(rec.localId) || tdzLocals.has(rec.localId)) f.throws = true;
           break;
         case "assign":
           // A declaration is allowed to fill an empty box. Legacy const
           // TDZ stores also initialize; only mutable subsequent stores
           // introduce the new write-side exception edge.
-          if (rec.initializes !== true && mutableTdzIds.has(rec.localId)) f.throws = true;
+          if (
+            rec.initializes !== true &&
+            (tdzGlobals.has(rec.localId) || mutableTdzLocals.has(rec.localId))
+          )
+            f.throws = true;
           break;
         case "dynCheck":
         case "caughtCheck":
@@ -297,7 +310,9 @@ export function computeMayThrow(
             rec.method === "replaceAll" ||
             rec.method === "split" ||
             rec.method === "matchAll" ||
-            rec.method === "matchAllInto"
+            rec.method === "matchAllCaptures" ||
+            rec.method === "matchAllInto" ||
+            rec.method === "matchAllCapturesInto"
           ) {
             f.throws = true;
           }
@@ -580,7 +595,7 @@ function breaksTo(
 
 /** Statements no execution reaches: those after a statement that cannot
  * complete normally in the same statement list. */
-function unreachableStatements(body: readonly IrStmt[]): Set<IrStmt> {
+export function unreachableStatements(body: readonly IrStmt[]): Set<IrStmt> {
   const dead = new Set<IrStmt>();
   const { statement } = completion();
   const list = (stmts: readonly IrStmt[]): void => {
@@ -890,7 +905,19 @@ function boundedNode(rec: IrExpr | IrStmt): boolean {
  * finishes after finitely many steps or reaches a polling callee. `polls`
  * names the functions that poll (and therefore may unwind with the
  * termination sentinel); `entry` the subset that polls on entry. */
-export function workerTerminationPolls(mod: IrModule): {
+/** The kinds call-graph census below can skip: boundedNode answers true
+ * for them, and the census reads nothing else from them. */
+const CENSUS_SKIPPED_KINDS: ReadonlySet<string> = new Set(
+  [...BOUNDED_KINDS].filter(
+    (kind) =>
+      !["while", "doWhile", "for", "forOf", "call", "new", "virtualCall", "closure"].includes(kind),
+  ),
+);
+
+export function workerTerminationPolls(
+  mod: IrModule,
+  nodes?: IrNodeIndex,
+): {
   entry: Set<string>;
   polls: Set<string>;
 } {
@@ -906,11 +933,12 @@ export function workerTerminationPolls(mod: IrModule): {
   const edges = new Map<string, string[]>();
   const entry = new Set<string>();
   const polls = new Set<string>();
+  const scan = nodes?.scanExcept(CENSUS_SKIPPED_KINDS);
   for (const fn of mod.functions) {
     const out: string[] = [];
     let bounded = fn.async !== true && fn.generator === undefined && fn.name !== mod.entry;
     let loops = false;
-    const visit = (rec: IrExpr | IrStmt): boolean => {
+    const visit = (rec: IrExpr | IrStmt): void => {
       if (!boundedNode(rec)) bounded = false;
       switch (rec.kind) {
         case "while":
@@ -929,9 +957,8 @@ export function workerTerminationPolls(mod: IrModule): {
           out.push(...(methodImpls.get(rec.method) ?? []));
           break;
       }
-      return true;
     };
-    everyStmtList(fn.body, { expr: visit, stmt: visit });
+    eachNodeOfKinds(fn, scan, visit);
     edges.set(
       fn.name,
       out.filter((callee) => names.has(callee)),
@@ -952,7 +979,7 @@ export function workerTerminationPolls(mod: IrModule): {
  * library call; see boundedNode) also reaches every function that such an
  * operation can invoke: closure targets and class members. Non-recursive
  * functions, including leaf callbacks, stay check-free. */
-export function stackCheckedFunctions(mod: IrModule): Set<string> {
+export function stackCheckedFunctions(mod: IrModule, nodes?: IrNodeIndex): Set<string> {
   const reentry = "\0reentry";
   const methodImpls = new Map<string, string[]>();
   const memberPrefixes = new Set<string>();
@@ -967,12 +994,13 @@ export function stackCheckedFunctions(mod: IrModule): Set<string> {
   const names = new Set(mod.functions.map((fn) => fn.name));
   const edges = new Map<string, string[]>();
   const targets = new Set<string>();
+  const scan = nodes?.scanExcept(CENSUS_SKIPPED_KINDS);
   for (const fn of mod.functions) {
     const dot = fn.name.indexOf(".");
     if (dot > 0 && memberPrefixes.has(fn.name.slice(0, dot + 1))) targets.add(fn.name);
     const out: string[] = [];
     let reenters = false;
-    const visit = (rec: IrExpr | IrStmt): boolean => {
+    const visit = (rec: IrExpr | IrStmt): void => {
       if (!boundedNode(rec)) reenters = true;
       switch (rec.kind) {
         case "call":
@@ -988,9 +1016,8 @@ export function stackCheckedFunctions(mod: IrModule): Set<string> {
           targets.add(rec.fnName);
           break;
       }
-      return true;
     };
-    everyStmtList(fn.body, { expr: visit, stmt: visit });
+    eachNodeOfKinds(fn, scan, visit);
     const callees = out.filter((callee) => names.has(callee));
     if (reenters) callees.push(reentry);
     edges.set(fn.name, callees);

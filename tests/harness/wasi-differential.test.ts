@@ -277,8 +277,11 @@ describe.skipIf(!zigOnPath())("wasm32-wasi differential", () => {
     "5087-promise-allsettled-any-dyn.js",
     "5088-promise-combinator-thenables.js",
     "2018-generators-uncaught.ts",
+    "5839-timers-promises-scheduler.ts",
     "2019-generators-loops.ts",
     "2093-timers-promises.ts",
+    "5830-timers-promises-signal.ts",
+    "5889-timers-scheduler-signal.ts",
     "2683-fs-rename-js.cjs",
     "2906-bigint-wasi-width.ts",
     "4900-bigint-division-cross-check.ts",
@@ -307,6 +310,12 @@ describe.skipIf(!zigOnPath())("wasm32-wasi differential", () => {
     "5721-intern-table-values.ts",
     // Array key sizes are checked in 32-bit size_t arithmetic.
     "5726-intern-table-key-limits.ts",
+    // ThreadSlots blocks and pages hold 32-bit pointers.
+    "5727-thread-slots-basics.ts",
+    "5729-thread-slots-values.ts",
+    // Weak-collection hashes mix 32-bit pointers in 64 bits.
+    "4591-weak-keys-union-records.ts",
+    "7742-weak-collections-many-keys.ts",
   ])("the LLVM target runs %s byte-identically to Node", async (fixture) => {
     const entry = join(repoRoot, "tests/corpus", fixture);
     const outDir = await mkdtemp("/tmp/scriptc-wasi-");

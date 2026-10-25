@@ -59,8 +59,12 @@
  *            order that differs from insertion order where the program
  *            observes it (SC6002), localeCompare over text the built-in
  *            collation does not cover (SC6003), a call feeding an instance
- *            to a cast to an unrelated class (SC6004), and Date strings the native parser does not
- *            accept (SC6005)
+ *            to a cast to an unrelated class (SC6004); SC6005 (Date strings
+ *            outside the native parser's grammar) is retired — the runtime
+ *            parses date strings with V8's grammar. SC61xx are performance
+ *            notes, also warnings (coverage --fail-on=dynamic opts in):
+ *            likely-hot functions that use untyped values (SC6101,
+ *            diagnostics/dynamic-tier.ts)
  *   SC9xxx  internal compiler errors (still source-anchored)
  */
 import type { SrcLoc } from "../ir/ir.js";
@@ -88,6 +92,10 @@ export interface ScrDiagnostic {
    * the error may not reproduce under the project's tsc. Machine-readable
    * output reports these under the "environment" category. */
   typeWorld?: boolean;
+  /** A runtime fence in a module's top-level code, outside every function
+   * and class member body: it throws when the module initializes, which is
+   * program startup for a module the entry imports. */
+  startup?: true;
 }
 
 /** SC3002–SC3004 — native-helper target, installation, and execution
@@ -97,14 +105,18 @@ export function nativeCodegenDiag(
   code: "SC3002" | "SC3003" | "SC3004",
   message: string,
   file: string,
+  hint?: string,
 ): ScrDiagnostic {
+  const shown =
+    hint ??
+    (code === "SC3003"
+      ? "reinstall scriptc with optional dependencies enabled for this host"
+      : undefined);
   return {
     code,
     message,
     loc: { file, start: 0, end: 0 },
-    ...(code === "SC3003"
-      ? { hint: "reinstall scriptc with optional dependencies enabled for this host" }
-      : {}),
+    ...(shown !== undefined ? { hint: shown } : {}),
   };
 }
 
@@ -196,18 +208,6 @@ export function unrelatedClassCastDivergenceDiag(
   };
 }
 
-/** SC6005 — a Date string literal outside the grammar the native parser
- * accepts (ISO 8601 with an explicit offset, date-only forms, and the
- * certificate-time shape): Node parses many more forms. */
-export function dateLiteralDivergenceDiag(text: string, loc: SrcLoc): ScrDiagnostic {
-  return {
-    code: "SC6005",
-    message: `the date string '${text}' parses to an invalid date (NaN) natively, while Node accepts it (the native parser takes ISO 8601 date-times with an explicit offset, such as '2024-01-02T03:04:05Z', and date-only forms)`,
-    loc,
-    hint: "write the date in ISO 8601 with an explicit offset ('Z' or '+HH:MM'), or build it from numbers with Date.UTC",
-  };
-}
-
 /* ── SC5xxx: native FFI ───────────────────────────────────────────────── */
 
 /** SC5001 — the outbound native-FFI manifest is malformed or unreadable. */
@@ -278,11 +278,11 @@ export const UNSUPPORTED: Record<string, UnsupportedEntry> = {
       "imports (#alias via the imports field, self-name references via " +
       "exports), statically compiled npm packages, " +
       "and the built-in fs, fs/promises, path, os, url, crypto, zlib, " +
-      "child_process, net, http, tls, https, http2, dgram, dns, util, " +
+      "child_process, net, http, tls, https, http2, dgram, dns, dns/promises, util, " +
       "util/types, string_decoder, querystring, readline, events, stream, " +
-      "stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, " +
+      "stream/promises, stream/consumers, stream/web, buffer, assert, assert/strict, worker_threads, " +
       "cluster, tty, async_hooks, timers, timers/promises, " +
-      "diagnostics_channel, perf_hooks, module, and console modules (bare or " +
+      "diagnostics_channel, perf_hooks, module, v8, and console modules (bare or " +
       "node:-prefixed) and node:test (node:-prefixed only, like in Node) " +
       "are supported",
   },
@@ -407,7 +407,7 @@ export const UNSUPPORTED: Record<string, UnsupportedEntry> = {
   SC1120: {
     feature: "this regex feature",
     milestone: "later",
-    hint: "supported: literal regexes with the g/i/m/s/u/y flags — .test(), .exec()/.match()/.matchAll(), named capture groups (.groups, $<name> templates, \\k<name>), .source/.flags, and string replace/replaceAll/split with string replacement templates",
+    hint: "supported: literal regexes with the g/i/m/s/u/v/y flags — .test(), .exec()/.match()/.matchAll(), named capture groups (.groups, $<name> templates, \\k<name>), .source/.flags, and string replace/replaceAll/split with string replacement templates",
   },
   // SC1121 (stateful g/y regex tests) shipped — code retired, do not reuse.
 };
@@ -622,7 +622,7 @@ export function unsupportedTypeDiag(typeText: string, loc: SrcLoc): ScrDiagnosti
     code: "SC2001",
     message:
       `values of type '${typeText}' cannot be compiled yet ` +
-      `(supported: number, string, boolean, arrays, Maps, Sets, RegExp, read-only Date values, functions, classes, records, unions of those, and 'unknown')`,
+      `(supported: number, string, boolean, arrays, Maps, Sets, RegExp, Dates, functions, classes, records, unions of those, and 'unknown')`,
     loc,
     milestone: "M2",
   };
@@ -656,7 +656,7 @@ export function genericSignatureTypeDiag(typeText: string, loc: SrcLoc): ScrDiag
 export function indexSignatureTypeDiag(typeText: string, loc: SrcLoc): ScrDiagnostic {
   return {
     code: "SC2006",
-    message: `values of type '${typeText}' cannot be compiled: this index signature is outside the supported shape (string or number keys; values limited to numbers, strings, booleans, records, classes, arrays, unions, functions, Maps, Sets, RegExps, Promises, or 'unknown')`,
+    message: `values of type '${typeText}' cannot be compiled: this index signature is outside the supported shape (string or number keys; values limited to numbers, strings, booleans, records, classes, arrays, unions, functions, Maps, Sets, RegExps, Dates, Promises, or 'unknown')`,
     loc,
     milestone: "M2",
     hint: "string- and number-keyed index signatures over the supported value types compile directly; symbol keys and dual signatures with unequal value types have no lowering",
@@ -744,6 +744,23 @@ export function noLoweringDiag(
       (viaNodeTypes
         ? "the type checker sees everything @types/node declares, but only the supported surface compiles (https://scriptc.dev/limitations)"
         : "the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)"),
+  };
+}
+
+/** A REACHED use of a part of the WebAssembly API scriptc does not
+ * implement yet (SC2020): the streaming functions, Tag and Exception, the
+ * classes as values. compile, instantiate, validate, the Module, Instance,
+ * Memory, Table and Global constructors, Module.imports/exports/
+ * customSections and the error classes lower (builtins/webassembly.ts).
+ * `surface` names what was used ('WebAssembly.compileStreaming',
+ * 'WebAssembly.Memory'). */
+export function webAssemblyDiag(surface: string, loc: SrcLoc): ScrDiagnostic {
+  return {
+    code: "SC2020",
+    message: `'${surface}' is not supported yet: scriptc implements WebAssembly.compile, instantiate, validate, the Module, Instance, Memory, Table and Global constructors, Module.imports, exports and customSections, and the error classes over modules translated at build time, but not this part of the API`,
+    loc,
+    milestone: "later",
+    hint: "the streaming functions, Tag and Exception, and the classes used as values other than with new and instanceof are planned; 'scriptc coverage' lists the modules this program loads (https://scriptc.dev/limitations)",
   };
 }
 
@@ -873,13 +890,20 @@ export function unsupportedPackageValueDiag(pkg: string, loc: SrcLoc): ScrDiagno
   );
 }
 
-export function npmStaticRefusalDiag(pkg: string, detail: string, loc: SrcLoc): ScrDiagnostic {
+export function npmStaticRefusalDiag(
+  pkg: string,
+  detail: string,
+  loc: SrcLoc,
+  hint?: string,
+): ScrDiagnostic {
   return {
     code: "SC2013",
     message: `cannot compile npm package '${pkg}' statically: ${detail}`,
     loc,
     milestone: "later",
-    hint: "use a dependency with supported source, or replace the unsupported operation; scriptc has no interpreter fallback",
+    hint:
+      hint ??
+      "use a dependency with supported source, or replace the unsupported operation; scriptc has no interpreter fallback",
   };
 }
 

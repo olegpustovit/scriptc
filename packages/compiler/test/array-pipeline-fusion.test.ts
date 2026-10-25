@@ -26,7 +26,7 @@ function helperCalls(fn: IrFunction): string[] {
   everyStmtList(fn.body, {
     expr: (e) => {
       if (e.kind === "call" && e.callee.startsWith("%arr."))
-        calls.push(e.callee.replace(/\.\d+$/, ""));
+        calls.push(e.callee.replace(/\.[0-9a-f]+$/, ""));
       return true;
     },
     stmt: () => true,

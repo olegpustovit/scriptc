@@ -1,3 +1,4 @@
+import { keyedHelperName } from "../stable-names.js";
 import { identityPreservingWidening } from "../coercions/identity.js";
 import { countedFor, numLit, varRef } from "../../../ir/build.js";
 import {
@@ -28,7 +29,7 @@ export function arrayConcatHelper(
   const key = `concat:${typeKey(elem)}:${shape.map((type) => (type ? `a:${typeKey(type)}` : "e")).join(";")}`;
   const existing = lowerer.arrHofHelpers.get(key);
   if (existing) return existing;
-  const name = `%arr.concat.${lowerer.arrHofHelpers.size}`;
+  const name = keyedHelperName(lowerer, "%arr.concat", key);
   const arrT = arrayOf(elem);
   const params = [
     { localId: "a.0", name: "a", type: arrT },
@@ -96,11 +97,15 @@ export function arrayConcatHelper(
     return [
       { kind: "varDecl", localId: "offset.0", init: length(out), loc },
       { kind: "varDecl", localId: "count.0", init: length(source), loc },
+      // Storage is reserved first and the length is set after the copy, so
+      // a source without holes is copied by appends and the result gets no
+      // state bytes.
       {
         kind: "arraySetLength",
         arr: out,
         length: { kind: "bin", op: "+", left: offset, right: count, type: F64, loc },
         loc,
+        reserve: true,
       },
       countedFor(loc, count, () => [
         {
@@ -133,6 +138,12 @@ export function arrayConcatHelper(
           loc,
         },
       ]),
+      {
+        kind: "arraySetLength",
+        arr: out,
+        length: { kind: "bin", op: "+", left: offset, right: count, type: F64, loc },
+        loc,
+      },
     ];
   };
   const body: IrStmt[] = [
@@ -144,7 +155,7 @@ export function arrayConcatHelper(
     },
     ...append(varRef("a.0", arrT, loc), elem, node.expression),
     ...shape.flatMap((type, i) =>
-      append(varRef(`x.${i}`, type ? arrayOf(type) : elem, loc), type, node.arguments[i]!),
+      append(varRef(`x.${i}`, type ? arrayOf(type) : elem, loc), type, node.arguments.nodes[i]!),
     ),
     { kind: "return", value: out, loc },
   ];

@@ -2,7 +2,7 @@
 title: "CLI Reference"
 ---
 
-The `scriptc` command has four subcommands: `build`, `run`, `coverage`, and `cache warm`. `scriptc --help` prints this summary and the options below, and `scriptc --version` prints the installed version.
+The `scriptc` command has five subcommands: `build`, `run`, `coverage`, `cache warm`, and `merge-profiles`. `scriptc --help` prints this summary and the options below, and `scriptc --version` prints the installed version.
 
 ```console
 $ scriptc --help
@@ -23,6 +23,13 @@ Usage:
                                             contract sidecar JSON beside the archive
   scriptc cache warm [runtime|tls…] verify and load precompiled runtime families
                                             for the current compiler/SDK/target
+  scriptc merge-profiles -o <out.profdata> [--sparse] <profile…>
+                                            merge the raw profiles that
+                                            --profile-generate runs wrote (or
+                                            earlier merged profiles) into one
+                                            profile for --profile-use;
+                                            --sparse leaves out functions
+                                            that never ran (a smaller file)
 ```
 
 ## scriptc build
@@ -85,6 +92,16 @@ Analyzes the program without building it and reports what compiles and what bloc
 
 Verifies and loads the installed precompiled runtime objects and vendored libraries, and prints the cache directory. Pass `runtime`, `tls`, or both to select which to warm. Ordinary builds don't need this step. With `--sanitize`, it builds the instrumented runtime objects using a C toolchain.
 
+## scriptc merge-profiles
+
+Merges the raw profiles that runs of a `--profile-generate` executable wrote, and any earlier merged profiles, into one profile for `--profile-use`. See [Profile-guided optimization](#profile-guided-optimization).
+
+```console
+$ scriptc merge-profiles -o app.profdata profiles/*.profraw
+```
+
+With `--sparse`, the profile leaves out the functions the runs never reached. The file is smaller, typically by about two thirds, and those functions are optimized as without a profile instead of as cold code.
+
 ## Options
 
 <dl>
@@ -92,13 +109,13 @@ Verifies and loads the installed precompiled runtime objects and vendored librar
   <dd>Primary artifact path. An explicit path is exact. Defaults are <code>.scriptc/&lt;name&gt;.ir.json</code>, <code>.ll</code>, <code>.s</code>, <code>.o</code>, or the platform executable name.</dd>
 
   <dt><code>--emit &lt;ir|llvm|asm|obj|exe&gt;</code></dt>
-  <dd>Select the primary artifact: serialized typed IR (<code>ir</code>), textual LLVM IR (<code>llvm</code>), assembly (<code>asm</code>), a relocatable object (<code>obj</code>), or an executable (<code>exe</code>, the default). Every kind except <code>exe</code> is produced without an external compiler, linker, or SDK.</dd>
+  <dd>Select the primary artifact: serialized typed IR (<code>ir</code>), textual LLVM IR (<code>llvm</code>), assembly (<code>asm</code>), a relocatable object (<code>obj</code>), or an executable (<code>exe</code>, the default). Every kind except <code>exe</code> is produced without an external compiler, linker, or SDK. Assembly and object output is compiled as one module; only executables are divided into partitions that compile in parallel (see <a href="/docs/how-it-works#build-parallelism">Build parallelism</a>).</dd>
 
   <dt><code>--print &lt;native-link-info|diagnostics&gt;</code></dt>
   <dd><code>native-link-info</code>: build an object (equivalent to <code>--emit=obj</code>) and print its machine-readable external link recipe as JSON instead of printing the artifact path. The document names the exact installed precompiled runtime pack and all link inputs, but does not invoke a linker. <code>diagnostics</code>: for <code>build</code> and <code>coverage</code>, print the versioned JSON diagnostics document described in <a href="/docs/coverage#machine-readable-diagnostics">Coverage Reports</a> instead of the human output.</dd>
 
-  <dt><code>--fail-on &lt;blockers|divergences&gt;</code></dt>
-  <dd>Coverage only. Exit with status 1 when the entry has blockers that would fail a build, or with <code>divergences</code>, also when it has Node divergence warnings. See <a href="/docs/coverage#gating-builds-and-ci">Gating builds and CI</a>.</dd>
+  <dt><code>--fail-on &lt;blockers|divergences|dynamic&gt;</code></dt>
+  <dd>Coverage only. Exit with status 1 when the entry has blockers that would fail a build, with <code>divergences</code>, also when it has Node divergence warnings, or with <code>dynamic</code>, also when it has the <code>SC6101</code> warning for untyped code that likely runs often. See <a href="/docs/coverage#gating-builds-and-ci">Gating builds and CI</a>.</dd>
 
   <dt><code>--ffi &lt;file&gt;</code></dt>
   <dd>Bind signature-only TypeScript declarations to native C ABI symbols and link the manifest's archive, object, and system-library inputs. See <a href="/docs/ffi">Native FFI</a>.</dd>
@@ -110,7 +127,7 @@ Verifies and loads the installed precompiled runtime objects and vendored librar
   <dd>Remove symbol and debug payload when linking an executable, including cross-compiled targets. This flag preserves code optimization.</dd>
 
   <dt><code>--optimization &lt;release|dev|speed&gt;</code></dt>
-  <dd>Select native optimization for executable, assembly, or object output. The default is <code>release</code> (<code>-O2</code>), which emits string retains and the retains and releases of dynamic values inline and lets LLVM inline small runtime functions that keep no internal runtime state into executable code; programs large enough to be compiled in parallel partitions skip that inlining to keep build time and size in check. <code>dev</code> uses <code>-O0</code> and emits source locations for TypeScript and JavaScript breakpoints and stack frames. LLVM builds include source variable names and native storage descriptions; see <a href="/docs/limitations#native-debugging">Native debugging</a> for the supported representations. macOS executable builds also produce an adjacent <code>.dSYM</code> bundle. <code>speed</code> is <code>-O2</code> plus optimizations that trade binary size and build time for run-time speed: it lets LLVM inline more small runtime functions into program code, emits the remaining reference counting inline, and on x86-64 starts every runtime function on a cache-line boundary. Expect larger executables and longer cold builds than <code>release</code>; how much faster a program runs depends on how much of its time is spent in the runtime. Runtime inlining needs a runtime pack built with the LLVM helper; where a runtime pack lacks it, programs link the same runtime without it and <code>speed</code> links the release runtime and keeps inline reference counting. Selecting <code>speed</code> never changes what <code>release</code> builds produce, and the two never share cached artifacts. Library profiles accept <code>"optimization": "speed"</code> for inline reference counting.</dd>
+  <dd>Select native optimization for executable, assembly, or object output. The default is <code>release</code> (<code>-O2</code>), which emits string retains and the retains and releases of dynamic values inline. <code>dev</code> uses <code>-O0</code> and emits source locations for TypeScript and JavaScript breakpoints and stack frames. LLVM builds include source variable names and native storage descriptions; see <a href="/docs/limitations#native-debugging">Native debugging</a> for the supported representations. macOS executable builds also produce an adjacent <code>.dSYM</code> bundle. <code>speed</code> is <code>-O2</code> plus optimizations that trade binary size and build time for run-time speed: it emits the remaining reference counting inline and, on x86-64, starts every runtime function on a cache-line boundary. Expect larger executables and longer cold builds than <code>release</code>; how much faster a program runs depends on how much of its time is spent in the runtime. Where a runtime pack has no speed runtime, <code>speed</code> links the release runtime and keeps inline reference counting. Selecting <code>speed</code> never changes what <code>release</code> builds produce, and the two never share cached artifacts. Library profiles accept <code>"optimization": "speed"</code> for inline reference counting. In executables large enough to be divided into partitions, <code>dev</code> compiles each partition on its own, and <code>release</code> and <code>speed</code> add a step that lets partitions import small functions from each other; see <a href="/docs/how-it-works#build-parallelism">Build parallelism</a>.</dd>
 
   <dt><code>--windows-subsystem &lt;console|gui&gt;</code></dt>
   <dd>Select the subsystem of a Windows executable. <code>console</code> is the default; <code>gui</code> prevents Windows from opening a console window for the app. Valid only for executable builds targeting Windows.</dd>
@@ -118,14 +135,35 @@ Verifies and loads the installed precompiled runtime objects and vendored librar
   <dt><code>--detached-exit</code></dt>
   <dd>On Linux, when the program calls <code>process.exit()</code>, hand the release of its memory to a helper process so the parent sees the exit sooner. The kernel otherwise frees the whole address space before the exit is reported, which takes tens of milliseconds per gigabyte. Opt in only where the trade-offs are acceptable: for up to about 100 ms after the exit, the helper keeps the executable mapped (overwriting the binary in place fails with "text file busy"), its memory stays charged to the cgroup, and the teardown CPU time no longer appears in the parent's resource usage. Valid only for executable builds; it has no effect on other platforms.</dd>
 
+  <dt><code>--target-cpu &lt;baseline|x86-64-v2|x86-64-v3|x86-64-v4|native&gt;</code></dt>
+  <dd>On x86-64 targets, compile the program's code for an x86-64 microarchitecture level. The default, <code>baseline</code>, runs on any x86-64 CPU. A higher level lets LLVM use more instructions, and the executable then runs only on CPUs that support that level. <code>native</code> uses the highest level the build machine supports. Valid for executable, assembly, and object output on x86-64 targets. See <a href="#target-cpu">Target CPU</a>.</dd>
+
+  <dt><code>--profile-generate &lt;pattern&gt;</code></dt>
+  <dd>On Linux, build an instrumented executable for profile-guided optimization. Each run writes a raw profile to the path pattern, where <code>%p</code> expands to the process ID; the <code>LLVM_PROFILE_FILE</code> environment variable overrides the pattern at run time. A relative pattern resolves from the current working directory. Instrumented programs run slower. Valid only for executable builds with <code>--optimization=release</code> or <code>speed</code>.</dd>
+
+  <dt><code>--profile-use &lt;file.profdata&gt;</code></dt>
+  <dd>Optimize the executable with a profile from <code>scriptc merge-profiles</code>: code is laid out, inlined, and split by how the profiled runs used it. Code the profile does not describe, or describes from an older version of the program, is optimized as without a profile, so a stale profile only loses part of its gain. A new or changed profile compiles every partition of the program again. Valid only for executable builds with <code>--optimization=release</code> or <code>speed</code>.</dd>
+
   <dt><code>--npm-static &lt;pkg[,pkg…]|auto&gt;</code></dt>
-  <dd>Name npm packages to compile even if they don't ship their own type declarations (repeatable). <code>auto</code> uses the default automatic selection. Packages that can't compile produce diagnostics. See <a href="/docs/dependencies#explicit-package-selection">npm Dependencies</a>.</dd>
+  <dd>Name npm packages to compile even if they don't ship their own type declarations (repeatable). A trailing <code>...</code>, as in <code>fs-extra...</code>, also names every package that package depends on. <code>auto</code> uses the default automatic selection. Packages that can't compile produce diagnostics. See <a href="/docs/dependencies#explicit-package-selection">npm Dependencies</a>.</dd>
 
   <dt><code>--provenance-sources</code></dt>
   <dd>Experimental. Compile npm dependencies from the source at the commit their provenance attestation names. Packages without a usable attestation compile from their installed files.</dd>
 
   <dt><code>--external-types &lt;specifier=file.d.ts&gt;</code></dt>
   <dd>Coverage only. Map an exact bare module specifier to a local declaration file supplied by an embedder. Repeat the option for multiple modules. The declaration supplies checker types so application coverage can continue; runtime imports and values remain explicit <code>SC1010</code> blockers. Relative paths resolve from the current working directory. Accepted files end in <code>.d.ts</code>, <code>.d.mts</code>, or <code>.d.cts</code>.</dd>
+
+  <dt><code>--tier &lt;auto|static-only&gt;</code></dt>
+  <dd>The tier policy for code that has no static lowering. <code>auto</code> is the default. <code>static-only</code> guarantees that the program contains no dynamic-tier demotions: every such construct stays a compile error in TypeScript and a deferred runtime error in JavaScript, which is how both modes behave today. Use it in CI to keep a program fully static. Library mode is always static-only. See <a href="/docs/coverage#dynamic-tier">Dynamic tier</a>.</dd>
+
+  <dt><code>--explain-dynamic[=&lt;name&gt;]</code></dt>
+  <dd>Coverage only. After the report, list the functions that already operate on values typed only at runtime and the bindings, fields, functions, classes and modules that unsupported constructs would move to the dynamic tier, each with the diagnostic behind it. With a name such as <code>x</code>, <code>Point</code>, or <code>Point.x</code>, show only the matching units. See <a href="/docs/coverage#dynamic-tier">Dynamic tier</a>.</dd>
+
+  <dt><code>--no-dynamic-tier-warning</code></dt>
+  <dd>Build and coverage. Leave out <code>SC6101</code>, the warning that names functions that likely run often and use untyped values. Not allowed with <code>--fail-on=dynamic</code>. See <a href="/docs/coverage#untyped-code-that-likely-runs-often">Untyped code that likely runs often</a>.</dd>
+
+  <dt><code>--wasm &lt;file.wasm&gt;</code></dt>
+  <dd>Coverage only. Report a WebAssembly module the program loads from a path its sources do not spell out. The report already lists modules whose paths the compiler resolves, modules inlined as base64 literals, and <code>.wasm</code> files shipped by packages that use WebAssembly; a <code>scriptc.wasm</code> array in <code>package.json</code> adds files the same way as this flag. Each module is listed with its size, whether it validates, and the WebAssembly proposals it uses. Builds translate the modules they find to native code; a build reads the <code>scriptc.wasm</code> array but not this flag. Repeatable.</dd>
 
   <dt><code>--sanitize</code></dt>
   <dd>Build an executable with AddressSanitizer and a reference-count audit at exit, the same checks scriptc's own test suite uses. Requires a C compiler and is available only for host builds. Not supported with <code>--emit=asm</code> or <code>--emit=obj</code>.</dd>
@@ -150,7 +188,7 @@ Verifies and loads the installed precompiled runtime objects and vendored librar
 
 <dl>
   <dt><code>SCRIPTC_CACHE_DIR</code></dt>
-  <dd>Override the persistent build-cache root. By default it is <code>$XDG_CACHE_HOME/scriptc/build</code> when set, <code>$HOME/Library/Caches/scriptc/build</code> on macOS, <code>%LOCALAPPDATA%\scriptc\cache\build</code> on Windows, and <code>$HOME/.cache/scriptc/build</code> elsewhere. Cached frontend results and LLVM artifacts are verified against their source, helper, target, and compilation settings. Native outputs also depend on the selected runtime pack and linker inputs. FFI objects, archives, and system libraries relink against their current dependencies. Sanitizer development builds additionally cache instrumented runtime objects and verify external compiler and header inputs. An existing POSIX override must already be private; otherwise caching is bypassed without changing the directory's permissions.</dd>
+  <dd>Override the persistent build-cache root. By default it is <code>$XDG_CACHE_HOME/scriptc/build</code> when set, <code>$HOME/Library/Caches/scriptc/build</code> on macOS, <code>%LOCALAPPDATA%\scriptc\cache\build</code> on Windows, and <code>$HOME/.cache/scriptc/build</code> elsewhere. Cached frontend results and LLVM artifacts, including the compiled partitions of large executables, are verified against their source, helper, target, and compilation settings. Native outputs also depend on the selected runtime pack and linker inputs. FFI objects, archives, and system libraries relink against their current dependencies. Sanitizer development builds additionally cache instrumented runtime objects and verify external compiler and header inputs. An existing POSIX override must already be private; otherwise caching is bypassed without changing the directory's permissions.</dd>
 
   <dt><code>SCRIPTC_NO_CACHE</code></dt>
   <dd>Set to <code>1</code> to bypass all build-cache reads and writes. An explicitly empty <code>SCRIPTC_CACHE_DIR</code> has the same effect.</dd>
@@ -169,6 +207,12 @@ Verifies and loads the installed precompiled runtime objects and vendored librar
 
   <dt><code>SCRIPTC_RUNTIME_PACK</code></dt>
   <dd>A runtime pack directory to use instead of an installed <code>@scriptc/runtime-&lt;target&gt;</code> package.</dd>
+
+  <dt><code>SCRIPTC_CHECKER</code></dt>
+  <dd>The TypeScript 7 API server that checks the program: <code>tsc-ts</code> (the default), which scriptc includes, or <code>tsgo</code>, from the <code>typescript</code> package scriptc also includes. Both give the same diagnostics and generated code.</dd>
+
+  <dt><code>SCRIPTC_CHECKER_SERVER</code></dt>
+  <dd>Set to <code>1</code> on Linux and macOS to check with a tsc-ts server that later builds share. It takes effect with a tsc-ts release that serves <code>tsc-ts --api --listen</code>. The tsc-ts 0.0.9 that this version of scriptc includes does not, so each build checks with its own tsc-ts process, as without the variable. A build connects to the server for its working directory, starting it when none answers, and the server keeps the files it parsed, so the next build of the same program loads it faster. A build that finds the server in use by another build, or cannot start or reach it, checks with its own tsc-ts process. The server exits after 5 minutes without a build, or after a build when its resident memory is above 2048 MB (<code>TSC_TS_LISTEN_MEMORY</code> sets another limit in megabytes). Diagnostics and generated code are the same with and without it. It applies to the default checker, tsc-ts.</dd>
 </dl>
 
 ```console
@@ -176,6 +220,56 @@ $ SCRIPTC_TARGET=aarch64-linux-gnu.2.36 scriptc build fib.ts -o fib-linux
 $ file fib-linux
 fib-linux: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, for GNU/Linux 2.0.0, with debug_info, not stripped
 ```
+
+## Profile-guided optimization
+
+A profile records how often each branch and call ran in representative runs of the program. With it, the optimizer inlines the hot calls, keeps hot paths together, and moves cold code out of the way. Profiling takes three steps:
+
+```console
+$ scriptc build app.ts --optimization=speed --profile-generate profiles/%p.profraw -o app-instrumented
+$ ./app-instrumented typical-input.json
+$ scriptc merge-profiles -o app.profdata profiles/*.profraw
+$ scriptc build app.ts --optimization=speed --profile-use app.profdata
+```
+
+Train on workloads like the ones the program will run: code the training never reached is optimized as without a profile. The profile can be committed and reused as the program changes. Functions whose control flow changed since the profile was collected lose their profile, and the rest keep theirs, so regenerate it when much of the program has changed. [Build parallelism](/docs/how-it-works#build-parallelism) describes what a profile adds to build time.
+
+## Target CPU
+
+By default, x86-64 executables run on any x86-64 CPU, so the compiler uses only the baseline instruction set (SSE2). `--target-cpu` compiles the program's code for a higher x86-64 microarchitecture level. Each level includes the ones below it:
+
+<table>
+  <thead>
+    <tr>
+      <th>Level</th>
+      <th>Adds</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>x86-64-v2</code></td>
+      <td>SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT</td>
+    </tr>
+    <tr>
+      <td><code>x86-64-v3</code></td>
+      <td>AVX, AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE</td>
+    </tr>
+    <tr>
+      <td><code>x86-64-v4</code></td>
+      <td>AVX-512 (F, BW, CD, DQ, VL)</td>
+    </tr>
+  </tbody>
+</table>
+
+```console
+$ scriptc build app.ts --target-cpu=x86-64-v3 -o app
+```
+
+Loops over typed arrays and numbers gain the most, because LLVM vectorizes them with wider registers. Some loops run slower at a higher level, so measure the program on the machines it will run on.
+
+An executable built for a level runs only on CPUs that support that level. On an older CPU, it crashes with an illegal-instruction signal (`SIGILL`) when it reaches an instruction the CPU lacks. A named level is portable to every machine of that level. `native` selects the highest level the build machine supports, so use it only for executables that run on the machine that built them or on identical machines.
+
+The level applies to the program's own code. The runtime pack keeps its baseline code. Builds for different levels never share cached artifacts, and `baseline` builds are the same as builds without the option.
 
 ## LLVM backend
 

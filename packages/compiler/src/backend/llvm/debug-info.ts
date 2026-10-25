@@ -139,7 +139,6 @@ export class LlvmDebugInfo {
     let id: string;
     switch (type.kind) {
       case "f64":
-      case "date":
       case "procStream":
         id = this.add(
           `!DIBasicType(name: ${quoted(type.kind === "f64" ? "number" : type.kind)}, size: 64, encoding: DW_ATE_float)`,
@@ -190,7 +189,7 @@ export class LlvmDebugInfo {
             ? []
             : [
                 this.add(
-                  `!DIDerivedType(tag: DW_TAG_member, name: "arm${i}", baseType: ${this.type(arm)}, size: ${arm.kind === "bool" ? 8 : arm.kind === "f64" || arm.kind === "date" ? 64 : this.pointerBits})`,
+                  `!DIDerivedType(tag: DW_TAG_member, name: "arm${i}", baseType: ${this.type(arm)}, size: ${arm.kind === "bool" ? 8 : arm.kind === "f64" ? 64 : this.pointerBits})`,
                 ),
               ],
         );
@@ -239,9 +238,7 @@ export class LlvmDebugInfo {
     // Scalar forward captures use an array-backed TDZ box. Expose that
     // exceptional representation opaquely rather than reporting a bad value.
     const opaqueBox =
-      local.boxed &&
-      local.tdz &&
-      (local.type.kind === "f64" || local.type.kind === "bool" || local.type.kind === "date");
+      local.boxed && local.tdz && (local.type.kind === "f64" || local.type.kind === "bool");
     const type = opaqueBox
       ? this.pointer(
           this.add(

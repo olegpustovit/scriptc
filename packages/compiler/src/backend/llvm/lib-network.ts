@@ -42,7 +42,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
   if (e.fn === "http.requestConn" || e.fn === "http.requestConnCb") {
     const args = e.args.map((arg) => host.emitExpr(arg));
     host.usesTimers = true;
-    host.moveTemp(args[0]!);
+    host.toHeap(args[0]!);
     const cb = args[6];
     const handler =
       cb === undefined
@@ -60,7 +60,54 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
       ...handler,
     ]);
   }
+  if (
+    e.fn === "http.requestDyn" ||
+    e.fn === "http.requestDynCb" ||
+    e.fn === "https.requestDyn" ||
+    e.fn === "https.requestDynCb"
+  ) {
+    // [options, autoEnd(, cb)]: the runtime walks the options record and
+    // attaches its signal through events.addAbortListener (the event-target
+    // unit, linked for these calls by runtime-features).
+    const args = e.args.map((arg) => host.emitExpr(arg));
+    host.usesTimers = true;
+    const cb = args[2];
+    const handler =
+      cb === undefined
+        ? [ptr(), ptr()]
+        : callbackAdapter(
+            host,
+            cb,
+            callbackType(cb).params.length === 0
+              ? "scr_http_resp_thunk0"
+              : "scr_http_resp_thunk_res",
+            ["ptr", "ptr"],
+          );
+    host.declare(`declare ptr @scr_events_add_abort_listener(ptr, ptr)`);
+    return finishRuntimeCall(
+      host,
+      e,
+      e.fn.startsWith("https.") ? "scr_https_request_dyn" : "scr_http_request_dyn",
+      [
+        abiValue(host, args[0]!),
+        abiValue(host, args[1]!),
+        ...handler,
+        ptr("@scr_events_add_abort_listener"),
+      ],
+    );
+  }
   const B = host.B;
+  if (e.fn === "net.listenPath" || e.fn === "net.listenPathCb") {
+    const args = e.args.map((a) => host.emitExpr(a));
+    let cb = "null";
+    if (e.fn === "net.listenPathCb") {
+      host.toHeap(args[2]!);
+      cb = args[2]!.name;
+    }
+    host.declare(`declare void @scr_net_listen_path(ptr, ptr, ptr)`);
+    B.line(`call void @scr_net_listen_path(ptr ${args[0]!.name}, ptr ${args[1]!.name}, ptr ${cb})`);
+    return { name: "", type: e.type };
+  }
   if (e.fn === "net.connectOptsChk") {
     return emitAlwaysThrowLibCall(host, e, "scr_net_connect_opts_chk");
   }
@@ -72,7 +119,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
       const cbT = e.args[0]!.type;
       if (cbT.kind !== "func")
         throw new InternalCompilerError("llvm emitter bug: net.createServerCb handler not a func");
-      host.moveTemp(args[0]!);
+      host.toHeap(args[0]!);
       cb = args[0]!.name;
       adapter = cbT.params.length === 0 ? "@scr_net_conn_thunk0" : "@scr_net_conn_thunk_sock";
       host.declare(`declare void ${adapter}(ptr, ptr)`);
@@ -86,7 +133,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
     const args = e.args.map((a) => host.emitExpr(a));
     let cb = "null";
     if (e.fn === "net.listenCb") {
-      host.moveTemp(args[2]!);
+      host.toHeap(args[2]!);
       cb = args[2]!.name;
     }
     host.declare(`declare void @scr_net_listen(ptr, double, ptr)`);
@@ -109,7 +156,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
     if (withCallback) {
       const cbT = e.args[cbIndex]!.type;
       if (cbT.kind === "func") {
-        host.moveTemp(args[cbIndex]!);
+        host.toHeap(args[cbIndex]!);
         cb = args[cbIndex]!.name;
       } else {
         if (cbT.kind !== "union")
@@ -135,6 +182,19 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
     );
     return { name: "", type: e.type };
   }
+  if (e.fn === "http.clientSignal") {
+    // [request, signal]: events.addAbortListener comes from the
+    // event-target unit (runtime-features links it for this call).
+    const request = host.emitExpr(e.args[0]!);
+    const signal = host.emitExpr(e.args[1]!);
+    host.declare(`declare ptr @scr_events_add_abort_listener(ptr, ptr)`);
+    host.declare(`declare void @scr_http_client_add_abort_signal(ptr, ptr, ptr)`);
+    B.line(
+      `call void @scr_http_client_add_abort_signal(ptr ${request.name}, ptr ${signal.name}, ptr @scr_events_add_abort_listener)`,
+    );
+    host.emitPendingCheck();
+    return { name: "", type: e.type };
+  }
   if (e.fn === "net.serverAddress") {
     // The AddressInfo record from the three runtime reads.
     if (e.type.kind !== "record")
@@ -155,7 +215,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
       const i = shape.fields.findIndex((f) => f.name === name);
       if (i < 0)
         throw new InternalCompilerError(`llvm emitter bug: net.serverAddress record lacks ${name}`);
-      return i + 1;
+      return i + host.nullableUnions.fieldBase(recT.shapeId);
     };
     const store = (name: string, ty: string, v: string): void => {
       const p = B.tmp();
@@ -179,7 +239,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
     const args = e.args.map((a) => host.emitExpr(a));
     let cb = "null";
     if (e.fn === "net.serverCloseCb") {
-      host.moveTemp(args[1]!);
+      host.toHeap(args[1]!);
       cb = args[1]!.name;
     }
     host.declare(`declare void @scr_net_server_close(ptr, ptr)`);
@@ -220,7 +280,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
       throw new InternalCompilerError("llvm emitter bug: close override not a func");
     const args = e.args.map((a) => host.emitExpr(a));
     const wrapSym = host.closeOverrideWrapFor(cbT.params[0]!, cbT.ret.kind === "netServer");
-    host.moveTemp(args[1]!); // ownership moves into the wrapper's env box
+    host.toHeap(args[1]!); // ownership moves into the wrapper's env box
     const wrap = host.wrapEmitterListener(args[1]!.name, wrapSym);
     host.declare(`declare void @scr_net_server_set_close_override(ptr, ptr)`);
     B.line(`call void @scr_net_server_set_close_override(ptr ${args[0]!.name}, ptr ${wrap})`);
@@ -231,7 +291,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
     if (cbT.kind !== "func")
       throw new InternalCompilerError(`llvm emitter bug: ${e.fn} callback not a func`);
     const args = e.args.map((a) => host.emitExpr(a));
-    host.moveTemp(args[1]!);
+    host.toHeap(args[1]!);
     const adapter = cbT.params.length === 0 ? "scr_child_err_thunk0" : "scr_child_err_thunk_error";
     const entry =
       e.fn === "net.serverOnError" ? "scr_net_server_on_error" : "scr_net_sock_on_error";
@@ -258,7 +318,8 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
     e.fn === "http.clientOnTimeout" ||
     e.fn === "http.clientOnClose" ||
     e.fn === "http.clientOnFinish" ||
-    e.fn === "http.clientOnAbort"
+    e.fn === "http.clientOnAbort" ||
+    e.fn === "http.clientOnContinue"
   ) {
     // Adapter-free registrations: (recv, cb /moves/, once).
     const entry = {
@@ -278,9 +339,10 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
       "http.clientOnClose": "scr_http_client_on_close",
       "http.clientOnFinish": "scr_http_client_on_finish",
       "http.clientOnAbort": "scr_http_client_on_abort",
+      "http.clientOnContinue": "scr_http_client_on_continue",
     }[e.fn]!;
     const args = e.args.map((a) => host.emitExpr(a));
-    host.moveTemp(args[1]!);
+    host.toHeap(args[1]!);
     host.declare(`declare void @${entry}(ptr, ptr, i1 zeroext)`);
     B.line(`call void @${entry}(ptr ${args[0]!.name}, ptr ${args[1]!.name}, i1 ${args[2]!.name})`);
     return { name: "", type: e.type };
@@ -297,7 +359,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
     if (cbT.kind !== "func")
       throw new InternalCompilerError(`llvm emitter bug: ${e.fn} callback not a func`);
     const args = e.args.map((a) => host.emitExpr(a));
-    host.moveTemp(args[cbIndex]!);
+    host.toHeap(args[cbIndex]!);
     const adapter = cbT.params.length === 0 ? "scr_net_conn_thunk0" : "scr_net_conn_thunk_sock";
     host.declare(`declare void @${adapter}(ptr, ptr)`);
     if (e.fn === "http.serverSetTimeoutCb") {
@@ -325,7 +387,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
     const args = e.args.map((a) => host.emitExpr(a));
     let cb = "null";
     if (e.fn === "net.connectCb") {
-      host.moveTemp(args[2]!);
+      host.toHeap(args[2]!);
       cb = args[2]!.name;
     }
     host.declare(`declare ptr @scr_net_connect_checked(double, ptr, ptr)`);
@@ -342,7 +404,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
     if (cbT.kind !== "func")
       throw new InternalCompilerError(`llvm emitter bug: ${e.fn} callback not a func`);
     const args = e.args.map((a) => host.emitExpr(a));
-    host.moveTemp(args[1]!);
+    host.toHeap(args[1]!);
     const adapter =
       cbT.params.length === 0
         ? "scr_net_data_thunk0"
@@ -518,7 +580,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
       const cbT = e.args[0]!.type;
       if (cbT.kind !== "func")
         throw new InternalCompilerError("llvm emitter bug: http.createServer handler not a func");
-      host.moveTemp(args[0]!);
+      host.toHeap(args[0]!);
       cb = args[0]!.name;
       const sym =
         cbT.params.length === 2
@@ -534,12 +596,12 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
     B.line(`${t} = call ptr @scr_http_create_server(ptr ${cb}, ptr ${adapter})`);
     return host.own({ name: t, type: e.type });
   }
-  if (e.fn === "http.serverOnRequest") {
+  if (e.fn === "http.serverOnRequest" || e.fn === "http.serverOnCheck") {
     const cbT = e.args[1]!.type;
     if (cbT.kind !== "func")
-      throw new InternalCompilerError("llvm emitter bug: http.serverOnRequest handler not a func");
+      throw new InternalCompilerError(`llvm emitter bug: ${e.fn} handler not a func`);
     const args = e.args.map((a) => host.emitExpr(a));
-    host.moveTemp(args[1]!);
+    host.toHeap(args[1]!);
     const adapter =
       cbT.params.length === 2
         ? "scr_http_handler_thunk2"
@@ -547,6 +609,13 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
           ? "scr_http_handler_thunk1"
           : "scr_http_handler_thunk0";
     host.declare(`declare void @${adapter}(ptr, ptr, ptr)`);
+    if (e.fn === "http.serverOnCheck") {
+      host.declare(`declare void @scr_http_server_on_check(ptr, ptr, ptr, i1 zeroext, i1 zeroext)`);
+      B.line(
+        `call void @scr_http_server_on_check(ptr ${args[0]!.name}, ptr ${args[1]!.name}, ptr @${adapter}, i1 ${args[2]!.name}, i1 ${args[3]!.name})`,
+      );
+      return { name: "", type: e.type };
+    }
     host.declare(`declare void @scr_http_server_on_request(ptr, ptr, ptr, i1 zeroext)`);
     B.line(
       `call void @scr_http_server_on_request(ptr ${args[0]!.name}, ptr ${args[1]!.name}, ptr @${adapter}, i1 ${args[2]!.name})`,
@@ -558,7 +627,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
     if (cbT.kind !== "func")
       throw new InternalCompilerError(`llvm emitter bug: ${e.fn} listener not a func`);
     const args = e.args.map((a) => host.emitExpr(a));
-    host.moveTemp(args[1]!);
+    host.toHeap(args[1]!);
     const adapter =
       cbT.params.length === 3
         ? "scr_http_upgrade_thunk3"
@@ -585,7 +654,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
     if (cbT.kind !== "func")
       throw new InternalCompilerError(`llvm emitter bug: ${e.fn} callback not a func`);
     const args = e.args.map((a) => host.emitExpr(a));
-    host.moveTemp(args[1]!);
+    host.toHeap(args[1]!);
     const adapter =
       e.fn === "http.clientOnResponse"
         ? cbT.params.length === 0
@@ -608,7 +677,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
   }
   if (e.fn === "http.resOnFinish" || e.fn === "http.resOnEndCallback") {
     const args = e.args.map((a) => host.emitExpr(a));
-    host.moveTemp(args[1]!);
+    host.toHeap(args[1]!);
     const entry =
       e.fn === "http.resOnFinish" ? "scr_http_res_on_finish" : "scr_http_res_on_end_callback";
     host.declare(`declare void @${entry}(ptr, ptr)`);
@@ -617,7 +686,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
   }
   if (e.fn === "http.resSetTimeoutCb" || e.fn === "http.reqSetTimeoutCb") {
     const args = e.args.map((a) => host.emitExpr(a));
-    host.moveTemp(args[2]!);
+    host.toHeap(args[2]!);
     const entry =
       e.fn === "http.resSetTimeoutCb" ? "scr_http_res_set_timeout" : "scr_http_req_set_timeout";
     host.declare(`declare void @${entry}(ptr, double, ptr)`);
@@ -628,7 +697,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
   }
   if (e.fn === "http.clientSetTimeoutCb") {
     const args = e.args.map((a) => host.emitExpr(a));
-    host.moveTemp(args[2]!);
+    host.toHeap(args[2]!);
     host.declare("declare void @scr_http_client_set_timeout_cb(ptr, double, ptr)");
     B.line(
       `call void @scr_http_client_set_timeout_cb(ptr ${args[0]!.name}, double ${args[1]!.name}, ptr ${args[2]!.name})`,
@@ -637,21 +706,21 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
   }
   if (e.fn === "net.sockOnFinish") {
     const args = e.args.map((a) => host.emitExpr(a));
-    host.moveTemp(args[1]!);
+    host.toHeap(args[1]!);
     host.declare(`declare void @scr_net_sock_on_finish(ptr, ptr)`);
     B.line(`call void @scr_net_sock_on_finish(ptr ${args[0]!.name}, ptr ${args[1]!.name})`);
     return { name: "", type: e.type };
   }
   if (e.fn === "net.sockOnWriteFlush") {
     const args = e.args.map((a) => host.emitExpr(a));
-    host.moveTemp(args[1]!);
+    host.toHeap(args[1]!);
     host.declare(`declare void @scr_net_sock_on_write_flush(ptr, ptr)`);
     B.line(`call void @scr_net_sock_on_write_flush(ptr ${args[0]!.name}, ptr ${args[1]!.name})`);
     return { name: "", type: e.type };
   }
   if (e.fn === "net.sockSetTimeoutCb") {
     const args = e.args.map((a) => host.emitExpr(a));
-    host.moveTemp(args[2]!);
+    host.toHeap(args[2]!);
     host.declare("declare void @scr_net_sock_set_timeout_cb(ptr, double, ptr)");
     B.line(
       `call void @scr_net_sock_set_timeout_cb(ptr ${args[0]!.name}, double ${args[1]!.name}, ptr ${args[2]!.name})`,

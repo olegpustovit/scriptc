@@ -1,5 +1,9 @@
+import { keyedHelperName } from "../stable-names.js";
+import { indexedUnionArms, lowerIndexedUnionToArray } from "../indexed-unions.js";
 import { generatorDrain } from "../iterator-adapters.js";
 import { identityPreservingWidening } from "../coercions/identity.js";
+import { liftedFreshSpread } from "../coercions/fresh-spread.js";
+import { checkedIterableSpread } from "../checked-iterable-spread.js";
 import { InternalCompilerError } from "../../../errors.js";
 import {
   dynUndefinedExpr,
@@ -24,6 +28,7 @@ import {
   STRING,
   type SrcLoc,
   arrayOf,
+  canConvertToDyn,
   funcOf,
   isRefCounted,
   isSupportedArrayElem,
@@ -44,6 +49,7 @@ import {
   lowerArrayCallback,
   callbackArrayElement,
 } from "./callback-arguments.js";
+import { classGeneratorIterable } from "../class-iterables.js";
 
 /** Build the argument array for a mutating/copying operation while keeping
  * the receiver's scalar payload ABI. A missing read is represented as the
@@ -141,6 +147,42 @@ export function lowerArraySpreadItems(
       if (source.type.kind === "record" && lowerer.shapes.get(source.type.shapeId)?.tuple) {
         source = lowerer.widthCoerce(source, arrType) ?? source;
       }
+      if (
+        !typeEquals(source.type, arrType) &&
+        !(
+          source.type.kind === "array" &&
+          identityPreservingWidening(lowerer, source.type.elem, elem)
+        )
+      ) {
+        // Fresh elements (an array literal) convert into the element layout.
+        source = liftedFreshSpread(lowerer, node.expression, source, arrType, loc) ?? source;
+      }
+      // A checked-dynamic source, or any other iterable spread into
+      // checked-dynamic items, drains once through the iterator protocol
+      // (with the spread call's TypeErrors), and its elements convert to
+      // the element type.
+      const drains =
+        source.type.kind === "dyn"
+          ? elem.kind === "dyn" ||
+            elem.kind === "f64" ||
+            elem.kind === "string" ||
+            elem.kind === "bool"
+          : elem.kind === "dyn" &&
+            !typeEquals(source.type, arrType) &&
+            !(
+              source.type.kind === "array" &&
+              identityPreservingWidening(lowerer, source.type.elem, elem)
+            ) &&
+            canConvertToDyn(
+              source.type,
+              (id) => lowerer.shapes.get(id),
+              (id) => lowerer.unions.get(id),
+            );
+      if (drains) {
+        const spelling = ts.getTextOfNode(node.expression);
+        const items = checkedIterableSpread(lowerer, source, spelling, loc);
+        source = lowerer.coerceInto(node.expression, items, arrType);
+      }
       if (!typeEquals(source.type, arrType)) {
         if (
           source.type.kind !== "array" ||
@@ -216,7 +258,7 @@ function appendWidenedArrayValues(
   const key = `insertValues:${typeKey(sourceType.elem)}:${typeKey(elem)}`;
   let name = lowerer.arrHofHelpers.get(key);
   if (!name) {
-    name = `%arr.insertValues.${lowerer.arrHofHelpers.size}`;
+    name = keyedHelperName(lowerer, "%arr.insertValues", key);
     lowerer.arrHofHelpers.set(key, name);
     const outType = arrayOf(elem);
     const valueType = arrayValueType(lowerer, source.type.elem);
@@ -265,6 +307,22 @@ function appendWidenedArrayValues(
 }
 
 /** The Array constructor's element and count forms, shared by calls and new. */
+/** The value of `.fill(v)` when `expr` is that call's receiver. */
+function fillArgumentOfReceiver(expr: ts.Expression): ts.Expression | null {
+  let receiver: ts.Node = expr;
+  let parent = expr.parent;
+  while (ts.isParenthesizedExpression(parent)) {
+    receiver = parent;
+    parent = parent.parent;
+  }
+  if (!ts.isPropertyAccessExpression(parent) || parent.expression !== receiver) return null;
+  if (parent.name.text !== "fill" || parent.questionDotToken) return null;
+  const call = parent.parent;
+  if (!ts.isCallExpression(call) || call.expression !== parent) return null;
+  const value = call.arguments.nodes[0];
+  return value !== undefined && !ts.isSpreadElement(value) ? value : null;
+}
+
 export function lowerArrayConstructor(
   lowerer: Lowerer,
   expr: ts.CallExpression | ts.NewExpression,
@@ -279,7 +337,7 @@ export function lowerArrayConstructor(
   // reference. Known element forms retain native arrays, including their
   // existing sparse storage and indexed property contracts.
   if (
-    isJsSourceFile(expr.getSourceFile()) &&
+    isJsSourceFile(ts.getSourceFileOfNode(expr)) &&
     (result?.kind !== "array" || result.elem.kind === "dyn")
   ) {
     return {
@@ -295,7 +353,16 @@ export function lowerArrayConstructor(
     const contextual = lowerer.checker.getContextualType(expr);
     if (contextual) result = lowerer.mapTypeOf(contextual);
   }
-  if (isJsSourceFile(expr.getSourceFile()) && (result === null || result.kind === "dyn"))
+  // `Array(n).fill(v)`: the checker types the length-constructed array as
+  // any[], but fill gives every element v's type.
+  if (result?.kind !== "array") {
+    const fillValue = fillArgumentOfReceiver(expr);
+    const elem = fillValue
+      ? lowerer.mapTypeOf(lowerer.checker.getBaseTypeOfLiteralType(lowerer.typeOf(fillValue)))
+      : null;
+    if (elem !== null && isSupportedArrayElem(elem)) result = arrayOf(elem);
+  }
+  if (isJsSourceFile(ts.getSourceFileOfNode(expr)) && (result === null || result.kind === "dyn"))
     result = arrayOf(DYN);
   if (result?.kind !== "array" || !isSupportedArrayElem(result.elem)) {
     lowerer.badType(expr, lowerer.typeOf(expr));
@@ -448,12 +515,12 @@ export function lowerArrayOfCall(
   if (result?.kind !== "array" || !isSupportedArrayElem(result.elem)) {
     lowerer.badType(call, lowerer.typeOf(call));
   }
-  if (call.arguments.some(ts.isSpreadElement)) {
-    return lowerArraySpreadItems(lowerer, call.arguments, result.elem, result, locOf(call));
+  if (call.arguments.nodes.some(ts.isSpreadElement)) {
+    return lowerArraySpreadItems(lowerer, call.arguments.nodes, result.elem, result, locOf(call));
   }
   return {
     kind: "arrayLit",
-    elems: call.arguments.map((arg) => lowerer.lowerExprExpecting(arg, result.elem)),
+    elems: call.arguments.nodes.map((arg) => lowerer.lowerExprExpecting(arg, result.elem)),
     type: result,
     loc: locOf(call),
   };
@@ -795,9 +862,9 @@ export function lowerArrayFromCall(
   if (!lowerer.isStdlibGlobal(access.expression, "Array")) return null;
   if (access.name.text !== "from") return null;
   const loc = locOf(call);
-  const args = call.arguments;
+  const args = call.arguments.nodes;
   if (
-    isJsSourceFile(call.getSourceFile()) &&
+    isJsSourceFile(ts.getSourceFileOfNode(call)) &&
     args.length >= 1 &&
     args.length <= 3 &&
     !args.some(ts.isSpreadElement)
@@ -884,9 +951,9 @@ export function lowerArrayFromCall(
   if (
     args.length === 1 &&
     ts.isObjectLiteralExpression(args[0]!) &&
-    args[0]!.properties.length === 1
+    args[0]!.properties.nodes.length === 1
   ) {
-    const n = lowerLengthProp(lowerer, args[0]!.properties[0]!);
+    const n = lowerLengthProp(lowerer, args[0]!.properties.nodes[0]!);
     if (n) {
       if (n.type.kind !== "f64") lowerer.badType(args[0]!, lowerer.typeOf(args[0]!));
       const arrT = lowerer.mapTypeOf(lowerer.typeOf(call));
@@ -913,7 +980,7 @@ export function lowerArrayFromCall(
   // and materializes holes while keeping element reference identity.
   if ((args.length === 1 || args.length === 2) && !ts.isObjectLiteralExpression(args[0]!)) {
     const source = lowerer.lowerExpr(args[0]!);
-    const src =
+    let src =
       source.type.kind === "string" && args.length === 2
         ? strCharsCall(lowerer, source, loc)
         : source;
@@ -941,7 +1008,7 @@ export function lowerArrayFromCall(
       const valueT = arrayValueType(lowerer, arrT.elem);
       const firstParam =
         ts.isArrowFunction(mapper) || ts.isFunctionExpression(mapper)
-          ? mapper.parameters[0]?.name
+          ? mapper.parameters.nodes[0]?.name
           : undefined;
       const paramSymbol =
         firstParam && ts.isIdentifier(firstParam)
@@ -970,7 +1037,7 @@ export function lowerArrayFromCall(
       const key = `fromArray:${typeKey(arrT.elem)}:${typeKey(outElem)}:${typeKey(fnRet)}:${arity}`;
       let helper = lowerer.arrHofHelpers.get(key);
       if (!helper) {
-        helper = `%arr.fromArray.${lowerer.arrHofHelpers.size}`;
+        helper = keyedHelperName(lowerer, "%arr.fromArray", key);
         lowerer.arrHofHelpers.set(key, helper);
         lowerer.liftedFns.push(
           buildArrayFromArrayFn(lowerer, helper, arrT.elem, outElem, fnRet, arity, loc),
@@ -988,6 +1055,10 @@ export function lowerArrayFromCall(
         loc,
       };
     }
+    // A union of typed arrays and number arrays (indexed-unions.ts).
+    const indexedArms = indexedUnionArms(lowerer, src.type);
+    if (indexedArms && args.length === 1)
+      return lowerIndexedUnionToArray(lowerer, src, indexedArms, loc, true);
     if (src.type.kind === "set" && args.length === 1) {
       return {
         kind: "setIntrinsic",
@@ -1004,6 +1075,13 @@ export function lowerArrayFromCall(
     if (src.type.kind === "dyn" && args.length === 1) {
       return lowerCheckedArrayFrom(lowerer, src, loc);
     }
+    // Array.from(sp): the checked-dynamic view's live pair iteration.
+    if (src.type.kind === "searchParams" && args.length === 1) {
+      return lowerCheckedArrayFrom(lowerer, lowerer.coerceInto(args[0]!, src, DYN), loc);
+    }
+    // A class whose [Symbol.iterator] is a generator method iterates the
+    // generator that method returns.
+    src = classGeneratorIterable(lowerer, src) ?? src;
     // A generator (or an iterator adapted into one) drains in order.
     if (src.type.kind === "generator" && args.length === 1) {
       const arrT = lowerer.mapTypeOf(lowerer.typeOf(call));
@@ -1017,8 +1095,10 @@ export function lowerArrayFromCall(
     );
   }
   const n =
-    args.length === 2 && ts.isObjectLiteralExpression(args[0]!) && args[0]!.properties.length === 1
-      ? lowerLengthProp(lowerer, args[0]!.properties[0]!)
+    args.length === 2 &&
+    ts.isObjectLiteralExpression(args[0]!) &&
+    args[0]!.properties.nodes.length === 1
+      ? lowerLengthProp(lowerer, args[0]!.properties.nodes[0]!)
       : null;
   if (!n) {
     lowerer.noLowering(
@@ -1048,7 +1128,7 @@ export function lowerArrayFromCall(
   const key = `fromLen:${typeKey(fnRet)}:${arity}`;
   let helper = lowerer.arrHofHelpers.get(key);
   if (!helper) {
-    helper = `%arr.fromLen.${lowerer.arrHofHelpers.size}`;
+    helper = keyedHelperName(lowerer, "%arr.fromLen", key);
     lowerer.arrHofHelpers.set(key, helper);
     lowerer.liftedFns.push(buildArrayFromLenFn(helper, fnRet, arity, loc));
   }

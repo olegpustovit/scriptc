@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { globSync, mkdirSync, readFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
+import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -162,6 +163,7 @@ describe(`static fetch differential${sanitize ? " (sanitized)" : ""}`, () => {
     "static-listener-noncallable",
     "static-abort-throw",
     "static-dispatch-throw",
+    "static-response-json",
   ] as const;
   test.for(
     staticCases.flatMap((name) => (["llvm"] as const).map((backend) => [name, backend] as const)),
@@ -461,6 +463,7 @@ describe(`proxy env opt-in (NODE_USE_ENV_PROXY${sanitize ? ", sanitized" : ""})`
       NO_PROXY: "",
     };
     const before = servers.proxiedRequests();
+    const tunneledBefore = servers.tunneledRequests();
     const authBefore = servers.proxyAuthorizations().length;
     const [nodeRes, nativeRes] = await Promise.all([
       runBinary("node", [entry, ...argv], env),
@@ -470,6 +473,8 @@ describe(`proxy env opt-in (NODE_USE_ENV_PROXY${sanitize ? ", sanitized" : ""})`
     expect(nativeRes.exitCode, nativeRes.stderr.toString("utf8")).toBe(nodeRes.exitCode);
     expectCleanStderr(nativeRes, nodeRes);
     expect(servers.proxiedRequests() - before).toBe(2);
+    // Both lanes reach the http:// target through a CONNECT tunnel.
+    expect(servers.tunneledRequests() - tunneledBefore).toBe(2);
     expect(servers.proxyAuthorizations().slice(authBefore)).toEqual([
       expectedProxyAuthorization,
       expectedProxyAuthorization,
@@ -522,6 +527,7 @@ describe(`proxy env opt-in (NODE_USE_ENV_PROXY${sanitize ? ", sanitized" : ""})`
         NO_PROXY: "",
       };
       const before = servers.proxiedRequests();
+      const tunneledBefore = servers.tunneledRequests();
       const authBefore = servers.proxyAuthorizations().length;
       const [nodeRes, nativeRes] = await Promise.all([
         runBinary("node", [entry, baseUrl], env),
@@ -531,6 +537,7 @@ describe(`proxy env opt-in (NODE_USE_ENV_PROXY${sanitize ? ", sanitized" : ""})`
       expect(nativeRes.exitCode, nativeRes.stderr.toString("utf8")).toBe(nodeRes.exitCode);
       expectCleanStderr(nativeRes, nodeRes);
       expect(servers.proxiedRequests() - before).toBe(2);
+      expect(servers.tunneledRequests() - tunneledBefore).toBe(2);
       expect(servers.proxyAuthorizations().slice(authBefore)).toEqual([
         expectedProxyAuthorization,
         expectedProxyAuthorization,
@@ -592,6 +599,244 @@ describe(`proxy env opt-in (NODE_USE_ENV_PROXY${sanitize ? ", sanitized" : ""})`
       });
     }
   }, 120_000);
+
+  /** An HTTPS target on localhost that counts the requests it serves,
+   * with the localhost certificate or another fixture certificate. */
+  async function secureTarget(cert = "localhost"): Promise<{
+    url: string;
+    requests: () => number;
+    close: () => Promise<void>;
+  }> {
+    const certs = join(fixturesRoot, "../server/certs");
+    let requests = 0;
+    const server = createHttpsServer(
+      {
+        key: readFileSync(join(certs, `${cert}-key.pem`)),
+        cert: readFileSync(join(certs, `${cert}.pem`)),
+      },
+      (request, response) => {
+        requests++;
+        response.end(`secure ${request.url} ${request.headers.host}`);
+      },
+    );
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    return {
+      url: `https://localhost:${port}`,
+      requests: () => requests,
+      close: () =>
+        new Promise<void>((resolve, reject) => {
+          server.close((error) => (error ? reject(error) : resolve()));
+        }),
+    };
+  }
+
+  test.for(["llvm"] as const)(
+    "%s fetch tunnels HTTPS through an http_proxy with CONNECT",
+    async () => {
+      const target = await secureTarget();
+      try {
+        const entry = join(fixturesRoot, "static-proxy/main.mts");
+        const binary = await build(entry, "proxy-connect");
+        const env = {
+          ...process.env,
+          NODE_EXTRA_CA_CERTS: join(fixturesRoot, "../server/certs/ca.pem"),
+          NODE_USE_ENV_PROXY: "1",
+          https_proxy: authenticatedProxyUrl,
+          HTTPS_PROXY: authenticatedProxyUrl,
+          no_proxy: "",
+          NO_PROXY: "",
+        };
+        const before = servers.proxiedRequests();
+        const authBefore = servers.proxyAuthorizations().length;
+        const [nodeRes, nativeRes] = await Promise.all([
+          runBinary("node", [entry, target.url], env),
+          runBinary(binary, [target.url], env),
+        ]);
+        expect(nativeRes.stdout.toString("utf8")).toBe(nodeRes.stdout.toString("utf8"));
+        expect(nativeRes.stdout.toString("utf8")).toContain("200 secure /text localhost:");
+        expect(nativeRes.exitCode, nativeRes.stderr.toString("utf8")).toBe(nodeRes.exitCode);
+        expectCleanStderr(nativeRes, nodeRes);
+        expect(servers.proxiedRequests() - before).toBe(2);
+        expect(target.requests()).toBe(2);
+        expect(servers.proxyAuthorizations().slice(authBefore)).toEqual([
+          expectedProxyAuthorization,
+          expectedProxyAuthorization,
+        ]);
+      } finally {
+        await target.close();
+      }
+    },
+    120_000,
+  );
+
+  test.for(["llvm"] as const)(
+    "%s fetch verifies the target host through the CONNECT tunnel",
+    async () => {
+      // The alt certificate names alt.localhost only.
+      const target = await secureTarget("alt");
+      try {
+        const entry = join(fixturesRoot, "static-network-error/main.mts");
+        const binary = await build(entry, "proxy-connect-verify");
+        const url = target.url;
+        const env = {
+          ...process.env,
+          NODE_EXTRA_CA_CERTS: join(fixturesRoot, "../server/certs/ca.pem"),
+          NODE_USE_ENV_PROXY: "1",
+          https_proxy: proxyUrl,
+          HTTPS_PROXY: proxyUrl,
+          no_proxy: "",
+          NO_PROXY: "",
+        };
+        const [nodeRes, nativeRes] = await Promise.all([
+          runBinary("node", [entry, url], env),
+          runBinary(binary, [url], env),
+        ]);
+        expect(nativeRes.stdout.toString("utf8")).toBe(nodeRes.stdout.toString("utf8"));
+        expect(nativeRes.stdout.toString("utf8")).toBe("TypeError fetch failed true\n");
+        expect(target.requests()).toBe(0);
+      } finally {
+        await target.close();
+      }
+    },
+    120_000,
+  );
+
+  test.for(["llvm"] as const)(
+    "%s fetch sends proxy credentials only with a username and a password",
+    async () => {
+      const entry = join(fixturesRoot, "static-proxy/main.mts");
+      const binary = await build(entry, "proxy-user-only");
+      const userOnly = proxyUrl.replace("http://", "http://proxy-user@");
+      const env = {
+        ...process.env,
+        NODE_USE_ENV_PROXY: "1",
+        http_proxy: userOnly,
+        HTTP_PROXY: userOnly,
+        no_proxy: "",
+        NO_PROXY: "",
+      };
+      const authBefore = servers.proxyAuthorizations().length;
+      const [nodeRes, nativeRes] = await Promise.all([
+        runBinary("node", [entry, baseUrl], env),
+        runBinary(binary, [baseUrl], env),
+      ]);
+      expect(nativeRes.stdout.equals(nodeRes.stdout)).toBe(true);
+      expect(nativeRes.exitCode, nativeRes.stderr.toString("utf8")).toBe(nodeRes.exitCode);
+      expect(servers.proxyAuthorizations().slice(authBefore)).toEqual(["", ""]);
+    },
+    120_000,
+  );
+
+  test.for(["llvm"] as const)(
+    "%s fetch failures through a proxy carry Node's cause",
+    async () => {
+      // Answers every CONNECT with one fixed status line.
+      const statusProxy = createNetServer((socket) => {
+        socket.once("data", () => {
+          socket.end("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        socket.on("error", () => {});
+      });
+      await new Promise<void>((resolve) => statusProxy.listen(0, "127.0.0.1", resolve));
+      const statusProxyUrl = `http://127.0.0.1:${(statusProxy.address() as AddressInfo).port}`;
+      try {
+        const entry = join(fixturesRoot, "static-proxy-error/main.mts");
+        const binary = await build(entry, "proxy-error-cause");
+        for (const proxy of [statusProxyUrl, refusedUrl]) {
+          const env = {
+            ...process.env,
+            NODE_USE_ENV_PROXY: "1",
+            https_proxy: proxy,
+            HTTPS_PROXY: proxy,
+            no_proxy: "",
+            NO_PROXY: "",
+          };
+          const [nodeRes, nativeRes] = await Promise.all([
+            runBinary("node", [entry, "https://localhost/"], env),
+            runBinary(binary, ["https://localhost/"], env),
+          ]);
+          expect(nativeRes.stdout.toString("utf8")).toBe(nodeRes.stdout.toString("utf8"));
+          expect(nativeRes.exitCode, nativeRes.stderr.toString("utf8")).toBe(nodeRes.exitCode);
+        }
+      } finally {
+        await new Promise<void>((resolve) => statusProxy.close(() => resolve()));
+      }
+    },
+    120_000,
+  );
+
+  test.for(["llvm"] as const)(
+    "%s fetch tunnels HTTPS through an HTTPS proxy with CONNECT",
+    async () => {
+      const target = await secureTarget();
+      try {
+        const entry = join(fixturesRoot, "static-proxy/main.mts");
+        const binary = await build(entry, "proxy-https-https");
+        const env = {
+          ...process.env,
+          NODE_EXTRA_CA_CERTS: join(fixturesRoot, "../server/certs/ca.pem"),
+          NODE_USE_ENV_PROXY: "1",
+          https_proxy: secureAuthenticatedProxyUrl,
+          HTTPS_PROXY: secureAuthenticatedProxyUrl,
+          no_proxy: "",
+          NO_PROXY: "",
+        };
+        const before = servers.proxiedRequests();
+        const tunneledBefore = servers.tunneledRequests();
+        const authBefore = servers.proxyAuthorizations().length;
+        const [nodeRes, nativeRes] = await Promise.all([
+          runBinary("node", [entry, target.url], env),
+          runBinary(binary, [target.url], env),
+        ]);
+        expect(nativeRes.stdout.toString("utf8")).toBe(nodeRes.stdout.toString("utf8"));
+        expect(nativeRes.stdout.toString("utf8")).toContain("200 secure /text localhost:");
+        expect(nativeRes.exitCode, nativeRes.stderr.toString("utf8")).toBe(nodeRes.exitCode);
+        expectCleanStderr(nativeRes, nodeRes);
+        expect(servers.proxiedRequests() - before).toBe(2);
+        expect(servers.tunneledRequests() - tunneledBefore).toBe(2);
+        expect(target.requests()).toBe(2);
+        expect(servers.proxyAuthorizations().slice(authBefore)).toEqual([
+          expectedProxyAuthorization,
+          expectedProxyAuthorization,
+        ]);
+      } finally {
+        await target.close();
+      }
+    },
+    120_000,
+  );
+
+  test.for(["llvm"] as const)(
+    "%s fetch verifies the target host through an HTTPS proxy tunnel",
+    async () => {
+      // The alt certificate names alt.localhost only.
+      const target = await secureTarget("alt");
+      try {
+        const entry = join(fixturesRoot, "static-network-error/main.mts");
+        const binary = await build(entry, "proxy-https-verify");
+        const env = {
+          ...process.env,
+          NODE_EXTRA_CA_CERTS: join(fixturesRoot, "../server/certs/ca.pem"),
+          NODE_USE_ENV_PROXY: "1",
+          https_proxy: secureProxyUrl,
+          HTTPS_PROXY: secureProxyUrl,
+          no_proxy: "",
+          NO_PROXY: "",
+        };
+        const [nodeRes, nativeRes] = await Promise.all([
+          runBinary("node", [entry, target.url], env),
+          runBinary(binary, [target.url], env),
+        ]);
+        expect(nativeRes.stdout.toString("utf8")).toBe(nodeRes.stdout.toString("utf8"));
+        expect(nativeRes.stdout.toString("utf8")).toBe("TypeError fetch failed true\n");
+        expect(target.requests()).toBe(0);
+      } finally {
+        await target.close();
+      }
+    },
+    120_000,
+  );
 
   test.for(["llvm"] as const)(
     "%s fetch rejects an invalid opted-in proxy instead of dialing directly",

@@ -29,6 +29,20 @@ void *scr_promise_retain_v(void *p);
 void scr_promise_release_v(void *p);
 
 typedef struct ScrFiber ScrFiber;
+/* Bytes of each async fiber's native stack (scr_async.c), mapped without a
+ * guard page: compiled code checks scr_stack_guard instead, which sits
+ * scr_stack_guard_for's reserve above the mapping's start. Deep enough for
+ * ordinary recursion inside async bodies and generators once that reserve
+ * is taken off; idle and shallow fibers only touch the pages they use.
+ * AddressSanitizer's larger frames get more. */
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define SCR_FIBER_STACK (8 * 1024 * 1024)
+#endif
+#endif
+#ifndef SCR_FIBER_STACK
+#define SCR_FIBER_STACK (512 * 1024)
+#endif
 /* Spawn + run eagerly to the first suspension; returns the promise, +1. */
 ScrPromise *scr_async_spawn(void (*entry)(ScrFiber *, void *), void *argpack);
 /* `await f(...)` of a fiber-backed async f: spawn and await in one call,
@@ -48,12 +62,14 @@ ScrPromise *scr_async_spawn_after(ScrPromise *dependency,
 /* Fiberless async call (native targets): the compiler proves an async body
  * can never park its execution context and runs it directly on the
  * caller's stack between enter and leave. The frame saves what a fresh
- * fiber would isolate — the Error.stack frame chain and the
- * AsyncLocalStorage context — and leave restores both, returning a fresh
- * pending promise (+1) the caller settles from the body's outcome. */
+ * fiber would isolate, the Error.stack frame chain, and leave restores it,
+ * returning a fresh pending promise (+1) the caller settles from the body's
+ * outcome. The body runs in the caller's AsyncLocalStorage context, as
+ * Node runs an async body's synchronous prefix. The second word is unused;
+ * emitted frames keep its size. */
 typedef struct ScrAsyncInline {
   void *stack;
-  void *als;
+  void *reserved;
 } ScrAsyncInline;
 void scr_async_inline_enter(ScrAsyncInline *frame);
 ScrPromise *scr_async_inline_leave(ScrAsyncInline *frame);
@@ -76,6 +92,34 @@ void scr_wasi_await_hop_prepare(ScrFiber *self);
 bool scr_wasi_module_await_prepare(ScrFiber *self, ScrPromise *p);
 void scr_wasi_async_finish(ScrFiber *self);
 void scr_wasi_gen_finish(ScrFiber *self);
+
+/* Native stackless async functions: an async body the compiler lowered to
+ * an LLVM switched coroutine because it suspends only at its own awaits.
+ * It runs on whichever stack resumes it (the spawner's for the eager
+ * prefix, the loop's afterwards) with a heap frame holding the values live
+ * across its awaits, instead of a dedicated fiber stack. Each await first
+ * prepares the continuation (true: the coroutine must suspend; false: it
+ * continues in place, exactly where a fiber's hop would continue without
+ * switching), then extracts the settled result after resuming without any
+ * further hop or park (a rejection re-throws). */
+ScrPromise *scr_async_spawn_stackless(void (*entry)(ScrFiber *, void *), void *argpack);
+bool scr_coro_await_prepare(ScrFiber *self, ScrPromise *p);
+bool scr_coro_hop_prepare(ScrFiber *self);
+void scr_coro_async_finish(ScrFiber *self);
+void scr_coro_await_void(ScrPromise *p);
+double scr_coro_await_f64(ScrPromise *p);
+bool scr_coro_await_bool(ScrPromise *p);
+ScrStr *scr_coro_await_str(ScrPromise *p); /* +1 */
+void *scr_coro_await_ref(ScrPromise *p);   /* +1 via the stored retain */
+/* A direct await of a stackless body: its promise stays inside the fiber
+ * record the spawn returns, and the awaiter takes the result from it. */
+ScrFiber *scr_async_spawn_direct(void (*entry)(ScrFiber *, void *), void *argpack);
+bool scr_coro_direct_prepare(ScrFiber *self, ScrFiber *callee);
+void scr_coro_direct_void(ScrFiber *f);
+double scr_coro_direct_f64(ScrFiber *f);
+bool scr_coro_direct_bool(ScrFiber *f);
+ScrStr *scr_coro_direct_str(ScrFiber *f); /* +1 */
+void *scr_coro_direct_ref(ScrFiber *f);   /* +1 */
 
 double scr_await_f64(ScrPromise *p); /* rejected promises re-throw */
 bool scr_await_bool(ScrPromise *p);
@@ -139,17 +183,38 @@ ScrAlsCtx **scr_als_slot(void);
 #endif
 ScrAlsCtx *scr_als_ctx_retain(ScrAlsCtx *c);
 void scr_als_ctx_release(ScrAlsCtx *c);
+/* After an enterWith: on the main stack, queues the tick that ends it. */
+void scr_als_entered_with(void);
+ScrAlsCtx *scr_als_ctx_alloc(size_t len);
+ScrDyn *scr_als_peek(double id); /* borrowed; NULL when unset */
 double scr_als_new(void);
 ScrDyn *scr_als_get(double id); /* +1; the undefined value when unset */
 ScrAlsCtx *scr_als_enter(double id, ScrDyn *value); /* borrows value; prev out (owned) */
 ScrAlsCtx *scr_als_enter_absent(double id);         /* exit()'s cleared arm */
 void scr_als_restore(ScrAlsCtx *prev);              /* moves prev back in */
+/* A runtime dispatch (an I/O event the loop delivers, a deferred emit)
+ * runs its listeners in the AsyncLocalStorage context of the object or
+ * request Node would run them in: enter installs `ctx` (borrowed, NULL
+ * for no store) and answers the previous context, which leave puts back.
+ * A store a listener enters (enterWith) ends with the dispatch. */
+ScrAlsCtx *scr_als_dispatch_enter(ScrAlsCtx *ctx);
+void scr_als_dispatch_leave(ScrAlsCtx *prev);
+/* The active context, +1 (NULL outside a store): what a handle keeps. */
+ScrAlsCtx *scr_als_capture(void);
 void scr_als_enter_with(double id, ScrDyn *value);  /* no restore point (enterWith) */
 void scr_als_disable(double id);
 /* run/exit: enter (or clear), call the dyn function with the forwarded
  * argument vector, restore (the finally). Result +1 or NULL pending. */
 ScrDyn *scr_als_run(double id, ScrDyn *value, ScrDyn *fn, ScrDyn *args);
 ScrDyn *scr_als_exit_run(double id, ScrDyn *fn, ScrDyn *args);
+/* new AsyncLocalStorage(options) (options borrowed; NaN with the exception
+ * pending for a non-object) and the name it carries (+1). */
+double scr_als_new_options(const ScrDyn *options);
+ScrDyn *scr_als_name(double id);
+/* AsyncLocalStorage.bind over a dyn function and the dyn completion
+ * callbacks (fn borrowed; +1), and AsyncLocalStorage.snapshot() (+1). */
+ScrDyn *scr_als_bind_dyn(ScrDyn *fn, bool always);
+ScrDyn *scr_als_snapshot(void);
 
 /* process.on/once('unhandledRejection', fn): dyn listeners dispatched
  * per never-observed rejection at the end of its nextTick/microtask
@@ -193,10 +258,29 @@ void scr_process_on_warning(ScrDyn *fn);
 void scr_process_off_warning(ScrDyn *fn);
 void scr_process_emit_warning(ScrDyn *args);
 void scr_emit_warning(const char *name, const char *code, ScrStr *message);
+/* process.emitWarning = fn (borrowed; the runtime keeps its own
+ * reference). Later process.emitWarning(...) calls apply the replacement
+ * to their arguments, and runtime-built warnings (Node's own modules call
+ * process.emitWarning) reach it as (message, type[, code]) instead of the
+ * report and the 'warning' listeners. */
+void scr_process_set_emit_warning(ScrDyn *fn);
+/* node:punycode's first load (scr_async_dyn.c): later calls are module
+ * cache hits. The first reports DEP0040 when `report` (false for a require
+ * made from node_modules) — at once for a static ES import, which Node
+ * links before any module evaluates, otherwise on the next tick. */
+void scr_punycode_warn(bool immediate, bool report);
+/* The deprecated Buffer() and new Buffer() called outside node_modules
+ * (scr_async_dyn.c): DEP0005 on the next tick, once, within Node's
+ * 10000-call check (scr_buffer_deprecation_count). */
+void scr_buffer_deprecation(void);
 /* scr_emit_warning once a 'warning' listener exists (scr_lib.c; set by the
  * listener registration): units that cannot link the dyn-async unit route
  * their warnings through it, and print the default report otherwise. */
 extern SCR_TL void (*scr_warning_emit_hook)(const char *name, const char *code, ScrStr *message);
+/* Node's traceWarningHelperShown: the "(Use `node --trace-warnings ...`"
+ * hint follows only the first warning report of the process, whichever
+ * unit prints it (scr_lib.c). */
+extern SCR_TL bool scr_warning_trace_hint_shown;
 /* process.noDeprecation (which 0) and process.throwDeprecation (which 1):
  * the stored value (+1; undefined until assigned), the assignment
  * (borrowed), and the truthiness the warning paths test. */
@@ -306,6 +390,8 @@ void scr_promise_all_store_f64(ScrArr *a, double i, ScrPromise *src);
 void scr_promise_all_store_bool(ScrArr *a, double i, ScrPromise *src);
 void scr_promise_all_store_str(ScrArr *a, double i, ScrPromise *src);
 void scr_promise_all_store_ref(ScrArr *a, double i, ScrPromise *src);
+/* Stores the fulfilled entry promise itself (+1), for Promise.all's tuple form. */
+void scr_promise_all_store_promise(ScrArr *a, double i, ScrPromise *src);
 void scr_promise_adapt_copy(ScrPromise *dst, ScrPromise *src);
 double scr_promise_payload_f64(ScrPromise *p);
 bool scr_promise_payload_bool(ScrPromise *p);
@@ -344,6 +430,14 @@ ScrPromise *scr_immediate_promise(void);
 void scr_clear_interval(double handle);
 
 double scr_set_timeout_handle(ScrClosure *cb, double ms); /* cb ownership moves in */
+/* Queues `cb` (moved) on the MockTimers that mocks AbortSignal.timeout
+ * (scr_test.c), NULL while it is not mocked. AbortSignal.timeout then
+ * aborts its signal from that queue instead of arming a loop timer. */
+extern SCR_TL void (*scr_mt_abort_timeout_arm)(ScrClosure *cb, double ms);
+/* scheduler.wait's mock.timers state (scr_test.c): 0 real, 1 mocked, 2 the
+ * real one restored after a reset, which throws ERR_INVALID_THIS in Node.
+ * scr_tp_scheduler_wait_signal reads it. */
+extern SCR_TL int scr_mt_wait_state;
 void scr_timers_teardown(void);
 /* Timeout.unref()/ref()/hasRef(): loop-liveness bookkeeping over the timer
  * handle (setTimeout/setInterval's id). unref drops the timer from the
@@ -373,6 +467,7 @@ double scr_set_immediate(ScrClosure *cb); /* cb ownership moves in */
  * synchronously on a non-function; borrowed. */
 void scr_queue_microtask(ScrClosure *cb);
 void scr_queue_microtask_dyn(const ScrDyn *cb);
+void scr_queue_microtask_dyn_als(const ScrDyn *cb);
 /* setImmediate AS A dyn VALUE (the traceCallback shape): a minted dyn
  * callable that schedules args[0](args[1..]) on the immediate queue and
  * answers undefined; a non-function first argument throws Node's
@@ -392,6 +487,22 @@ bool scr_immediate_has_ref(double handle);
  * teardown (they must never run yet must not leak). cb ownership moves
  * in. */
 void scr_next_tick(ScrClosure *cb);
+/* The scheduling entry points of programs that enter AsyncLocalStorage
+ * stores: each callback runs with the stores active when it was scheduled
+ * (scr_async.c). */
+void scr_set_timeout_als(ScrClosure *cb, double ms);
+double scr_set_interval_als(ScrClosure *cb, double ms);
+double scr_set_timeout_handle_als(ScrClosure *cb, double ms);
+double scr_set_immediate_als(ScrClosure *cb);
+void scr_next_tick_als(ScrClosure *cb);
+void scr_queue_microtask_als(ScrClosure *cb);
+/* A typed callback bound to the active context (scr_async.c): `thunk` is
+ * the compiler's per-signature entry, which brackets the call with
+ * scr_als_bound_target/enter/leave. cb moves in; the result is +1. */
+ScrClosure *scr_als_bind_closure(ScrClosure *cb, void *thunk, bool always);
+ScrClosure *scr_als_bound_target(ScrClosure *self);
+ScrAlsCtx *scr_als_bound_enter(ScrClosure *self);
+void scr_als_bound_leave(ScrAlsCtx *prev, ScrClosure *target);
 /* A successful process.stdout/stderr.write completion on that same queue.
  * The callback and its program-shaped Error | null adapter both MOVE into
  * the entry; the adapter is invoked with NULL (Node's success argument). */

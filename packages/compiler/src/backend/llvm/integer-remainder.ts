@@ -188,43 +188,204 @@ function isPowerOfTwo(value: number): boolean {
   return power === value;
 }
 
+/** `x - trunc(x / c) * c` for a power of two c of at least 1, which is
+ * exact for every double x. When |x| < c the quotient's magnitude is below
+ * 1 and truncates to zero, so the result is x. Otherwise x / c is a normal
+ * double and exact, and the truncated quotient times c is a multiple of c
+ * of magnitude at most |x|, also exact. When c is below x's ulp, x is
+ * itself a multiple of c and the difference is zero; otherwise both terms
+ * are multiples of x's ulp and the difference, smaller than c, is exact.
+ * ±Infinity gives the default NaN of `Infinity - Infinity`, the NaN fmod
+ * also returns for it, and a NaN dividend propagates. A zero difference
+ * takes the dividend's sign (`-4 % 2` and `-0 % 1` are -0). */
+function emitPowerOfTwoDouble(host: LlvmEmitterContext, left: string, magnitude: number): string {
+  const B = host.B;
+  const c = f64Lit(magnitude);
+  const quotient = B.tmp();
+  B.line(`${quotient} = fdiv double ${left}, ${c}`);
+  const whole = emitTruncF64(host, quotient);
+  const multiple = B.tmp(),
+    difference = B.tmp();
+  B.line(`${multiple} = fmul double ${whole}, ${c}`);
+  B.line(`${difference} = fsub double ${left}, ${multiple}`);
+  return signDividendZero(host, left, difference);
+}
+
+/** `value`, or a zero with the dividend's sign when `value` is zero. */
+function signDividendZero(host: LlvmEmitterContext, left: string, value: string): string {
+  const B = host.B;
+  const zero = B.tmp(),
+    signedZero = B.tmp(),
+    result = B.tmp();
+  host.declare("declare double @llvm.copysign.f64(double, double)");
+  B.line(`${zero} = fcmp oeq double ${value}, ${f64Lit(0)}`);
+  B.line(`${signedZero} = call double @llvm.copysign.f64(double ${f64Lit(0)}, double ${left})`);
+  B.line(`${result} = select i1 ${zero}, double ${signedZero}, double ${value}`);
+  return result;
+}
+
+/** 2^52: the largest power-of-two divisor the integer path takes. */
+const INTEGER_DIVISOR_LIMIT = 2 ** 52;
+
+/** 2^62 as a double: the bound on dividends the integer path accepts. */
+const DOUBLE_DIVIDEND_LIMIT = 2 ** 62;
+
 /** JS `%` by a constant divisor whose magnitude c is a power of two of at
- * least 1, as `x - trunc(x / c) * c`, which is exact for every double x.
- * When |x| < c the quotient's magnitude is below 1 and truncates to zero,
- * so the result is x. Otherwise x / c is a normal double and exact, and
- * the truncated quotient times c is a multiple of c of magnitude at most
- * |x|, also exact. When c is below x's ulp, x is itself a multiple of c and
- * the difference is zero; otherwise both terms are multiples of x's ulp and
- * the difference, smaller than c, is exact. ±Infinity gives the default
- * NaN of `Infinity - Infinity`, the NaN fmod also returns for it, and a NaN
- * dividend propagates. A zero difference takes the dividend's sign
- * (`-4 % 2` and `-0 % 1` are -0). The divisor's sign does not change the
- * result. Returns null for any other divisor; a power of two below 1 keeps
- * frem, because x / c can overflow. */
+ * least 1. The divisor's sign does not change the result. Returns null for
+ * any other divisor; a power of two below 1 keeps frem, because x / c can
+ * overflow.
+ *
+ * Where truncation is itself an integer round trip (x86-64 without SSE4.1,
+ * see trunc.ts), `x - trunc(x / c) * c` puts two multiplications, the round
+ * trip and a sign fix on the dividend's dependency chain. In a loop that
+ * feeds the result back, such as `s = (s + x) % 65536`, that costs more
+ * than the integer remainder. There a proven integer dividend takes the i64
+ * remainder directly, and other dividends of magnitude below 2^62 take
+ * integer paths:
+ *
+ * - A computed dividend (`+`, `-` or `*`, as in hashes, generators and
+ *   accumulators) is usually an integer. When it is one, the result is the
+ *   i64 remainder (shifts, since c is a constant power of two), as in
+ *   emitCheckedRemainder. Otherwise, when |x| < 2c (as in a phase
+ *   accumulator reduced by 1), the result is x itself if |x| < c and
+ *   x - copysign(c, x) if not, exact because x and c are then within a
+ *   factor of two, and never zero because x is not an integer. Larger
+ *   quotients take the path below, whose cost does not grow with the
+ *   quotient as fmod's does.
+ * - Any other dividend takes i = trunc(x) as an i64 and adds back x's
+ *   fraction without a branch on whether x is an integer, which stays fast
+ *   when integers and fractions alternate unpredictably. Because c is an
+ *   integer, trunc(x / c) = trunc(i / c), so
+ *     x % c = (i - trunc(i / c) * c) + (x - i) = (i srem c) + (x - i).
+ *   Both terms carry x's sign or are zero; x - i is exact, and the sum, of
+ *   magnitude below c and a multiple of x's ulp (an integer when x is one),
+ *   is exact too. It is zero exactly when both terms are.
+ *
+ * A zero result takes the dividend's sign. Larger, infinite and NaN
+ * dividends take the double sequence, as do targets with a rounding
+ * instruction and divisors above 2^52. */
 export function emitPowerOfTwoRemainder(
   host: LlvmEmitterContext,
   left: LlValue,
   divisor: number,
+  dividend: LlInteger | null,
+  computed: boolean,
 ): LlValue | null {
   const magnitude = Math.abs(divisor);
   if (!isPowerOfTwo(magnitude)) return null;
+  if (!host.inlineTrunc || magnitude > INTEGER_DIVISOR_LIMIT)
+    return { name: emitPowerOfTwoDouble(host, left.name, magnitude), type: F64 };
+  if (dividend)
+    return emitSignedIntegerRemainder(host, left, dividend, {
+      name: String(magnitude),
+      type: "i64",
+      signed: false,
+      range: { min: magnitude, max: magnitude },
+    });
   const B = host.B;
-  const c = f64Lit(magnitude);
-  const quotient = B.tmp();
-  B.line(`${quotient} = fdiv double ${left.name}, ${c}`);
-  const whole = emitTruncF64(host, quotient);
-  const multiple = B.tmp(),
-    difference = B.tmp(),
+  host.declare("declare double @llvm.fabs.f64(double)");
+  host.declare("declare double @llvm.copysign.f64(double, double)");
+  host.declare("declare i1 @llvm.expect.i1(i1, i1)");
+  const raw = B.tmp(),
+    integer = B.tmp(),
+    back = B.tmp(),
+    size = B.tmp(),
+    inRange = B.tmp();
+  B.line(`${raw} = fptosi double ${left.name} to i64`);
+  // Poison when out of range or NaN; no path below uses it then.
+  B.line(`${integer} = freeze i64 ${raw}`);
+  B.line(`${back} = sitofp i64 ${integer} to double`);
+  B.line(`${size} = call double @llvm.fabs.f64(double ${left.name})`);
+  // False for NaN.
+  B.line(`${inRange} = fcmp olt double ${size}, ${f64Lit(DOUBLE_DIVIDEND_LIMIT)}`);
+  const join = B.newLabel("rem.pow2.join");
+  const incoming: string[] = [];
+  const branch = (condition: string, likely: string, unlikely: string): void => {
+    const expected = B.tmp();
+    B.line(`${expected} = call i1 @llvm.expect.i1(i1 ${condition}, i1 true)`);
+    B.condBr(expected, likely, unlikely);
+  };
+  if (computed) {
+    const exact = B.tmp(),
+      integral = B.tmp();
+    B.line(`${exact} = fcmp oeq double ${back}, ${left.name}`);
+    B.line(`${integral} = and i1 ${inRange}, ${exact}`);
+    const whole = B.newLabel("rem.pow2.int"),
+      other = B.newLabel("rem.pow2.other");
+    branch(integral, whole, other);
+    B.startBlock(whole);
+    const remainder = B.tmp(),
+      number = B.tmp(),
+      zero = B.tmp(),
+      signedZero = B.tmp(),
+      integerValue = B.tmp();
+    B.line(`${remainder} = srem i64 ${integer}, ${magnitude}`);
+    B.line(`${number} = sitofp i64 ${remainder} to double`);
+    B.line(`${zero} = icmp eq i64 ${remainder}, 0`);
+    B.line(`${signedZero} = fmul double ${left.name}, ${f64Lit(0)}`);
+    B.line(`${integerValue} = select i1 ${zero}, double ${signedZero}, double ${number}`);
+    incoming.push(`[ ${integerValue}, %${B.currentLabel()} ]`);
+    B.br(join);
+    B.startBlock(other);
+    const near = B.tmp();
+    // False for NaN.
+    B.line(`${near} = fcmp olt double ${size}, ${f64Lit(2 * magnitude)}`);
+    const small = B.newLabel("rem.pow2.small"),
+      large = B.newLabel("rem.pow2.large");
+    branch(near, small, large);
+    B.startBlock(small);
+    const c = f64Lit(magnitude);
+    const below = B.tmp();
+    B.line(`${below} = fcmp olt double ${size}, ${c}`);
+    // A branch rather than a select keeps the usual |x| < c case, where the
+    // result is x, off the dividend's dependency chain.
+    const keep = B.newLabel("rem.pow2.keep"),
+      wrap = B.newLabel("rem.pow2.wrap");
+    branch(below, keep, wrap);
+    B.startBlock(keep);
+    incoming.push(`[ ${left.name}, %${B.currentLabel()} ]`);
+    B.br(join);
+    B.startBlock(wrap);
+    const step = B.tmp(),
+      reduced = B.tmp();
+    B.line(`${step} = call double @llvm.copysign.f64(double ${c}, double ${left.name})`);
+    B.line(`${reduced} = fsub double ${left.name}, ${step}`);
+    incoming.push(`[ ${reduced}, %${B.currentLabel()} ]`);
+    B.br(join);
+    B.startBlock(large);
+  }
+  const fractional = B.newLabel("rem.pow2.frac"),
+    huge = B.newLabel("rem.pow2.float");
+  branch(inRange, fractional, huge);
+  B.startBlock(fractional);
+  const remainder = B.tmp(),
+    whole = B.tmp(),
+    fraction = B.tmp(),
+    sum = B.tmp(),
+    wholeZero = B.tmp(),
+    fractionZero = B.tmp(),
     zero = B.tmp(),
     signedZero = B.tmp(),
-    result = B.tmp();
-  host.declare("declare double @llvm.copysign.f64(double, double)");
-  B.line(`${multiple} = fmul double ${whole}, ${c}`);
-  B.line(`${difference} = fsub double ${left.name}, ${multiple}`);
-  B.line(`${zero} = fcmp oeq double ${difference}, ${f64Lit(0)}`);
+    value = B.tmp();
+  B.line(`${remainder} = srem i64 ${integer}, ${magnitude}`);
+  B.line(`${whole} = sitofp i64 ${remainder} to double`);
+  B.line(`${fraction} = fsub double ${left.name}, ${back}`);
+  B.line(`${sum} = fadd double ${whole}, ${fraction}`);
+  B.line(`${wholeZero} = icmp eq i64 ${remainder}, 0`);
+  B.line(`${fractionZero} = fcmp oeq double ${fraction}, ${f64Lit(0)}`);
+  B.line(`${zero} = and i1 ${wholeZero}, ${fractionZero}`);
   B.line(
     `${signedZero} = call double @llvm.copysign.f64(double ${f64Lit(0)}, double ${left.name})`,
   );
-  B.line(`${result} = select i1 ${zero}, double ${signedZero}, double ${difference}`);
+  B.line(`${value} = select i1 ${zero}, double ${signedZero}, double ${sum}`);
+  incoming.push(`[ ${value}, %${B.currentLabel()} ]`);
+  B.br(join);
+  B.startBlock(huge);
+  const floating = emitPowerOfTwoDouble(host, left.name, magnitude);
+  incoming.push(`[ ${floating}, %${B.currentLabel()} ]`);
+  B.br(join);
+  B.startBlock(join);
+  const result = B.tmp();
+  B.line(`${result} = phi double ${incoming.join(", ")}`);
   return { name: result, type: F64 };
 }

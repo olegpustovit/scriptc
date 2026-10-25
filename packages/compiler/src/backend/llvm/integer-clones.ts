@@ -1009,10 +1009,10 @@ class CloneEmitter {
     B.line(
       `${field} = getelementptr inbounds %ScrArr, ptr ${array}, i32 0, i32 ${SCR_ARR_FIELD.len}`,
     );
-    B.line(`${len} = load i64, ptr ${field}`);
-    B.line(`${fits} = icmp ule i64 ${len}, 2147483647`);
+    B.line(`${len} = load i32, ptr ${field}`);
+    B.line(`${fits} = icmp ule i32 ${len}, 2147483647`);
     this.require(fits);
-    B.line(`${value} = trunc i64 ${len} to i32`);
+    B.line(`${value} = add i32 ${len}, 0`);
     return value;
   }
 

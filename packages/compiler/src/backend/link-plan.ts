@@ -40,6 +40,7 @@ export async function createNativeLinkPlan(options: {
   optimization: NativeOptimization;
   strip?: boolean;
   windowsSubsystem?: WindowsSubsystem;
+  profileGenerate?: boolean;
   programObjectDependencies?: readonly NativeArtifactDependency[];
   env?: NodeJS.ProcessEnv;
   resolver?: (specifier: string) => string;
@@ -72,6 +73,7 @@ export async function createNativeLinkPlan(options: {
       ...(options.windowsSubsystem === undefined
         ? {}
         : { windowsSubsystem: options.windowsSubsystem }),
+      ...(options.profileGenerate === true ? { profileGenerate: true } : {}),
     }),
     dependencyPaths: [...runtimePack.dependencyPaths, ...(options.ffi?.libraries ?? [])],
     programObjectDependencies: [...(options.programObjectDependencies ?? [])],

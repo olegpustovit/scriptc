@@ -11,7 +11,9 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -171,6 +173,89 @@ static void failure_cases(void) {
   scriptc_ts7_close(UINT32_MAX);
 }
 
+#ifndef _WIN32
+static uint32_t attach(const char *name, const char *mode, uint32_t memory) {
+  return scriptc_ts7_attach((const uint8_t *)name, strlen(name), (const uint8_t *)executable, strlen(executable),
+                            (const uint8_t *)mode, strlen(mode), (const uint8_t *)callbacks, strlen(callbacks),
+                            0, 1, memory);
+}
+
+static void expect_line(uint32_t id, const char *expected) {
+  char line[512];
+  size_t at = 0;
+  do {
+    assert(at + 1 < sizeof(line));
+    read_exact(id, (uint8_t *)line + at, 1);
+  } while (line[at++] != '\n');
+  line[at] = '\0';
+  assert(strcmp(line, expected) == 0);
+}
+
+static void attach_cases(void) {
+  char runtime[] = "/tmp/scriptc-ts7-attach-XXXXXX";
+  assert(mkdtemp(runtime) != NULL);
+  assert(setenv("XDG_RUNTIME_DIR", runtime, 1) == 0);
+  assert(unsetenv("TSC_TS_LISTEN_MEMORY") == 0);
+  char directory[256], socket_path[512], expected[600];
+  uint8_t bytes[4];
+  snprintf(directory, sizeof(directory), "%s/scriptc", runtime);
+  snprintf(socket_path, sizeof(socket_path), "%s/server.sock", directory);
+  // The first build starts the server with its idle time and memory limit.
+  // The server holds none of the build's descriptors, such as an output
+  // pipe its caller reads to the end.
+  int output[2];
+  assert(pipe(output) == 0);
+  uint32_t first = attach("server", "listen", 123);
+  assert(first != 0 && scriptc_ts7_pid(first) == 0);
+  close(output[1]);
+  struct pollfd ended = {output[0], POLLIN, 0};
+  assert(poll(&ended, 1, 5000) == 1);
+  assert(read(output[0], bytes, 1) == 0);
+  close(output[0]);
+  expect_line(first, "client 1\n");
+  snprintf(expected, sizeof(expected), "%s 1\n", socket_path);
+  expect_line(first, expected);
+  expect_line(first, "123\n");
+  write_exact(first, (const uint8_t *)"ping", 4, 0, 4);
+  read_exact(first, bytes, 4);
+  assert(memcmp(bytes, "ping", 4) == 0);
+  // A build that finds the server in use gets no handle.
+  for (int i = 0; i < 3; i++) { assert(attach("server", "listen", 123) == 0); fail_message(); }
+  scriptc_ts7_close(first);
+  scriptc_ts7_close(first);
+  // A later build connects to the same server.
+  uint32_t second = attach("server", "listen", 123);
+  assert(second != 0);
+  expect_line(second, "client 2\n");
+  scriptc_ts7_close(second);
+  // An executable without --listen exits as it starts.
+  assert(attach("old", "listen-exit", 0) == 0);
+  fail_message();
+  // A server directory others can access is not used.
+  assert(chmod(directory, 0755) == 0);
+  assert(attach("server", "listen", 123) == 0);
+  fail_message();
+  assert(chmod(directory, 0700) == 0);
+  // A name that would leave the directory, or make the path too long.
+  assert(attach("../server", "listen", 123) == 0);
+  fail_message();
+  char long_name[200];
+  memset(long_name, 'x', sizeof(long_name) - 1);
+  long_name[sizeof(long_name) - 1] = '\0';
+  assert(attach(long_name, "listen", 123) == 0);
+  fail_message();
+  // The server exits after its idle second and removes its socket.
+  unlink(socket_path);
+  snprintf(expected, sizeof(expected), "%s.lock", socket_path);
+  unlink(expected);
+  snprintf(expected, sizeof(expected), "%s/old.sock.lock", directory);
+  unlink(expected);
+  rmdir(directory);
+  rmdir(runtime);
+  assert(unsetenv("XDG_RUNTIME_DIR") == 0);
+}
+#endif
+
 static int process_main(int argc, char **argv) {
   assert(argc >= 2);
   executable = argv[1];
@@ -196,6 +281,9 @@ static int process_main(int argc, char **argv) {
   argument_cases();
   exchange_cases();
   failure_cases();
+#ifndef _WIN32
+  attach_cases();
+#endif
   assert(resource_count() == before);
 #ifndef _WIN32
   if (saved_input >= 0) { assert(dup2(saved_input, STDIN_FILENO) >= 0); close(saved_input); }

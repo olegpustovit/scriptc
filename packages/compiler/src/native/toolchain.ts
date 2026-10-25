@@ -6,6 +6,11 @@ import {
   type NativeTargetSpec,
   type NativeHelperSpec,
 } from "../backend/targets.js";
+import {
+  checkerBackend,
+  tscTsExecutable,
+  tscTsPlatformPackage,
+} from "../frontend/ts7/checker-backend.js";
 
 export interface NativeToolchain {
   compilerVersion: string;
@@ -34,6 +39,8 @@ export interface NativeToolchainManifest {
   compiler_version: string;
   target: string;
   ts7: string;
+  /** The tsc-ts executable, the default checker; without it, an installed `tsc-ts` package's. */
+  tsc_ts?: string;
   llvm_package: string;
   runtime_pack: string;
   runtime_sources?: string;
@@ -106,6 +113,7 @@ export function loadNativeToolchain(
   }
   const manifest = raw as NativeToolchainManifest;
   for (const name of [
+    "tsc_ts",
     "runtime_sources",
     "declarations",
     "archiver",
@@ -169,7 +177,19 @@ export function loadNativeToolchain(
         : [...target.defaultLinkerArgs];
   return {
     compilerVersion: manifest.compiler_version,
-    ts7Executable: pathFrom(root, manifest.ts7),
+    // tsc-ts, the default checker, comes with the distribution; a development
+    // build takes it from the tsc-ts package installed with the compiler or for
+    // the working directory. SCRIPTC_CHECKER selects a checker.
+    ts7Executable:
+      checkerBackend(env) === "tsgo"
+        ? pathFrom(root, manifest.ts7)
+        : manifest.tsc_ts !== undefined
+          ? pathFrom(root, manifest.tsc_ts)
+          : tscTsExecutable(
+              [root, cwd],
+              tscTsPlatformPackage(host.platform, host.architecture, host.name.endsWith("-musl")),
+              host.platform,
+            ),
     target,
     helper: host.helper,
     helperPackageRoot,

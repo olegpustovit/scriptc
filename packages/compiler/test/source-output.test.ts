@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
 import { compile, deserializeModule, validateModule } from "../src/index.js";
+import { setLibDiagnosticsStore } from "../src/frontend/ts7/lib-diagnostics.js";
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -183,6 +184,38 @@ test("source outputs ignore invalid external compiler selection and create no ex
   } finally {
     if (oldCc === undefined) delete process.env["SCRIPTC_CC"];
     else process.env["SCRIPTC_CC"] = oldCc;
+    if (oldCache === undefined) delete process.env["SCRIPTC_CACHE_DIR"];
+    else process.env["SCRIPTC_CACHE_DIR"] = oldCache;
+  }
+});
+
+test("source outputs neither read nor create declaration diagnostics a previous build stored", async () => {
+  const { dir, entry, outDir } = await fixture();
+  const oldCache = process.env["SCRIPTC_CACHE_DIR"];
+  const cache = join(dir, "must-not-exist");
+  process.env["SCRIPTC_CACHE_DIR"] = cache;
+  // A store an earlier build of this process left configured.
+  const reads: string[] = [];
+  setLibDiagnosticsStore(
+    { read: (key) => (reads.push(key), null), write: () => {} },
+    "earlier-checker",
+  );
+  try {
+    for (const [kind, name] of [
+      ["ir", "main.ir.json"],
+      ["llvm", "main.ll"],
+    ] as const) {
+      const result = await compile(entry, {
+        outDir,
+        outPath: join(outDir, name),
+        outputKind: kind,
+      });
+      expect(result.ok).toBe(true);
+    }
+    expect(reads).toEqual([]);
+    await expect(readdir(cache)).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    setLibDiagnosticsStore(null);
     if (oldCache === undefined) delete process.env["SCRIPTC_CACHE_DIR"];
     else process.env["SCRIPTC_CACHE_DIR"] = oldCache;
   }

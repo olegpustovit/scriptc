@@ -85,6 +85,7 @@ async function build() {
   const quickjs = join(vendorRoot, "quickjs-ng");
   const zlib = join(vendorRoot, "zlib");
   const mbedtls = join(vendorRoot, "mbedtls");
+  const brotli = join(vendorRoot, "brotli", "c");
   const qjsSources = ["dtoa.c", "libregexp.c", "libunicode.c", "quickjs.c"];
   const lreSources = ["libregexp.c", "libunicode.c"];
   const zlibSources = [
@@ -131,6 +132,9 @@ async function build() {
     const width = Math.max(1, Math.min(8, availableParallelism()));
     return parallelMap(items, width, task);
   };
+  // Archive members are named by basename, so a source in a subdirectory
+  // (brotli's dec/ and enc/ share file names) is named after its path.
+  const objectName = (source) => source.replaceAll("/", "-").replace(/\.c$/, ".o");
   const archive = async (id, sources, sourceRoot, flags) => {
     process.stdout.write(`building ${packageManifest.name} ${id} archive\n`);
     const root = join(stagedOutputRoot, "vendor", id);
@@ -138,7 +142,7 @@ async function build() {
     await parallel(sources, async (source) =>
       compile(
         join(sourceRoot, source),
-        join(objectRoot, source.replace(/\.c$/, ".o")),
+        join(objectRoot, objectName(source)),
         unalignedVendorSources.has(source)
           ? flags.filter((flag) => !codeAlignment.includes(flag))
           : flags,
@@ -148,7 +152,7 @@ async function build() {
     await createDeterministicArchive(
       archiver,
       output,
-      sources.map((source) => join(objectRoot, source.replace(/\.c$/, ".o"))),
+      sources.map((source) => join(objectRoot, objectName(source))),
       archiverArgs,
     );
     await rm(objectRoot, { recursive: true, force: true });
@@ -221,12 +225,18 @@ async function build() {
             );
             const includeFlags = [
               ...(unit.source === "scr_regex.c" ? ["-I", quickjs] : []),
-              ...(unit.source === "scr_tls.c" || unit.source === "scr_cipher.c"
+              ...(unit.source === "scr_tls.c" ||
+              unit.source === "scr_cipher.c" ||
+              unit.source === "scr_ecdh.c" ||
+              unit.source === "scr_dh.c" ||
+              unit.source === "scr_pki.c" ||
+              unit.source === "scr_webcrypto_aes.c"
                 ? ["-I", join(mbedtls, "include")]
                 : []),
               ...(unit.source === "scr_zlib.c" || unit.source === "scr_fetch.c"
                 ? ["-I", zlib]
                 : []),
+              ...(unit.source === "scr_brotli.c" ? ["-I", join(brotli, "include")] : []),
             ];
             // Worker variants link only into executables, whose own TLS block
             // holds every runtime thread-local: on ELF the initial-exec model
@@ -329,6 +339,17 @@ async function build() {
     const mbedtlsSources = (await readdir(join(mbedtls, "library")))
       .filter((name) => !name.startsWith(".") && name.endsWith(".c"))
       .sort();
+    const brotliSources = (
+      await Promise.all(
+        ["common", "dec", "enc"].map(async (dir) =>
+          (await readdir(join(brotli, dir)))
+            .filter((name) => !name.startsWith(".") && name.endsWith(".c"))
+            .map((name) => `${dir}/${name}`),
+        ),
+      )
+    )
+      .flat()
+      .sort();
     // Vendored QuickJS reads `clock_gettime` for its monotonic clock. WASI
     // exposes that declaration only when its process-clock emulation ABI is
     // selected, so vendor sources inherit the target's runtime defines too.
@@ -365,6 +386,10 @@ async function build() {
               ? [
                   await archive("libregexp", lreSources, quickjs, [
                     ...vendorTarget,
+                    // Section elimination keeps only the libunicode tables a
+                    // program reaches: the URL host parser's NFC links the
+                    // normalization tables without the regex property ones.
+                    ...matrix.executable_section_elimination.compile_flags,
                     "-std=c11",
                     "-Os",
                     "-I",
@@ -380,6 +405,17 @@ async function build() {
                     "-Os",
                     "-I",
                     zlib,
+                  ]),
+                ]
+              : []),
+            ...(requestedArchives.has("brotli")
+              ? [
+                  await archive("brotli", brotliSources, brotli, [
+                    ...vendorTarget,
+                    "-std=c11",
+                    "-Os",
+                    "-I",
+                    join(brotli, "include"),
                   ]),
                 ]
               : []),
@@ -412,6 +448,7 @@ async function build() {
         "BSD-3-Clause",
       ],
       [join(zlib, "LICENSE"), "artifacts/licenses/zlib.txt", "Zlib"],
+      [join(vendorRoot, "brotli", "LICENSE"), "artifacts/licenses/brotli.txt", "MIT"],
       [join(mbedtls, "LICENSE"), "artifacts/licenses/mbedtls.txt", "Apache-2.0"],
     ];
     licensed.push([
@@ -432,7 +469,7 @@ async function build() {
       package: packageManifest.name,
       version: packageManifest.version,
       target: matrix.target,
-      runtime_abi: { version: 22, marker: "scr_runtime_abi_v22" },
+      runtime_abi: { version: 43, marker: "scr_runtime_abi_v43" },
       compiler: {
         command: compiler,
         identity: compilerVersion,
@@ -440,7 +477,12 @@ async function build() {
         ...(unitHelper === null ? {} : { speed_codegen: unitHelper.identity }),
       },
       macros: {
-        executable: ["SCR_TEXT_DECODER_LEGACY"],
+        executable: [
+          "SCR_TEXT_DECODER_LEGACY",
+          "SCR_WARNING_REPLACE",
+          "SCR_STDIO_EXTENDED",
+          "SCR_YIN",
+        ],
         excluded: ["SCR_RC_AUDIT", "SCR_ASAN_FIBERS"],
         sanitizer: "external-toolchain-required",
       },

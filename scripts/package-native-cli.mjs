@@ -44,6 +44,7 @@ for (const name of readdirSync(packages)
     for (const path of [
       binary,
       resolve(bin, hostPath(manifest.ts7)),
+      resolve(bin, hostPath(manifest.tsc_ts)),
       resolve(bin, hostPath(manifest.comptime)),
       join(
         resolve(bin, hostPath(manifest.llvm_package)),

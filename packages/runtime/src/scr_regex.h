@@ -80,6 +80,16 @@ ScrStr *scr_regex_flags(ScrRegex *re);        /* +1 */
 ScrStr *scr_regex_to_string(ScrRegex *re);    /* +1 */
 /* replace: first match without /g, every match with it. */
 ScrStr *scr_regex_replace(ScrStr *s, ScrRegex *re, ScrStr *rep);
+/* replace/replaceAll with a typed replacer closure of `arity` (at most 4)
+ * parameters returning a string. Parameter i receives what Node passes at
+ * position i: the match and captures (strings) below the capture count n,
+ * the match offset (a number) at n, the subject (a string) at n + 1. The
+ * compiler admits a closure only when every position it declares is one of
+ * those with the declared kind, and every capture it reads is set in every
+ * match (scr_regex_replace_callback handles the rest). Borrows all. */
+struct ScrClosure;
+ScrStr *scr_regex_replace_fn(ScrStr *s, ScrRegex *re, struct ScrClosure *f, uint32_t arity,
+                             bool all);
 /* replaceAll: throws Node's TypeError when /g is missing (may-throw). */
 ScrStr *scr_regex_replace_all(ScrStr *s, ScrRegex *re, ScrStr *rep);
 /* split: captured substrings are interleaved with the split pieces;
@@ -88,11 +98,23 @@ ScrStr *scr_regex_replace_all(ScrStr *s, ScrRegex *re, ScrStr *rep);
 ScrArr *scr_regex_split(ScrStr *s, ScrRegex *re);
 ScrArr *scr_regex_split_limit(ScrStr *s, ScrRegex *re, double limit);
 /* matchAll drained eagerly: +1 string[][] of honest match slices; throws
- * Node's TypeError on a non-global regex (catchable). */
+ * Node's TypeError on a non-global regex (catchable). Each row carries its
+ * index, input and groups properties. */
 ScrArr *scr_regex_match_all(ScrStr *s, ScrRegex *re);
+/* scr_regex_match_all for rows read only through their elements: the rows
+ * carry no index, input or groups properties. */
+ScrArr *scr_regex_match_all_captures(ScrStr *s, ScrRegex *re);
 /* matchAll + the companion-index drain: also pushes each match's UTF-16
  * start index (f64) onto `indices` — the .index the for-of-over-matchAll
  * desugar reads. Same throw/result contract as scr_regex_match_all. */
 ScrArr *scr_regex_match_all_into(ScrStr *s, ScrRegex *re, ScrArr *indices);
+/* scr_regex_match_all_into for rows read only through their elements and
+ * the companion index: the rows carry no index, input or groups
+ * properties. */
+ScrArr *scr_regex_match_all_captures_into(ScrStr *s, ScrRegex *re, ScrArr *indices);
+/* `.index` / `.input` of a match result: its pending match source or its
+ * metadata answers, without building the metadata object; undefined when
+ * neither has the key. Borrows both; +1. */
+struct ScrDyn *scr_regex_result_prop(ScrArr *a, ScrStr *key);
 
 #endif /* SCR_REGEX_H */

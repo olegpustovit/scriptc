@@ -15,7 +15,13 @@
  * `--`, arguments and returns) must be an int32 by construction: an integer
  * literal in range, a bitwise result such as `x | 0`, another `Int32` value,
  * a string or array length, or arithmetic whose range scriptc can bound.
- * scriptc then stores the slot as a 32-bit integer. */
+ * scriptc then stores the slot as a 32-bit integer.
+ *
+ * As an array element type (`Int32[]`, `readonly Int32[]`, `Array<Int32>`)
+ * on a declaration of type `number[]`: every element stored into the array,
+ * through any reference to it, must be an int32 by construction, and element
+ * reads that find a value are int32s. Holes, missing indices and `length`
+ * changes behave as in JavaScript. */
 export type Int32 = number;
 
 /** Return-type wrapper: the function never throws. scriptc proves that no

@@ -143,6 +143,7 @@ const FUNCTION_FIELDS: Record<StringFields<Omit<IrFunction, "body">>, Role> = {
   "captures[].localId": "other",
   "classCaptures[].name": "other",
   "classCaptures[].localId": "other",
+  "generator.tag": "other",
 };
 
 const MODULE_FIELDS: Record<StringFields<Omit<IrModule, "functions">>, Role> = {
@@ -153,12 +154,15 @@ const MODULE_FIELDS: Record<StringFields<Omit<IrModule, "functions">>, Role> = {
   "classes[].jsName": "other",
   "classes[].genericOf": "other",
   "classes[].baseValueGlobal": "other",
+  "classes[].errorNameAfter": "other",
   "classes[].prototypeDataHelper": "reference",
   "classes[].instancePrototypeHelper": "reference",
+  "classes[].stringTagHelper": "reference",
   "classes[].localCaptures[].name": "other",
   "classes[].localCaptures[].localId": "other",
   "classes[].symbolFields[].field": "other",
   "classes[].symbolFields[].globalId": "other",
+  "classes[].symbolFields[].wellKnown": "other",
   "classes[].fields[].name": "other",
   "classes[].methods[]": "method",
   "classes[].prototypeNames[]": "other",
@@ -169,6 +173,8 @@ const MODULE_FIELDS: Record<StringFields<Omit<IrModule, "functions">>, Role> = {
   "records[].id": "other",
   "records[].fields[].name": "other",
   "records[].declaredOrder[]": "other",
+  "records[].accessorOrder[]": "other",
+  "records[].orderVariants[][]": "other",
   "unions[].id": "other",
   "unions[].discriminant.field": "other",
   "unions[].discriminant.cases[].values[]": "other",
@@ -193,6 +199,7 @@ const MODULE_FIELDS: Record<StringFields<Omit<IrModule, "functions">>, Role> = {
   "lib.exports[].fnName": "reference",
   "lib.exports[].inboundBytesTrap": "other",
   "lib.exports[].inboundIntTrap": "other",
+  "lib.exports[].inboundCstringTrap": "other",
   "lib.trapOverlays[].code": "other",
   "lib.trapOverlays[].teaching": "other",
   "lib.trapOverlays[].remediation": "other",
@@ -203,10 +210,18 @@ const MODULE_FIELDS: Record<StringFields<Omit<IrModule, "functions">>, Role> = {
   "contracts.int32Params[]": "other",
   "contracts.int32Returns[]": "fact",
   "contracts.int32Locals[]": "other",
+  "contracts.int32Elements[]": "other",
+  "int32ArrayCandidates[]": "other",
   "contracts.noThrow[]": "fact",
   "contracts.acyclic[]": "other",
   "contracts.immortalGlobals[]": "other",
   "contracts.programLifetime[]": "other",
+  "wasmModules[].sha256": "other",
+  "wasmModules[].bytes": "other",
+  "wasmUntranslated[].sha256": "other",
+  "wasmUntranslated[].reason": "other",
+  "threadSlotKeys[]": "other",
+  "freezableArrays[]": "other",
 };
 
 const loc = { file: "references.ts", start: 0, end: 0 };
@@ -228,7 +243,7 @@ const entry = (body: IrStmt[] = []): IrFunction => ({
   loc,
 });
 const module = (body: IrStmt[] = []): IrModule => ({
-  irVersion: 16,
+  irVersion: 17,
   sourceFile: loc.file,
   entry: "%main",
   functions: [target, entry(body)],
@@ -267,6 +282,10 @@ const REFERENCE_FIXTURES: Record<string, () => IrModule> = {
   "classes[].instancePrototypeHelper": () => ({
     ...module(),
     classes: [{ name: "%m0.Cell", fields: [], instancePrototypeHelper: TARGET, loc }],
+  }),
+  "classes[].stringTagHelper": () => ({
+    ...module(),
+    classes: [{ name: "%m0.Cell", fields: [], stringTagHelper: TARGET, loc }],
   }),
   "lib.exports[].fnName": () => ({
     ...module(),

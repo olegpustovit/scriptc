@@ -78,6 +78,10 @@ test("CI restores each seed only into its matching instrumented bootstrap lane",
   const execute = checks.steps.find((step) =>
     step.run?.split("\n").includes("node scripts/ci-native-bootstrap.mjs"),
   )!;
+  // The sanitized seed's build needs more memory than the runner has: swap backs it.
+  const swap = seed.steps.findIndex((step) => step.run?.includes("swapon /mnt/swapfile"));
+  expect(seed.steps[swap]?.if).toBe("matrix.flavor == 'san'");
+  expect(swap).toBeLessThan(seed.steps.indexOf(prepare));
   expect(prepare.env?.SCRIPTC_BOOTSTRAP_SEED_DIRECTORY).toBe("${{ runner.temp }}/native-bootstrap");
   expect(execute.env?.SCRIPTC_BOOTSTRAP_SEED_DIRECTORY).toBe(
     prepare.env?.SCRIPTC_BOOTSTRAP_SEED_DIRECTORY,

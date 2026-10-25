@@ -23,26 +23,48 @@
 ScrStr *scr_insp_f64(double x);   /* JS ToString, except -0 → "-0" */
 ScrStr *scr_insp_str(ScrStr *s);  /* the quoting ladder + line splitting */
 ScrStr *scr_insp_regex(ScrRegex *re);  /* /source/flags */
+/* A Date (its time value): toISOString(), or "Invalid Date" for NaN (+1). */
+ScrStr *scr_insp_date(double ms);
 ScrStr *scr_insp_buffer(ScrBytes *b);  /* <Buffer aa bb ...>, 50-byte cap */
-/* The stackless error form: [Name: message] / [Name], plus the stamped
- * code slot as its one extra property ({ code: 'X' }); [Name] beyond
- * depth when a code makes it composite. */
+/* The stackless error form: [Name: message] / [Name], then a runtime
+ * error's own properties through its checked-dynamic node, or another
+ * error's stamped code slot as its one extra property ({ code: 'X' });
+ * [Name] beyond depth when a code makes it composite. */
 ScrStr *scr_insp_error(ScrError *e, double recurse, double depth);
+/* A runtime error rendered through its checked-dynamic node (the cached
+ * one, or one built from its fields), so Node's own properties follow the
+ * bracket form. */
+ScrStr *scr_insp_error_node(ScrError *e, double recurse, double depth);
+bool scr_insp_error_bag_has_properties(ScrDyn *bag);
+bool scr_insp_error_has_cause(ScrError *e);
+ScrStr *scr_insp_error_cause(ScrError *e, double recurse, double depth);
 /* The checked-dynamic tree: shape lives in the value, so the whole
  * traversal is here. dyn-boxed bytes render in the checked-dynamic tree's documented
  * Uint8Array identity. */
 ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth);
+/* A numeric typed array that is not a Buffer: `Uint8Array(n) [ ... ]`,
+ * `[Uint8Array]` past the depth limit. Borrows b; +1. */
+ScrStr *scr_insp_typed_array(ScrBytes *b, double recurse, double depth);
+/* A u8 byte view whose static type does not say which one it is (a union
+ * arm, an element or field): a DataView, a Buffer (<Buffer ..>) or a
+ * Uint8Array, by the view's own flags. */
+ScrStr *scr_insp_bytes(ScrBytes *b, double recurse, double depth);
 /* format's %s / rest-args twin: dyn strings pass verbatim. */
 ScrStr *scr_insp_dyn_s(ScrDyn *d, double depth);
+ScrStr *scr_insp_dyn_hidden(ScrDyn *d, double depth); /* %o: showHidden */
 void scr_insp_begin(double recurse);
+/* util.inspect's breakLength, compact (0 for false) and sorted for the
+ * renders that follow; the call site restores the defaults (80, 3, false)
+ * afterwards. */
+void scr_insp_layout(double break_length, double compact, bool sorted);
 void scr_insp_entry(ScrStr *s, bool is_num);
 /* Circular references, Node-exact (<ref *N> / [Circular *N]): the
  * compiler-emitted helpers over CYCLE-CAPABLE composites call circ_check
  * FIRST (a value already on the traversal stack answers its circular id,
  * assigned in discovery order — the caller renders scr_insp_circular and
  * descends no further), seen_push after begin, and ref_wrap around end's
- * result (pops the stack; values in the circular map gain the "<ref *N> "
- * prefix). State resets at each top-level value's first frame
+ * result (pops the stack; scr_insp_end gives values in the circular map
+ * the "<ref *N> " prefix). State resets at each top-level value's first frame
  * (scr_insp_begin(1)). ref_wrap BORROWS s and returns +1. */
 double scr_insp_circ_check(const void *v);
 void scr_insp_seen_push(const void *v);
@@ -58,6 +80,10 @@ ScrStr *scr_insp_end(ScrStr *base, ScrStr *b0, ScrStr *b1, double recurse,
  * caller's level (+1; borrows both). */
 void scr_insp_nested_begin(void);
 ScrStr *scr_insp_nested_end(ScrStr *prefix, ScrStr *inner);
+/* Mark the inspector's state before a top-level render, and return to the
+ * mark when the render ends, normally or by an inspection refusal. */
+void scr_insp_mark(void);
+void scr_insp_unwind(void);
 
 /* The buf.read* / buf.write* numeric families on u8 bytes, Node-exact:
  * boundsError's ladder (non-integer offset → 'It must be an integer', a
@@ -98,6 +124,9 @@ ScrBytes *scr_fs_read_file_bytes(ScrStr *path); /* +1 */
  * with the exception pending. */
 ScrDyn *scr_fs_read_file_sync_dyn(ScrStr *path, const ScrDyn *enc);
 ScrStr *scr_fs_read_file_encoded(ScrStr *path, ScrStr *encoding);
+/* readFileSync's encoding check (ERR_INVALID_ARG_VALUE), on its own: the
+ * check Node runs before it converts a URL path. */
+void scr_fs_check_read_encoding(ScrStr *encoding);
 ScrStr *scr_fs_read_fd_encoded(double fd, ScrStr *encoding);
 ScrDyn *scr_fs_callback_value(ScrStr *member);
 ScrDyn *scr_fs_callback_call(ScrStr *member, const ScrDyn *args);

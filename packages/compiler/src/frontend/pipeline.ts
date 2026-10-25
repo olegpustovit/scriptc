@@ -7,28 +7,60 @@ import { entryFunctionExports, type EntryExportInfo } from "./lib-exports.js";
 import { entryContractFacts, type ContractFacts } from "./lib-contract.js";
 import {
   canonicalBuiltinModule,
+  npmBuiltinAliasOf,
   checkPreflight,
   isNodeTypesPath,
   locOf,
+  npmStaticDepSf7,
+  npmStaticLoadableFiles,
   requiresOf,
+  resolveImport,
   resolveNpmImport,
   type LoadResult,
 } from "./program.js";
 import {
+  definitelyTypedMismatch,
+  npmStaticFileDegrades,
   npmStaticIneligibleReason,
   npmStaticOffenders,
   npmStaticPackageOfPath,
 } from "./npm-static.js";
 import { clearResolveCaches, resolveBareModule, resolveWorkspaceSourceModule } from "./resolve.js";
+import { isShimmedImport } from "./package-shims.js";
 import { provenanceEntryFor } from "./provenance-registry.js";
 import { isJsSourceFileName } from "./tsc-codes.js";
 import { isRelativeSpecifier, packageNameOfSpecifier } from "./workspace-registry.js";
 import { lowerToIr, type LowerOptions, type LowerResult } from "./lowering/lowerer.js";
 import type { FrontendServices } from "./services.js";
-import { isImportDeclaration, isExportDeclaration, isStringLiteral } from "./ts7/adapter.js";
+import {
+  isIdentifier,
+  isImportDeclaration,
+  isExportDeclaration,
+  isStringLiteral,
+  isStringLiteralLike,
+  SyntaxKind,
+  type SourceFile,
+} from "./ts7/adapter.js";
+import { moduleSourceCandidates } from "./module-source-candidates.js";
 import { CONTRACT_TYPES_MODULE } from "./contract-types.js";
 import { THREADS_MODULE } from "./threads-import.js";
+import { erasedTypeOnlyImport } from "./type-only-imports.js";
 import { EXPERIMENTAL_MODULE } from "./experimental-import.js";
+
+/** Where a package-anchored preflight diagnostic sits, as
+ * `<package path>:<line>` — the SC2013 refusal that drops the package
+ * reports only at the consumer's import, so its reason carries the inner
+ * location. */
+function packageDiagWhere(load: LoadResult, loc: SrcLoc): string {
+  const file = loc.file.split("\\").join("/");
+  const at = file.lastIndexOf("/node_modules/");
+  const shown = at >= 0 ? file.slice(at + "/node_modules/".length) : file;
+  const text = load.program.getSourceFile(loc.file)?.text;
+  if (text === undefined) return shown;
+  let line = 1;
+  for (let i = 0; i < loc.start && i < text.length; i++) if (text.charCodeAt(i) === 10) line++;
+  return `${shown}:${line}`;
+}
 
 export interface ProgramLoadOptions {
   npmStatic?: readonly string[];
@@ -85,33 +117,133 @@ export type FrontendFactory = (
   libraryNpmStatic?: readonly string[],
 ) => Frontend;
 
+/** Adds the program modules a literal `import()` reaches to `scanned`,
+ * with their own static import graphs: they load at the call, outside the
+ * startup module order, and their npm imports are dependencies all the
+ * same (a workspace package loaded on demand, the vercel.ts config parser
+ * shape). An opted-in package's JavaScript reached that way joins too,
+ * with every file its literal require() and import edges load: those
+ * files are outside the module order as well, and the packages THEY
+ * require (a compiled CommonJS dist requiring a sibling package) are
+ * dependencies the selection must see. */
+function addDynamicImportGraph(load: LoadResult, scanned: Set<SourceFile>): void {
+  const queue = [...scanned];
+  const added = new Set<SourceFile>();
+  while (queue.length > 0) {
+    const sf = queue.pop()!;
+    const packageJs = sf.fileName.includes("/node_modules/");
+    if (packageJs && !added.has(sf)) continue;
+    const specs: { spec: string; kind: "import" | "require" }[] = [];
+    // Every literal import() in the file, read from the syntax: a comment
+    // can stand between the keyword and its parenthesis. A file without
+    // the keyword has none. Package JavaScript loads its literal require()
+    // calls the same way, nested ones included.
+    const calls =
+      packageJs || sf.text.includes("import") ? moduleSourceCandidates(load.program, sf).calls : [];
+    for (const call of calls) {
+      const arg = call.arguments.nodes[0];
+      if (arg === undefined || !isStringLiteralLike(arg)) continue;
+      if (call.expression.kind === SyntaxKind.ImportKeyword)
+        specs.push({ spec: arg.text, kind: "import" });
+      else if (packageJs && isIdentifier(call.expression) && call.expression.text === "require")
+        specs.push({ spec: arg.text, kind: "require" });
+    }
+    // The startup graph's static edges are already in the module order.
+    if (added.has(sf)) {
+      for (const stmt of sf.statements.nodes) {
+        if (
+          (isImportDeclaration(stmt) || isExportDeclaration(stmt)) &&
+          stmt.moduleSpecifier &&
+          isStringLiteral(stmt.moduleSpecifier) &&
+          !(isImportDeclaration(stmt) ? erasedTypeOnlyImport(stmt) : stmt.isTypeOnly)
+        )
+          specs.push({ spec: stmt.moduleSpecifier.text, kind: "import" });
+      }
+    }
+    for (const { spec, kind } of specs) {
+      if (canonicalBuiltinModule(spec) !== null) continue;
+      // Only the JavaScript of a package the selection already opted in:
+      // a package's declarations load nothing.
+      const dep =
+        resolveImport(load.program, sf, spec, kind) ??
+        npmStaticDepSf7(load.program, sf, spec, kind);
+      if (dep === null || scanned.has(dep)) continue;
+      if (dep.fileName.includes("/node_modules/") && !isJsSourceFileName(dep.fileName)) continue;
+      scanned.add(dep);
+      added.add(dep);
+      queue.push(dep);
+    }
+  }
+}
+
 function detectAutoPackages(
   load: LoadResult,
   statuses: NpmStaticStatus[],
   mode: "auto" | "lib" = "auto",
   judged?: Set<string>,
   sites?: Map<string, SrcLoc>,
+  transitive: Set<string> = new Set(),
 ): string[] {
+  const chosen: string[] = [];
   // package → the resolved types file AND the file whose import found it:
   // the runtime-JS probe below must resolve from the SAME importing file,
   // or a package visible only to a nested package.json realm (a pnpm
   // monorepo's packages/*/node_modules, unreachable from the entry's own
   // walk-up) answers "no runtime JS" for perfectly ordinary installs.
-  const seen = new Map<string, { typesFile: string; fromFile: string; spec: string }>();
-  for (const sf of [...load.moduleOrder, load.entry]) {
+  const seen = new Map<
+    string,
+    { typesFile: string; fromFile: string; spec: string; owner: string | null }
+  >();
+  // A transitive package's files outside the module order (reached through
+  // nested require() calls the graph walk does not model) still name its
+  // dependencies.
+  const scanned = new Set([...load.moduleOrder, load.entry]);
+  addDynamicImportGraph(load, scanned);
+  const transitiveFiles =
+    transitive.size === 0
+      ? []
+      : load.program.getImplementationSourceFiles().filter((sf) => {
+          const pkg = npmStaticPackageOfPath(sf.fileName);
+          return !scanned.has(sf) && pkg !== null && transitive.has(pkg);
+        });
+  for (const sf of [...scanned, ...transitiveFiles]) {
     if (mode === "auto" && sf.fileName.includes("/node_modules/")) continue;
+    // `--npm-static=pkg...` opts pkg's whole dependency closure in: every
+    // package its compiled files import is selected the same explicit way,
+    // without the declaration eligibility bar.
+    const owner = npmStaticPackageOfPath(sf.fileName);
+    const viaTransitive = owner !== null && transitive.has(owner);
     const edges: { spec: string; loc: SrcLoc }[] = [];
-    for (const stmt of sf.statements) {
+    for (const stmt of sf.statements.nodes) {
       if (
         (isImportDeclaration(stmt) || isExportDeclaration(stmt)) &&
         stmt.moduleSpecifier &&
         isStringLiteral(stmt.moduleSpecifier)
       ) {
+        // `import type` and `export type … from` erase under Node's type
+        // stripping: Node never loads the package, so it is no dependency
+        // to compile (its declarations still type the program).
+        if (isImportDeclaration(stmt) ? erasedTypeOnlyImport(stmt) : stmt.isTypeOnly) continue;
         edges.push({ spec: stmt.moduleSpecifier.text, loc: locOf(stmt) });
-      } else if (mode === "lib") {
+      } else if (mode === "lib" && !viaTransitive) {
         // CJS packages spell their dep edges as top-level requires; the
         // import-statement scan alone would miss every one of them.
-        for (const req of requiresOf(stmt)) edges.push({ spec: req.spec, loc: locOf(req.node) });
+        for (const req of requiresOf(stmt, load.program))
+          edges.push({ spec: req.spec, loc: locOf(req.node) });
+      }
+    }
+    // Transitive selection counts every literal require() and import()
+    // anywhere in the package, nested ones included.
+    if (viaTransitive) {
+      for (const call of moduleSourceCandidates(load.program, sf).calls) {
+        const arg = call.arguments.nodes[0];
+        if (
+          arg !== undefined &&
+          isStringLiteralLike(arg) &&
+          (call.expression.kind === SyntaxKind.ImportKeyword ||
+            (isIdentifier(call.expression) && call.expression.text === "require"))
+        )
+          edges.push({ spec: arg.text, loc: locOf(call) });
       }
     }
     for (const { spec, loc } of edges) {
@@ -125,6 +257,9 @@ function detectAutoPackages(
       // Attested entries already resolve to program sources, so the
       // published package's declaration eligibility does not apply.
       if (provenanceEntryFor(spec) !== null) continue;
+      // Packages scriptc implements itself, or that the project marks never
+      // loaded, are not npm dependencies (package-shims.ts).
+      if (isShimmedImport(sf.fileName, spec)) continue;
       if (resolveWorkspaceSourceModule(sf.fileName, spec) !== null) continue;
       if (isRelativeSpecifier(spec) || spec.startsWith("node:") || spec.startsWith("#")) continue;
       // Bare builtin names ("fs", "path") are the builtin machinery's
@@ -132,33 +267,72 @@ function detectAutoPackages(
       // never npm candidates. Auto keeps its original path (the
       // @types/node answer skips them below), unchanged.
       if (mode === "lib" && canonicalBuiltinModule(spec) !== null) continue;
+      // npm packages served as builtins (graceful-fs as fs) never compile
+      // their JavaScript.
+      if (npmBuiltinAliasOf(spec) !== null) continue;
       // Explicit attempts name the runtime package. Types-first resolution
       // may instead identify its @types twin, which has no runtime to admit.
       if (judged?.has(packageNameOfSpecifier(spec))) continue;
       const npm = resolveNpmImport(sf.fileName, spec);
       if (npm !== null && isNodeTypesPath(npm.typesFile)) continue;
-      if (npm === null) {
-        if (mode !== "lib") continue;
-        const js = resolveBareModule(sf.fileName, spec, "js-only");
-        if (js === null || judged!.has(js.packageName)) continue;
-        judged!.add(js.packageName);
-        sites!.set(js.packageName, loc);
+      // The runtime package Node loads. Types-first resolution answers an
+      // @types twin's declarations for a package that ships none, but
+      // selection and every refusal name the package that has the code.
+      const js =
+        mode === "lib" && (npm === null || npm.packageName.startsWith("@types/"))
+          ? resolveBareModule(sf.fileName, spec, "js-only")
+          : null;
+      const runtimePkg = js !== null && js.packageName !== npm?.packageName ? js.packageName : null;
+      if (npm === null || runtimePkg !== null) {
+        if (mode !== "lib" || runtimePkg === null || judged!.has(runtimePkg)) continue;
+        judged!.add(runtimePkg);
+        sites!.set(runtimePkg, loc);
+        if (viaTransitive) {
+          transitive.add(runtimePkg);
+          chosen.push(runtimePkg);
+          continue;
+        }
+        // Both answers compile the JavaScript with inferred types; the
+        // declarations only check the importer, and an inferred surface
+        // the program does not typecheck against still refuses the package
+        // below. A DefinitelyTyped twin qualifies; a package without
+        // declarations qualifies as a dependency of another package, whose
+        // JavaScript importer has no declarations to check.
+        const refusal =
+          npm === null
+            ? owner === null && !sf.fileName.includes("/node_modules/")
+              ? "it ships no own .d.ts declaration surface"
+              : null
+            : definitelyTypedMismatch(runtimePkg, npm.typesFile);
+        if (refusal === null) {
+          chosen.push(runtimePkg);
+          continue;
+        }
         statuses.push({
-          package: js.packageName,
+          package: runtimePkg,
           status: "refused",
-          detail: "it ships no own .d.ts declaration surface",
+          detail: refusal,
+          hint: npmStaticOptInHint(runtimePkg, owner),
         });
         continue;
       }
       if (judged?.has(npm.packageName)) continue;
+      // An @types twin with no runtime package installed has nothing to
+      // compile (Node cannot load it either).
+      if (viaTransitive && !npm.packageName.startsWith("@types/")) {
+        judged!.add(npm.packageName);
+        sites!.set(npm.packageName, loc);
+        transitive.add(npm.packageName);
+        chosen.push(npm.packageName);
+        continue;
+      }
       if (!seen.has(npm.packageName)) {
-        seen.set(npm.packageName, { typesFile: npm.typesFile, fromFile: sf.fileName, spec });
+        seen.set(npm.packageName, { typesFile: npm.typesFile, fromFile: sf.fileName, spec, owner });
         sites?.set(npm.packageName, loc);
       }
     }
   }
-  const chosen: string[] = [];
-  for (const [pkg, { typesFile, fromFile, spec }] of seen) {
+  for (const [pkg, { typesFile, fromFile, spec, owner }] of seen) {
     judged?.add(pkg);
     // A package without a root entry (no "main", "exports" or index file)
     // can still serve the subpath the program imports.
@@ -168,6 +342,7 @@ function detectAutoPackages(
       pkg,
       typesFile,
       jsEntry !== null && isJsSourceFileName(jsEntry.typesFile) ? jsEntry.typesFile : null,
+      mode === "lib" && isJsSourceFileName(typesFile) && fromFile.includes("/node_modules/"),
     );
     if (reason === null) chosen.push(pkg);
     else
@@ -175,9 +350,21 @@ function detectAutoPackages(
         package: pkg,
         status: "refused",
         detail: mode === "lib" ? reason : `auto: ${reason}`,
+        // Naming a package bypasses the declaration and shipped-JS
+        // heuristics; it cannot supply JavaScript that does not resolve.
+        ...(mode === "lib" && jsEntry !== null ? { hint: npmStaticOptInHint(pkg, owner) } : {}),
       });
   }
   return chosen;
+}
+
+/** How to compile a package the declaration bar refused anyway: name it,
+ * or (for a dependency of an opted-in package) opt in that package's
+ * whole dependency closure. */
+function npmStaticOptInHint(pkg: string, importer: string | null): string {
+  return importer === null
+    ? `to compile it anyway, name it with --npm-static=${pkg} (or --npm-static=${pkg}... to include its dependencies)`
+    : `to compile it anyway, name it with --npm-static=${pkg}, or use --npm-static=${importer}... to include all of ${importer}'s dependencies`;
 }
 
 /** The opted-in packages a consumer-anchored tsc message NAMES: module
@@ -227,9 +414,23 @@ export function runFrontend(
     // selections bypass eligibility heuristics, but never compilation checks.
     const explicit: readonly string[] =
       npmStatic !== undefined && typeof npmStatic !== "string" ? npmStatic : [];
-    return loadFrontend(entryPath, trackedLoader, "lib", externalTypes, [
-      ...new Set([...libraryNpmStatic, ...explicit]),
-    ]);
+    // A trailing "..." (`--npm-static=fs-extra...`) selects the package and
+    // its whole dependency closure, which the library fixpoint discovers.
+    const transitive = new Set<string>();
+    const names = [...libraryNpmStatic, ...explicit].map((name) => {
+      if (!name.endsWith("...") || name.length === 3) return name;
+      const base = name.slice(0, -3);
+      transitive.add(base);
+      return base;
+    });
+    return loadFrontend(
+      entryPath,
+      trackedLoader,
+      "lib",
+      externalTypes,
+      [...new Set(names)],
+      transitive,
+    );
   } catch (error) {
     for (const load of active) {
       // Preserve the original failure and attempt every remaining cleanup.
@@ -249,6 +450,7 @@ function loadFrontend(
   npmStatic?: readonly string[] | "auto" | "lib",
   externalTypes?: Readonly<Record<string, string>>,
   libraryNpmStatic: readonly string[] = [],
+  transitive: Set<string> = new Set(),
 ): Frontend {
   // Resolver package/workspace metadata is intentionally shared across the
   // several load attempts of ONE auto-detection fixpoint, but never across
@@ -270,7 +472,10 @@ function loadFrontend(
       const scoutPreflight = checkPreflight(scout);
       requested =
         npmStatic === "lib"
-          ? [...libraryNpmStatic, ...detectAutoPackages(scout, statuses, "lib", judged, npmSites)]
+          ? [
+              ...libraryNpmStatic,
+              ...detectAutoPackages(scout, statuses, "lib", judged, npmSites, transitive),
+            ]
           : detectAutoPackages(scout, statuses);
       // With no package to opt in, the scout already IS the final frontend:
       // same roots, resolution posture, preflight, and module order. Retain it
@@ -328,7 +533,7 @@ function loadFrontend(
   // at least one new package for good).
   if (npmStatic === "lib") {
     for (;;) {
-      const grown = detectAutoPackages(load, statuses, "lib", judged, npmSites);
+      const grown = detectAutoPackages(load, statuses, "lib", judged, npmSites, transitive);
       if (grown.length === 0) break;
       requested = [...requested, ...grown];
       load.dispose();
@@ -337,11 +542,24 @@ function loadFrontend(
     }
   }
   const effective = new Set(requested);
+  // Packages refused only because the program does not typecheck against
+  // their inferred surface (no offender, no package-anchored diagnostic).
+  const typecheckRefused = new Set<string>();
   while (effective.size > 0) {
     const reasons = new Map<string, string>(npmStaticOffenders());
+    // Bundler interop the rewrite could not finish refuses its package
+    // only where the compiled program can load the file.
+    if (npmStaticFileDegrades().size > 0) {
+      const loadable = npmStaticLoadableFiles(load.program, load.moduleOrder);
+      for (const [file, { pkg, reason }] of npmStaticFileDegrades()) {
+        if (!reasons.has(pkg) && (loadable === null || loadable.has(file)))
+          reasons.set(pkg, reason);
+      }
+    }
     for (const d of preflight) {
       const pkg = npmStaticPackageOfPath(d.loc.file);
-      if (pkg !== null && !reasons.has(pkg)) reasons.set(pkg, `${d.code}: ${d.message}`);
+      if (pkg !== null && !reasons.has(pkg))
+        reasons.set(pkg, `${d.code} at ${packageDiagWhere(load, d.loc)}: ${d.message}`);
     }
     if (![...reasons.keys()].some((p) => effective.has(p))) {
       const named = new Map<string, number>();
@@ -352,6 +570,7 @@ function loadFrontend(
         }
       }
       for (const [pkg, count] of named) {
+        typecheckRefused.add(pkg);
         reasons.set(
           pkg,
           `its inferred export surface breaks ${count} import site${count === 1 ? "" : "s"} in program files (bundler-emitted surfaces type only as far as inference reaches)`,
@@ -384,6 +603,7 @@ function loadFrontend(
   if (effective.size > 0 && preflight.some((d) => d.code === "SC0001")) {
     const dropWithNote = (p: string): void => {
       effective.delete(p);
+      typecheckRefused.add(p);
       statuses.push({
         package: p,
         status: "refused",
@@ -417,6 +637,16 @@ function loadFrontend(
   }
   for (const p of requested) {
     if (effective.has(p)) statuses.push({ package: p, status: "static" });
+  }
+  // The final program types the refused packages by their own
+  // declarations. If it still fails to typecheck, the type errors are the
+  // program's, not the packages': report them at their own locations
+  // instead of a package refusal that hides them.
+  if (typecheckRefused.size > 0 && preflight.some((d) => d.code === "SC0001")) {
+    for (let i = statuses.length - 1; i >= 0; i--) {
+      const s = statuses[i]!;
+      if (s.status === "refused" && typecheckRefused.has(s.package)) statuses.splice(i, 1);
+    }
   }
 
   const finalLoad = load;
@@ -456,14 +686,23 @@ function loadFrontend(
           ...finalLoad.program.getImplementationSourceFiles().filter((sf) => !sf.isDeclarationFile),
         ].map((sf) => [sf.fileName, sf.text]),
       ),
-    lower: (opts) =>
-      lowerToIr(finalLoad.program, finalLoad.entry, finalLoad.moduleOrder, {
+    lower: (opts) => {
+      const lowered = lowerToIr(finalLoad.program, finalLoad.entry, finalLoad.moduleOrder, {
         ...opts,
         frontendServices: finalLoad.services,
         startupCrash: finalLoad.startupCrash ?? null,
+        inlineRequireCycleCalls: finalLoad.inlineRequireCycleCalls,
+        moduleEdges: finalLoad.moduleEdges,
+        projectCheckJs: finalLoad.typeWorld?.projectCheckJs ?? false,
         externalTypes: finalLoad.externalTypes,
         externalTypeSpecifiersByFile: finalLoad.externalTypeSpecifiersByFile,
-      }),
+      });
+      // The declaration-typed boundary's notes (SC6102) join the
+      // performance warnings; they never fail a build.
+      const notes = finalLoad.declBoundaryNotes;
+      if (notes === undefined) return lowered;
+      return { ...lowered, performance: [...notes, ...(lowered.performance ?? [])] };
+    },
     npmStatic: statuses,
     npmImportSites: npmSites,
     dispose: finalLoad.dispose,

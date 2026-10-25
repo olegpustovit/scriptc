@@ -1,9 +1,11 @@
+import { keyedHelperName } from "../stable-names.js";
 import { buildUnionNarrow, unionNarrowFailureMessage } from "../union-narrow.js";
 import { isSafeToRepeat } from "../expressions/evaluation-safety.js";
 import { nodeThrowExpr } from "../../../ir/build.js";
 import {
   planUnionRetag,
   buildUnionRetag,
+  planRecordUnionLift,
   planRecordUnionWrap,
   buildRecordUnionWrap,
 } from "../union-retag.js";
@@ -77,6 +79,48 @@ export function narrowedRetagHelper(
   return lowerer.unionRetagHelper(fromId, toId, loc, trappable);
 }
 
+/** A union conversion whose source arms include an object type with a
+ * required property of type `never` (the error arm of `Result<T, never>`).
+ * No value has that type, but its arm still has a storage layout (never
+ * maps to the f64 placeholder) that no destination arm matches. When the
+ * node's checker type proves a source arm uninhabited, the re-tag traps on
+ * it instead of needing a destination. Optional `never` properties,
+ * `never[]` and functions returning `never` have values and keep their
+ * arms. Null when no source arm is proven uninhabited. */
+export function uninhabitedArmRetagHelper(
+  lowerer: Lowerer,
+  node: ts.Node,
+  fromId: string,
+  toId: string,
+  loc: SrcLoc,
+): string | null {
+  const type = lowerer.typeOf(node);
+  if (!type.isUnionType()) return null;
+  const uninhabited = new Set<number>();
+  const inhabited = new Set<number>();
+  for (const part of ts.constituentTypes(type)) {
+    const arm = lowerer.mapTypeOf(part);
+    const tag = arm ? lowerer.armTag(fromId, arm) : -1;
+    if (tag < 0) continue;
+    (hasRequiredNeverProperty(lowerer, part) ? uninhabited : inhabited).add(tag);
+  }
+  // An arm shared with an inhabited constituent holds real values.
+  for (const tag of inhabited) uninhabited.delete(tag);
+  if (uninhabited.size === 0) return null;
+  return lowerer.unionRetagHelper(fromId, toId, loc, uninhabited);
+}
+
+function hasRequiredNeverProperty(lowerer: Lowerer, type: ts.Type): boolean {
+  if ((type.flags & ts.TypeFlags.Object) === 0) return false;
+  return lowerer.checker
+    .getPropertiesOfType(type)
+    .some(
+      (property) =>
+        (property.flags & ts.SymbolFlags.Optional) === 0 &&
+        (lowerer.checker.getTypeOfSymbol(property).flags & ts.TypeFlags.Never) !== 0,
+    );
+}
+
 /** The stranded-UNIT trap for PLAIN (non-union) slots: a null/undefined
  * value flowing into a non-nullable typed slot the checker approved —
  * `null!` and `null as any as T` casts, and the non-strict world's
@@ -104,7 +148,7 @@ export function strandedUnitTrap(
   const key = `strandunit:${typeKey(expected)}:${expr.type.kind}`;
   let name = lowerer.coercions.retags.get(key);
   if (!name) {
-    name = `%unit.strand.${lowerer.coercions.retags.size}`;
+    name = keyedHelperName(lowerer, "%unit.strand", key);
     lowerer.coercions.retags.set(key, name);
     lowerer.liftedFns.push({
       name,
@@ -184,7 +228,7 @@ export function strandedCoercionTrap(
   const key = `strand:${expected.unionId}:${typeKey(src)}`;
   let name = lowerer.coercions.retags.get(key);
   if (!name) {
-    name = `%union.strand.${lowerer.coercions.retags.size}`;
+    name = keyedHelperName(lowerer, "%union.strand", key);
     lowerer.coercions.retags.set(key, name);
     const toT: IrType = { kind: "union", unionId: expected.unionId };
     lowerer.liftedFns.push({
@@ -232,7 +276,39 @@ export function recordUnionWrapHelper(
   const key = `recordWrap:${source.shapeId}:${toId}`;
   const existing = lowerer.coercions.retags.get(key);
   if (existing) return existing;
-  const name = `%record.wrap.${lowerer.coercions.retags.size}`;
+  const name = keyedHelperName(lowerer, "%record.wrap", key);
+  lowerer.coercions.retags.set(key, name);
+  lowerer.liftedFns.push(
+    buildRecordUnionWrap(name, source, to, plan, loc, (lift, value, dst) =>
+      lowerer.applyWidthLift(lift, value, dst, loc),
+    ),
+  );
+  return name;
+}
+
+/** Interned `%record.route.<n>(r)`: a record that fits several arms of a
+ * discriminated union, converted into the arm its discriminant names
+ * (planRecordUnionLift). The width plan's `discriminantRoute` lift. */
+export function recordUnionRouteHelper(
+  lowerer: Lowerer,
+  source: IrType & { kind: "record" },
+  toId: string,
+  loc: SrcLoc,
+): string | null {
+  const shape = lowerer.shapes.get(source.shapeId);
+  const to = lowerer.unions.get(toId);
+  if (!shape || !to) return null;
+  const key = `recordRoute:${source.shapeId}:${toId}`;
+  const existing = lowerer.coercions.retags.get(key);
+  if (existing) return existing;
+  const plan = planRecordUnionLift(
+    shape,
+    to,
+    (id) => lowerer.shapes.get(id),
+    (from, dst) => lowerer.widthLiftPlan(from, dst),
+  );
+  if (!plan) return null;
+  const name = keyedHelperName(lowerer, "%record.route", key);
   lowerer.coercions.retags.set(key, name);
   lowerer.liftedFns.push(
     buildRecordUnionWrap(name, source, to, plan, loc, (lift, value, dst) =>
@@ -277,7 +353,7 @@ export function unionRetagHelper(
   });
   const key = `${fromId}:${toId}:${stranded.join(".")}`;
   const existing = lowerer.coercions.retags.get(key);
-  const name = existing ?? `%union.retag.${lowerer.coercions.retags.size}`;
+  const name = existing ?? keyedHelperName(lowerer, "%union.retag", key);
   if (!existing) {
     lowerer.coercions.retags.set(key, name);
     lowerer.liftedFns.push(
@@ -335,7 +411,7 @@ export function narrowedArmHelper(
     lowerer.coercions.checkedNarrows.add(existing);
     return existing;
   }
-  const name = `%union.narrow.${lowerer.coercions.narrows.size}`;
+  const name = keyedHelperName(lowerer, "%union.narrow", key);
   lowerer.coercions.narrows.set(key, name);
   lowerer.coercions.checkedNarrows.add(name);
   const fn = buildUnionNarrow(name, from, target, loc, (type) => lowerer.fmt(type));
@@ -512,7 +588,7 @@ export function deferredReadHelper(
   const key = `deferred:${fromId}:${tag}`;
   const existing = lowerer.coercions.narrows.get(key);
   if (existing) return existing;
-  const name = `%deferred.read.${lowerer.coercions.narrows.size}`;
+  const name = keyedHelperName(lowerer, "%deferred.read", key);
   lowerer.coercions.narrows.set(key, name);
   const dflt: IrExpr =
     target.kind === "bool"

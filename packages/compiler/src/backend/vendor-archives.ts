@@ -14,10 +14,15 @@ import type { CcDriver } from "./native/driver.js";
 
 const execFileAsync = promisify(execFile);
 
+/** The section flags the libregexp/libunicode objects build with (the
+ * runtime pack's executable_section_elimination flags). */
+const LRE_SECTION_FLAGS = ["-ffunction-sections", "-fdata-sections"];
+
 import {
   QJS_COMMIT,
   MBEDTLS_VERSION,
   ZLIB_VERSION,
+  BROTLI_VERSION,
   LRE_SOURCES,
   ZLIB_SOURCES,
 } from "./vendor-inputs.js";
@@ -25,6 +30,7 @@ export {
   QJS_COMMIT,
   MBEDTLS_VERSION,
   ZLIB_VERSION,
+  BROTLI_VERSION,
   LRE_SOURCES,
   ZLIB_SOURCES,
 } from "./vendor-inputs.js";
@@ -189,13 +195,13 @@ export function createVendorArchives(context: VendorArchiveContext) {
       (sanitize ? "asan" : "plain") +
       (driver.argv.length === 1 && driver.argv[0] === "clang" ? "" : "-zigcc") +
       `-${vendorCacheTargetFlavor(driver)}-${buildIdentity}`;
-    const cacheDir = join(cacheRoot, `${QJS_COMMIT.slice(0, 12)}-lre-${flavor}`);
+    const cacheDir = join(cacheRoot, `${QJS_COMMIT.slice(0, 12)}-lre-sections-${flavor}`);
     return LRE_SOURCES.map((f) => join(cacheDir, f.replace(/\.c$/, ".o")));
   }
 
   /** The libregexp objects for one flavor, compiled lazily on the first
    * regex-using build (~1s) and cached under
-   * <build-cache>/vendor/<commit>-lre-<flavor>-<target>-<toolchain>/*.o — with the same atomic-rename
+   * <build-cache>/vendor/<commit>-lre-sections-<flavor>-<target>-<toolchain>/*.o — with the same atomic-rename
    * publish (parallel first builds race safely; losers discard their work).
    * Plain is -Os to keep regex-using binaries small; asan matches the final link so
    * the sanitized lane instruments the matcher too. Cross targets get their
@@ -226,6 +232,10 @@ export function createVendorArchives(context: VendorArchiveContext) {
       vendor: vendorEngineDir(),
       sources: LRE_SOURCES,
       objects: lreObjectPaths(sanitize, driver, buildIdentity, cacheRoot),
+      // Section elimination keeps only the libunicode tables a program
+      // reaches: the URL host parser's NFC links the normalization tables
+      // without the regex property ones.
+      flags: LRE_SECTION_FLAGS,
     });
   }
 
@@ -294,6 +304,7 @@ export function createVendorArchives(context: VendorArchiveContext) {
     vendor: string;
     sources: readonly string[];
     objects: string[];
+    flags?: readonly string[];
   }): Promise<string[]> {
     const { sanitize, driver, cacheRoot, flavor, name, vendor, sources, objects } = options;
     if ((await Promise.all(objects.map(validVendorArtifact))).every(Boolean)) return objects;
@@ -310,6 +321,7 @@ export function createVendorArchives(context: VendorArchiveContext) {
             "-std=c11",
             ...driver.targetArgs,
             ...(sanitize ? ["-O1", "-fsanitize=address"] : ["-Os"]),
+            ...(options.flags ?? []),
             "-I",
             vendor,
             "-c",
@@ -418,9 +430,98 @@ export function createVendorArchives(context: VendorArchiveContext) {
     return archive;
   }
 
+  function vendorBrotliDir(): string {
+    return join(runtimeSrcDir(), "..", "vendor", "brotli", "c");
+  }
+
+  function brotliArchivePath(
+    sanitize: boolean,
+    driver: CcDriver,
+    buildIdentity: string,
+    cacheRoot: string = vendorBuildCacheRoot(),
+  ): string {
+    const flavor = `${sanitize ? "asan" : "plain"}-${vendorCacheTargetFlavor(driver)}-${buildIdentity}`;
+    return join(cacheRoot, `brotli-${BROTLI_VERSION}-${flavor}`, "libbrotli.a");
+  }
+
+  /** The brotli archive for one flavor, compiled lazily on the first
+   * Brotli-using build and cached under
+   * <build-cache>/vendor/brotli-<version>-<flavor>-<target>-<toolchain>/libbrotli.a,
+   * with the mbedTLS archive's recipe: per-TU compiles of c/common, c/dec
+   * and c/enc against c/include, then one `ar rcs`. dec/ and enc/ share
+   * file names, so each object is named after its path (dec-static_init.o). */
+  async function ensureBrotliArchive(
+    sanitize: boolean,
+    driver: CcDriver,
+    buildIdentity: string,
+    cacheRoot: string = vendorBuildCacheRoot(),
+  ): Promise<string> {
+    const flavor = `${sanitize ? "asan" : "plain"}-${vendorCacheTargetFlavor(driver)}-${buildIdentity}`;
+    const compileArgv = isZigDriver(driver) ? driver.argv : ["clang"];
+    const arArgv = isZigDriver(driver) ? [...driver.argv.slice(0, 1), "ar"] : ["ar"];
+    const vendor = vendorBrotliDir();
+    const archive = brotliArchivePath(sanitize, driver, buildIdentity, cacheRoot);
+    if (await validVendorArtifact(archive)) return archive;
+
+    await mkdir(cacheRoot, { recursive: true });
+    const buildDir = await mkdtemp(join(tmpdir(), `scriptc-vendor-brotli-${flavor}-`));
+    try {
+      const sources = (
+        await Promise.all(
+          ["common", "dec", "enc"].map(async (dir) =>
+            (await readdir(join(vendor, dir)))
+              .filter((name) => !name.startsWith(".") && name.endsWith(".c"))
+              .map((name) => `${dir}/${name}`),
+          ),
+        )
+      )
+        .flat()
+        .sort();
+      const object = (src: string): string =>
+        join(buildDir, `${src.replaceAll("/", "-").replace(/\.c$/, "")}.o`);
+      const cflags = [
+        "-std=c11",
+        ...driver.targetArgs,
+        ...(sanitize ? ["-O1", "-fsanitize=address"] : ["-Os"]),
+        "-I",
+        join(vendor, "include"),
+      ];
+      const width = availableParallelism();
+      for (let i = 0; i < sources.length; i += width) {
+        await Promise.all(
+          sources
+            .slice(i, i + width)
+            .map((src) =>
+              execFileAsync(compileArgv[0] ?? "clang", [
+                ...compileArgv.slice(1),
+                ...cflags,
+                "-c",
+                join(vendor, src),
+                "-o",
+                object(src),
+              ]),
+            ),
+        );
+      }
+      await execFileAsync(arArgv[0] ?? "ar", [
+        ...arArgv.slice(1),
+        "rcs",
+        join(buildDir, "libbrotli.a"),
+        ...sources.map(object),
+      ]);
+      await publishVendorArtifact(join(buildDir, "libbrotli.a"), archive);
+    } finally {
+      await rm(buildDir, { recursive: true, force: true });
+    }
+    return archive;
+  }
+
   return {
     vendorEngineDir,
     vendorTlsDir,
+    vendorBrotliDir,
+    brotliArchivePath,
+    ensureBrotliArchive,
     vendorBuildCacheRoot,
     vendorCacheTargetFlavor,
     vendorCacheBuildIdentity,

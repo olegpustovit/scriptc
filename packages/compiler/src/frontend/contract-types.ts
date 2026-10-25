@@ -30,6 +30,9 @@ export interface ContractNote {
   loc: SrcLoc;
   /** The annotated declaration's name, for messages. */
   name: string;
+  /** `Int32[]` (also `readonly Int32[]`, `Array<Int32>`, `ReadonlyArray<Int32>`):
+   * the contract covers the elements of the annotated array. */
+  elements?: true;
 }
 
 /** An Acyclic type: a class (by its declaration's location key, like
@@ -106,7 +109,7 @@ function markerNamed(
   if (!MARKERS.has(written)) return null;
   let member = written;
   const symbol = checker.getSymbolAtLocation(ident);
-  const decl = symbol ? checker.declarationsOf(symbol)[0] : undefined;
+  const decl = symbol ? symbol.declarations[0] : undefined;
   if (decl === undefined) return null;
   let importDecl: ts.Node | undefined;
   if (ts.isImportSpecifier(decl) && !qualified) {
@@ -127,7 +130,7 @@ function markerNamed(
 function nameText(node: ts.Node | undefined): string {
   if (node === undefined) return "<anonymous>";
   if (ts.isIdentifier(node) || ts.isPrivateIdentifier(node)) return node.text;
-  return node.getText();
+  return ts.getTextOfNode(node);
 }
 
 function contractDiag(
@@ -202,7 +205,7 @@ function unsupported(out: ContractAnnotations, node: ts.Node, marker: ContractMa
     marker === "NoThrow"
       ? "NoThrow wraps a function's written return type"
       : marker === "Int32"
-        ? "Int32 is checked on parameters, variables, class instance fields and function results"
+        ? "Int32 and Int32[] are checked on parameters, variables, class instance fields and function results"
         : marker === "ProgramLifetime"
           ? "ProgramLifetime is checked in the implements clause of a class declaration"
           : "Immutable is checked on parameters, variables, class instance fields and function results";
@@ -215,7 +218,9 @@ function unsupported(out: ContractAnnotations, node: ts.Node, marker: ContractMa
         ? "write it as the function's return type annotation: function f(): NoThrow<T>"
         : marker === "ProgramLifetime"
           ? "declare it on the class itself: class Node implements ProgramLifetime { ... }"
-          : `write ${marker} directly as the annotation of the declaration; type aliases, interface members and types nested in other types (arrays, unions, type arguments) are not followed`,
+          : marker === "Int32"
+            ? "write Int32 or Int32[] directly as the annotation of the declaration; type aliases, interface members and types nested in other types (unions, nested arrays, other type arguments) are not followed"
+            : `write ${marker} directly as the annotation of the declaration; type aliases, interface members and types nested in other types (arrays, unions, type arguments) are not followed`,
     ),
   );
 }
@@ -257,7 +262,7 @@ function placeHeritage(
     return unsupported(out, node, marker);
   // `implements Acyclic<C>` would make the class implement C's own type,
   // which the lowering treats as a protocol of C.
-  if ((node.typeArguments?.length ?? 0) > 0) return unsupported(out, node, marker);
+  if ((node.typeArguments?.nodes.length ?? 0) > 0) return unsupported(out, node, marker);
   const note = (name: string): ContractNote => ({ marker, loc: locOf(node), name });
   if (
     (ts.isClassDeclaration(owner) || ts.isClassExpression(owner)) &&
@@ -299,16 +304,47 @@ function place(
 ): void {
   let node: ts.Node = ref;
   let parent = ref.parent;
+  // Int32[] (readonly Int32[], Array<Int32>, ReadonlyArray<Int32>): the
+  // contract covers the elements of the annotated array.
+  let elements = false;
+  if (marker === "Int32" && parent !== undefined) {
+    if (ts.isArrayTypeNode(parent) && parent.elementType === ref) {
+      node = parent;
+      parent = parent.parent;
+      elements = true;
+      if (
+        parent !== undefined &&
+        ts.isTypeOperatorNode(parent) &&
+        parent.operator === ts.SyntaxKind.ReadonlyKeyword
+      ) {
+        node = parent;
+        parent = parent.parent;
+      }
+    } else if (
+      ts.isTypeReferenceNode(parent) &&
+      ts.isIdentifier(parent.typeName) &&
+      (parent.typeName.text === "Array" || parent.typeName.text === "ReadonlyArray") &&
+      parent.typeArguments?.nodes.length === 1 &&
+      parent.typeArguments.nodes[0] === ref
+    ) {
+      node = parent;
+      parent = parent.parent;
+      elements = true;
+    }
+  }
   // NoThrow<Int32> / NoThrow<Immutable<T>>: the inner marker is the result
   // contract of the function the NoThrow annotates.
   if (marker !== "NoThrow" && parent !== undefined && ts.isTypeReferenceNode(parent)) {
     const wrapper = markerOf(checker, parent);
-    if (wrapper === "NoThrow" && parent.typeArguments?.[0] === ref) {
+    if (wrapper === "NoThrow" && parent.typeArguments?.nodes[0] === node) {
       node = parent;
       parent = parent.parent;
     }
   }
-  const note = (name: string): ContractNote => ({ marker, loc: locOf(ref), name });
+  const note = (name: string): ContractNote =>
+    elements
+      ? { marker, loc: locOf(ref), name, elements: true }
+      : { marker, loc: locOf(ref), name };
   if (parent === undefined) return unsupported(out, ref, marker);
   if (ts.isFunctionLike(parent) && parent.type === node) {
     if (!ts.isFunctionLikeDeclaration(parent)) return unsupported(out, ref, marker);

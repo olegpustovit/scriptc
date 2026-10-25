@@ -9,6 +9,7 @@ import {
   type IrUnionDef,
 } from "../../ir/ir.js";
 import { everyExprChild, everyStmtChild } from "../../ir/traverse.js";
+import { eachNodeOfKinds, type IrNodeIndex, type IrNodeKind } from "../../ir/node-index.js";
 import { borrowsMapMutationReceiver, borrowsMapReadInputs } from "./map-read-lifetimes.js";
 import { preservesRegexInputs, VirtualTargets } from "./reference-effects.js";
 import { borrowsStringInputs } from "./string-lifetimes.js";
@@ -104,8 +105,13 @@ const INERT_LIB_CALLS = new Set([
   "regex.groupEquals",
   "regex.groupNumber",
   "regex.groupParseInt",
+  "regex.resultProp",
+  "array.namedKeys",
+  "array.hasNamedKey",
+  "array.hasProperties",
   "process.cwd",
   "process.argv",
+  "process.execArgv",
   "process.platform",
   "process.execPath",
   "process.isTTY",
@@ -114,7 +120,22 @@ const INERT_LIB_CALLS = new Set([
   "worker.parentPort",
   "worker.root",
   "cp.spawnSyncOpts",
+  "cp.spawnSyncEnv",
 ]);
+
+/** jsval conversions (ir/jsval.ts): no user code, no stores. */
+const JS_CONVERSIONS = new Set([
+  "js.fromDyn",
+  "js.toDyn",
+  "js.fromF64",
+  "js.fromBool",
+  "js.fromStr",
+  "js.fromBigInt",
+  "js.toF64",
+]);
+
+/** jsval conversions of static primitives. */
+const JS_PRIMITIVE_SOURCES = new Set(["js.fromF64", "js.fromBool", "js.fromStr", "js.fromBigInt"]);
 
 /** Array methods that never release an existing element or run user code. */
 const PRESERVING_ARRAY_METHODS = new Set([
@@ -191,6 +212,7 @@ export class ReferenceWrites {
   private current: IrFunction | null = null;
   private currentBoxed = new Set<string>();
   private currentLocals = new Set<string>();
+  private currentPrivateArrays: ReadonlySet<string> = new Set();
   private constructors: ReadonlySet<string> = new Set();
   private inConstructor = false;
 
@@ -206,6 +228,8 @@ export class ReferenceWrites {
     /** Fields no code writes once their object is constructed
      * (immutability.ts, from cycle-mutability's construction-only facts). */
     private readonly immutable: ImmutableFields | null = null,
+    /** The module's node index, read instead of walking the bodies. */
+    private readonly nodes?: IrNodeIndex,
   ) {
     this.key(HEAP_KEY);
     this.unions = new Map((types.unions ?? []).map((u) => [u.id, u]));
@@ -215,25 +239,25 @@ export class ReferenceWrites {
     const constructors = new Set(classes.map((cls) => `%${cls.name}.constructor`));
     this.constructors = constructors;
     this.freshConstructors = [...functions.values()].every((fn) =>
-      fn.body.every((s) => this.onlySuperCalls(fn, s, constructors)),
+      this.onlySuperCalls(fn, constructors),
     );
-    this.callTargets = new CallTargets(functions, this.virtualTargets);
+    this.callTargets = new CallTargets(functions, this.virtualTargets, nodes);
     this.solve(constructors);
   }
 
-  /** Every direct call of a constructor is a `super` call from a
+  /** Every direct call of a constructor in `fn` is a `super` call from a
    * constructor on its own `this`. */
-  private onlySuperCalls(fn: IrFunction, s: IrStmt, constructors: ReadonlySet<string>): boolean {
+  private onlySuperCalls(fn: IrFunction, constructors: ReadonlySet<string>): boolean {
     const thisId = constructors.has(fn.name) ? fn.params[0]?.localId : undefined;
-    const expr = (e: IrExpr): boolean => {
-      if (e.kind === "call" && constructors.has(e.callee)) {
-        const self = e.args[0];
-        if (thisId === undefined || !self || !isThisRef(self, thisId)) return false;
+    let only = true;
+    eachNodeOfKinds(fn, this.nodes?.scan(CALL_KINDS), (node) => {
+      if (node.kind === "call" && constructors.has(node.callee)) {
+        const self = node.args[0];
+        if (thisId === undefined || !self || !isThisRef(self, thisId)) only = false;
       }
-      return everyExprChild(e, expr, stmt);
-    };
-    const stmt = (node: IrStmt): boolean => everyStmtChild(node, expr, stmt);
-    return stmt(s);
+      return only;
+    });
+    return only;
   }
 
   private key(k: string): number {
@@ -278,6 +302,7 @@ export class ReferenceWrites {
       }
       const thisId = external && constructors.has(fn.name) ? (fn.params[0]?.localId ?? null) : null;
       const boxed = boxedLocals(fn);
+      const privates = privateArrays(fn, boxed, this.nodes);
       const sink: WriteSink = {
         add: (k) => {
           // Interned for queries; a callee's locals are private to it.
@@ -311,7 +336,7 @@ export class ReferenceWrites {
       const stmt = (s: IrStmt): boolean => {
         if (thisId !== null && s.kind === "fieldSet" && isThisRef(s.obj, thisId)) {
           // A store into the fresh `this`: no outside borrow can reach it.
-        } else this.stmtWrites(s, sink, boxed);
+        } else this.stmtWrites(s, sink, boxed, privates);
         return everyStmtChild(s, expr, stmt);
       };
       fn.body.every(stmt);
@@ -466,11 +491,14 @@ export class ReferenceWrites {
         return;
       case "intrinsic":
         // A TDZ test reads; publication only makes objects immortal; intern
-        // tables store published values and write no script object.
+        // tables store published values and write no script object;
+        // ThreadSlots reads write nothing.
         if (
           e.name !== "module.tdzCheck" &&
           e.name !== "threads.publish" &&
-          !e.name.startsWith("itable.")
+          !e.name.startsWith("itable.") &&
+          e.name !== "slots.get" &&
+          e.name !== "slots.has"
         )
           sink.all();
         return;
@@ -574,7 +602,12 @@ export class ReferenceWrites {
   }
 
   /** Writes of one statement node itself. */
-  private stmtWrites(s: IrStmt, sink: WriteSink, boxed: ReadonlySet<string>): void {
+  private stmtWrites(
+    s: IrStmt,
+    sink: WriteSink,
+    boxed: ReadonlySet<string>,
+    privates: ReadonlySet<string>,
+  ): void {
     switch (s.kind) {
       case "assign":
         if (isRefCounted(s.value.type)) sink.add(this.localKey(s.localId, boxed));
@@ -593,7 +626,7 @@ export class ReferenceWrites {
       case "arraySetUndefined":
       case "arrayDelete":
       case "arraySetLength":
-        sink.add(ARRAY_KEY);
+        if (!privateReceiver(s.arr, privates)) sink.add(ARRAY_KEY);
         return;
       case "varDecl":
       case "exprStmt":
@@ -623,6 +656,13 @@ export class ReferenceWrites {
    * accessors) or absent. */
   private inertLibCall(e: IrExpr & { kind: "libCall" }): boolean {
     if (e.fn === "error.nodeThrow" || isStableReceiverOperand(e, "")) return true;
+    // jsval conversions run no user code: they move a value between its
+    // dyn and jsval forms, and js.toF64 is dynCheck's number check. A
+    // comparison is inert exactly when its dyn twin is: every operand a
+    // wrapped primitive.
+    if (JS_CONVERSIONS.has(e.fn)) return true;
+    if (e.fn === "js.compare")
+      return e.args.every((arg) => arg.type.kind !== "jsval" || this.jsPrimitive(arg));
     if (e.fn === "error.newOptions")
       return e.args.every(
         (arg) =>
@@ -640,6 +680,17 @@ export class ReferenceWrites {
           // A wrapped primitive has no methods to call back into.
           (arg.kind === "dynFrom" && this.primitive(arg.value.type))),
     );
+  }
+
+  /** A jsval operand made from a primitive: it has no methods to call
+   * back into. */
+  private jsPrimitive(e: IrExpr): boolean {
+    if (e.kind !== "libCall") return false;
+    if (e.fn === "js.fromDyn") {
+      const value = e.args[0]!;
+      return value.kind === "dynFrom" && this.primitive(value.value.type);
+    }
+    return JS_PRIMITIVE_SOURCES.has(e.fn);
   }
 
   /** Numbers, booleans, strings and unit values (and unions of them). */
@@ -701,6 +752,7 @@ export class ReferenceWrites {
   enter(fn: IrFunction): void {
     this.current = fn;
     this.currentBoxed = boxedLocals(fn);
+    this.currentPrivateArrays = privateArrays(fn, this.currentBoxed, this.nodes);
     this.currentLocals = new Set(fn.locals.map((local) => local.id));
     this.inConstructor = this.constructors.has(fn.name);
     for (const p of fn.params) this.currentLocals.add(p.localId);
@@ -780,7 +832,7 @@ export class ReferenceWrites {
     const known = this.stmtCache.get(s);
     if (known !== undefined) return known;
     const parts: Writes[] = [];
-    this.stmtWrites(s, this.querySink(parts), this.currentBoxed);
+    this.stmtWrites(s, this.querySink(parts), this.currentBoxed, this.currentPrivateArrays);
     everyStmtChild(
       s,
       (child) => (parts.push(this.expr(child)), true),
@@ -915,6 +967,119 @@ function isThisRef(e: IrExpr, thisId: string): boolean {
   return false;
 }
 
+/** A write whose receiver is a private array of the current function. */
+function privateReceiver(arr: IrExpr, privates: ReadonlySet<string>): boolean {
+  return privates.size > 0 && arr.kind === "varRef" && privates.has(arr.localId);
+}
+
+/** Array methods a private array may receive: they neither read an
+ * element out nor let the array escape. */
+const PRIVATE_ARRAY_METHODS = new Set(["length", "push"]);
+
+/** The nodes the scans below read. */
+const CALL_KINDS: readonly IrNodeKind[] = ["call"];
+const CALL_SITE_KINDS: readonly IrNodeKind[] = ["call", "new", "virtualCall", "closure"];
+const DEFINITION_KINDS: readonly IrNodeKind[] = ["assignExpr", "incDec", "varDecl", "assign"];
+
+/** The nodes privateArrays reads. */
+const PRIVATE_ARRAY_KINDS: readonly IrNodeKind[] = [
+  "varRef",
+  "assignExpr",
+  "incDec",
+  "closure",
+  "classRef",
+  "arrIntrinsic",
+  "arrayHas",
+  "varDecl",
+  "assign",
+  "arraySet",
+  "arraySetUndefined",
+  "arrayDelete",
+  "arraySetLength",
+  "return",
+];
+
+/** Array locals whose storage the function allocated itself and that
+ * nothing else can reach before the function returns them: declared once
+ * from an array literal or `new Array(n)`, never rebound, unboxed, and
+ * otherwise only the receiver of element stores, length updates, `length`,
+ * `push` and presence tests, or the value of a `return`. No code reads an
+ * element of such an array or reaches its storage through another path, so
+ * its element stores cannot release a value that a borrow depends on:
+ * a borrow's own location stays unwritten, and the array is not one. The
+ * stores are private to the activation, like writes of its locals, and
+ * stay out of the function's summary (a caller's borrows predate the
+ * array). The literal map, filter and fused-pipeline helpers fill their
+ * results this way. */
+function privateArrays(
+  fn: IrFunction,
+  boxed: ReadonlySet<string>,
+  nodes: IrNodeIndex | undefined,
+): ReadonlySet<string> {
+  if (fn.async || fn.generator) return new Set();
+  const candidates = new Set<string>();
+  for (const local of fn.locals)
+    if (local.type.kind === "array" && !local.boxed && !boxed.has(local.id))
+      candidates.add(local.id);
+  if (candidates.size === 0) return candidates;
+  const declarations = new Map<string, number>();
+  const rejected = new Set<string>();
+  // Permitted positions per varRef node (lowering may share one node
+  // between several positions, so each visit consumes one permission).
+  const permitted = new Map<IrExpr, number>();
+  const permit = (e: IrExpr): void => {
+    if (e.kind === "varRef" && candidates.has(e.localId))
+      permitted.set(e, (permitted.get(e) ?? 0) + 1);
+  };
+  eachNodeOfKinds(fn, nodes?.scan(PRIVATE_ARRAY_KINDS), (node) => {
+    switch (node.kind) {
+      case "varRef": {
+        const left = permitted.get(node) ?? 0;
+        if (left === 0) rejected.add(node.localId);
+        else permitted.set(node, left - 1);
+        break;
+      }
+      case "assignExpr":
+      case "incDec":
+        rejected.add(node.localId);
+        break;
+      case "closure":
+      case "classRef":
+        for (const id of node.captures ?? []) rejected.add(id);
+        break;
+      case "arrIntrinsic":
+        if (PRIVATE_ARRAY_METHODS.has(node.method)) permit(node.receiver);
+        break;
+      case "arrayHas":
+        permit(node.arr);
+        break;
+      case "varDecl":
+        declarations.set(node.localId, (declarations.get(node.localId) ?? 0) + 1);
+        if (
+          node.init === null ||
+          (node.init.kind !== "arrayLit" && node.init.kind !== "arrayNewLen")
+        )
+          rejected.add(node.localId);
+        break;
+      case "assign":
+        rejected.add(node.localId);
+        break;
+      case "arraySet":
+      case "arraySetUndefined":
+      case "arrayDelete":
+      case "arraySetLength":
+        permit(node.arr);
+        break;
+      case "return":
+        if (node.value !== null) permit(node.value);
+        break;
+    }
+  });
+  const out = new Set<string>();
+  for (const id of candidates) if (!rejected.has(id) && declarations.get(id) === 1) out.add(id);
+  return out;
+}
+
 /** Locals living in boxes: declared boxed or captured from an enclosing
  * function. */
 function boxedLocals(fn: IrFunction): Set<string> {
@@ -942,30 +1107,30 @@ class CallTargets {
   constructor(
     private readonly functions: ReadonlyMap<string, IrFunction>,
     virtualTargets: VirtualTargets,
+    private readonly nodes: IrNodeIndex | undefined,
   ) {
     const site = (callee: string, caller: IrFunction, args: readonly IrExpr[]): void => {
       let list = this.sites.get(callee);
       if (!list) this.sites.set(callee, (list = []));
       list.push({ caller, args });
     };
+    const scan = nodes?.scan(CALL_SITE_KINDS);
     for (const fn of functions.values()) {
       if (fn.captures !== undefined || fn.classCaptures !== undefined) this.opaque.add(fn.name);
-      const expr = (e: IrExpr): boolean => {
-        if (e.kind === "call") site(e.callee, fn, e.args);
-        else if (e.kind === "new") site(`%${e.className}.constructor`, fn, [e, ...e.args]);
-        else if (e.kind === "virtualCall") {
-          const targets = virtualTargets.targets(e.className, e.method);
-          for (const t of targets ?? []) site(t, fn, e.args);
-        } else if (e.kind === "closure") {
-          this.opaque.add(e.fnName);
-          let list = this.creators.get(e.fnName);
-          if (!list) this.creators.set(e.fnName, (list = []));
+      eachNodeOfKinds(fn, scan, (node) => {
+        if (node.kind === "call") site(node.callee, fn, node.args);
+        else if (node.kind === "new")
+          site(`%${node.className}.constructor`, fn, [node, ...node.args]);
+        else if (node.kind === "virtualCall") {
+          const targets = virtualTargets.targets(node.className, node.method);
+          for (const t of targets ?? []) site(t, fn, node.args);
+        } else if (node.kind === "closure") {
+          this.opaque.add(node.fnName);
+          let list = this.creators.get(node.fnName);
+          if (!list) this.creators.set(node.fnName, (list = []));
           list.push(fn);
         }
-        return everyExprChild(e, expr, stmt);
-      };
-      const stmt = (st: IrStmt): boolean => everyStmtChild(st, expr, stmt);
-      fn.body.every(stmt);
+      });
     }
     // Fixpoint over function-typed parameter positions.
     const positions: [IrFunction, number][] = [];
@@ -1086,18 +1251,13 @@ class CallTargets {
       defs = new Map();
       const boxed = new Set(fn.locals.filter((l) => l.boxed).map((l) => l.id));
       const counts = new Map<string, number>();
-      const expr = (e: IrExpr): boolean => {
-        if (e.kind === "assignExpr" || e.kind === "incDec") counts.set(e.localId, 2);
-        return everyExprChild(e, expr, stmt);
-      };
-      const stmt = (st: IrStmt): boolean => {
-        if (st.kind === "varDecl") {
-          counts.set(st.localId, (counts.get(st.localId) ?? 0) + 1);
-          defs!.set(st.localId, st.init);
-        } else if (st.kind === "assign") counts.set(st.localId, 2);
-        return everyStmtChild(st, expr, stmt);
-      };
-      fn.body.every(stmt);
+      eachNodeOfKinds(fn, this.nodes?.scan(DEFINITION_KINDS), (node) => {
+        if (node.kind === "assignExpr" || node.kind === "incDec") counts.set(node.localId, 2);
+        else if (node.kind === "varDecl") {
+          counts.set(node.localId, (counts.get(node.localId) ?? 0) + 1);
+          defs!.set(node.localId, node.init);
+        } else if (node.kind === "assign") counts.set(node.localId, 2);
+      });
       for (const [local, n] of counts) if (n !== 1 || boxed.has(local)) defs.set(local, null);
       this.definitions.set(fn, defs);
     }

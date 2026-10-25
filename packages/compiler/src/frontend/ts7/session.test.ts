@@ -11,9 +11,11 @@ import {
   type Ts7FileSystem,
 } from "./rpc-filesystem.js";
 import { spawnTs7Wire } from "./rpc-process.js";
-import { ts7Executable } from "./rpc-api.js";
+import { tsgoExecutable } from "./rpc-api.js";
 import { Ts7Session, Ts7SessionProject, Ts7SessionSnapshot } from "./session.js";
 import { AstNode } from "./ast-node.js";
+import { ts7Diagnostic } from "./diagnostic.js";
+import { getTextOfNode } from "./node-functions.js";
 
 const tempRoot = process.platform === "win32" ? tmpdir() : "/tmp";
 const protocolPath = (path: string) => path.replaceAll("\\", "/");
@@ -25,9 +27,10 @@ const fallback: Ts7FileSystem = {
   getAccessibleEntries: () => undefined,
 };
 
+// These tests compare the session with the pinned SDK, which runs tsgo, so the session runs tsgo too.
 function transport(cwd: string, fs: Ts7FileSystem = fallback, timing = false) {
   const rpc = new Ts7RpcClient(
-    spawnTs7Wire(ts7Executable(), [
+    spawnTs7Wire(tsgoExecutable(), [
       "--api",
       "--cwd",
       cwd,
@@ -103,8 +106,11 @@ test("owned snapshots preserve SDK options, diagnostics, metadata and default-pr
       "getSuggestionDiagnostics",
       "getDeclarationDiagnostics",
     ] as const) {
-      expect(project.program[name](file), name).toEqual(expected.program[name](file));
-      expect(project.program[name](), name).toEqual(expected.program[name]());
+      // scriptc's diagnostics have every member set (ts7Diagnostic); the SDK's leave absent ones out.
+      expect(project.program[name](file), name).toEqual(
+        expected.program[name](file).map(ts7Diagnostic),
+      );
+      expect(project.program[name](), name).toEqual(expected.program[name]().map(ts7Diagnostic));
     }
     for (const name of [
       "getProgramDiagnostics",
@@ -288,7 +294,7 @@ test("a released latest snapshot cannot lend stale ASTs to the same project", ()
     source = "export const third = true;";
     const third = session.updateSnapshot({ fileChanges: { created: [file] } });
     expect(third.getProject(config)!.program.getSourceFile(file)!.text).toBe(source);
-    expect(old.statements[0]!.getText()).toBe("export const value = 1;");
+    expect(getTextOfNode(old.statements.nodes[0]!)).toBe("export const value = 1;");
   } finally {
     session.close();
     rmSync(dir, { recursive: true, force: true });

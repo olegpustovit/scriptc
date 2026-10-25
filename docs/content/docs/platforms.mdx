@@ -69,9 +69,12 @@ Executables open a console window by default. For an application that shows its 
 
 ### WebAssembly (WASI)
 
+WASI is a cross-compile target, so it needs [zig](https://ziglang.org) and the `@scriptc/runtime-wasm32-wasi` runtime pack, as described in [Cross-compile](#cross-compilation-via-zig). Install the runtime pack in your project at the same version as `scriptc --version`. Without it, the build fails with `SC3003`.
+
 Set `SCRIPTC_TARGET=wasm32-wasi` to build a standalone `.wasm` module:
 
 ```console
+$ npm install --save-dev @scriptc/runtime-wasm32-wasi@0.3.5
 $ SCRIPTC_TARGET=wasm32-wasi scriptc build hello.ts >/dev/null
 $ SCRIPTC_TARGET=wasm32-wasi scriptc run hello.ts
 hello, world

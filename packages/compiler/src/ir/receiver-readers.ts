@@ -1,6 +1,6 @@
 import { isBorrowSafeMath } from "./analysis.js";
 import type { IrExpr, IrFunction, IrLibFn, IrStmt } from "./ir.js";
-import { everyStmtList } from "./traverse.js";
+import { eachNodeOfKinds, type IrNodeIndex } from "./node-index.js";
 
 /** Expression kinds that run no user code of their own and never consult
  * the ambient receiver stack. Calls are admitted here and resolved through
@@ -85,6 +85,25 @@ const RECEIVER_FREE_STMTS = new Set<IrStmt["kind"]>([
   "runtimeFence",
 ]);
 
+/** The kinds whose nodes the readers walk answers true for without looking
+ * at them: every receiver-free statement, and the receiver-free expressions
+ * other than calls, library calls, string conversions and data intrinsics. */
+const TRIVIALLY_RECEIVER_FREE = new Set<string>([
+  ...RECEIVER_FREE_STMTS,
+  ...[...RECEIVER_FREE_EXPRS].filter(
+    (kind) =>
+      kind !== "call" &&
+      kind !== "new" &&
+      kind !== "virtualCall" &&
+      kind !== "libCall" &&
+      kind !== "toString" &&
+      kind !== "arrIntrinsic" &&
+      kind !== "strIntrinsic" &&
+      kind !== "mapIntrinsic" &&
+      kind !== "setIntrinsic",
+  ),
+]);
+
 /** Runtime library calls beyond scalar Math that only compute or build and
  * park a native error: the f64[] folds behind Math.max/min(...xs),
  * `new Error(message)` (scr_error_new), and the checked-read TypeError
@@ -133,7 +152,11 @@ function opaqueOperand(e: IrExpr): boolean {
 export class AmbientReceiverReaders {
   private readers: Set<string> | null = null;
 
-  constructor(private readonly functions: ReadonlyMap<string, IrFunction>) {}
+  constructor(
+    private readonly functions: ReadonlyMap<string, IrFunction>,
+    /** The module's node index, read instead of walking the bodies it holds. */
+    private readonly nodes?: IrNodeIndex,
+  ) {}
 
   ignores(fn: IrFunction): boolean {
     if (fn.async || fn.generator) return false;
@@ -153,6 +176,7 @@ export class AmbientReceiverReaders {
     }
     const readers = new Set<string>();
     const callers = new Map<string, string[]>();
+    const scan = this.nodes?.scanExcept(TRIVIALLY_RECEIVER_FREE);
     for (const fn of this.functions.values()) {
       const callees = new Set<string>();
       let reads = fn.async === true || fn.generator !== undefined;
@@ -161,32 +185,36 @@ export class AmbientReceiverReaders {
         callees.add(name);
         return true;
       };
+      const expr = (expr: IrExpr): boolean => {
+        if (!RECEIVER_FREE_EXPRS.has(expr.kind)) return false;
+        switch (expr.kind) {
+          case "call":
+            return edge(expr.callee);
+          case "new":
+            return edge(`%${expr.className}.constructor`);
+          case "virtualCall": {
+            // Any class's override may run: admit only when every
+            // same-named method is itself receiver-free.
+            const targets = byMethod.get(expr.method) ?? [];
+            return targets.length > 0 && targets.every(edge);
+          }
+          case "libCall":
+            return isBorrowSafeMath(expr.fn) || RECEIVER_FREE_LIB_FNS.has(expr.fn);
+          case "toString":
+            return !opaqueOperand(expr.operand);
+          default: {
+            const operands = dataIntrinsicOperands(expr);
+            return operands === null || !operands.some(opaqueOperand);
+          }
+        }
+      };
       if (!reads)
-        reads = !everyStmtList(fn.body, {
-          stmt: (stmt) => RECEIVER_FREE_STMTS.has(stmt.kind),
-          expr: (expr) => {
-            if (!RECEIVER_FREE_EXPRS.has(expr.kind)) return false;
-            switch (expr.kind) {
-              case "call":
-                return edge(expr.callee);
-              case "new":
-                return edge(`%${expr.className}.constructor`);
-              case "virtualCall": {
-                // Any class's override may run: admit only when every
-                // same-named method is itself receiver-free.
-                const targets = byMethod.get(expr.method) ?? [];
-                return targets.length > 0 && targets.every(edge);
-              }
-              case "libCall":
-                return isBorrowSafeMath(expr.fn) || RECEIVER_FREE_LIB_FNS.has(expr.fn);
-              case "toString":
-                return !opaqueOperand(expr.operand);
-              default: {
-                const operands = dataIntrinsicOperands(expr);
-                return operands === null || !operands.some(opaqueOperand);
-              }
-            }
-          },
+        eachNodeOfKinds(fn, scan, (node, statement) => {
+          const free = statement
+            ? RECEIVER_FREE_STMTS.has((node as IrStmt).kind)
+            : expr(node as IrExpr);
+          if (!free) reads = true;
+          return free;
         });
       if (reads) readers.add(fn.name);
       for (const callee of callees) {

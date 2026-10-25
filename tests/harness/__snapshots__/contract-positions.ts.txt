@@ -1,53 +1,53 @@
-contract-positions.ts:6:15 - error SC7006: the Int32 contract is not checked in this position (Int32 is checked on parameters, variables, class instance fields and function results)
+contract-positions.ts:7:15 - error SC7006: the Int32 contract is not checked in this position (Int32 and Int32[] are checked on parameters, variables, class instance fields and function results)
 
-  5 | 
-  6 | type NodeId = Int32;
+  6 | 
+  7 | type NodeId = Int32;
     |               ^~~~~
-  7 | 
+  8 | 
 
-  hint: write Int32 directly as the annotation of the declaration; type aliases, interface members and types nested in other types (arrays, unions, type arguments) are not followed
+  hint: write Int32 or Int32[] directly as the annotation of the declaration; type aliases, interface members and types nested in other types (unions, nested arrays, other type arguments) are not followed
 
-contract-positions.ts:9:6 - error SC7006: the Int32 contract is not checked in this position (Int32 is checked on parameters, variables, class instance fields and function results)
+contract-positions.ts:10:6 - error SC7006: the Int32 contract is not checked in this position (Int32 and Int32[] are checked on parameters, variables, class instance fields and function results)
 
-   8 | interface Point {
-   9 |   x: Int32;
+   9 | interface Point {
+  10 |   x: Int32;
      |      ^~~~~
-  10 | }
+  11 | }
 
-  hint: write Int32 directly as the annotation of the declaration; type aliases, interface members and types nested in other types (arrays, unions, type arguments) are not followed
+  hint: write Int32 or Int32[] directly as the annotation of the declaration; type aliases, interface members and types nested in other types (unions, nested arrays, other type arguments) are not followed
 
-contract-positions.ts:12:12 - error SC7006: the Int32 contract is not checked in this position (Int32 is checked on parameters, variables, class instance fields and function results)
+contract-positions.ts:13:12 - error SC7006: the Int32 contract is not checked in this position (Int32 and Int32[] are checked on parameters, variables, class instance fields and function results)
 
-  11 | 
-  12 | const ids: Int32[] = [1, 2];
+  12 | 
+  13 | const ids: Int32[][] = [[1, 2]];
      |            ^~~~~
-  13 | const point: Point = { x: 1 };
+  14 | const point: Point = { x: 1 };
 
-  hint: write Int32 directly as the annotation of the declaration; type aliases, interface members and types nested in other types (arrays, unions, type arguments) are not followed
+  hint: write Int32 or Int32[] directly as the annotation of the declaration; type aliases, interface members and types nested in other types (unions, nested arrays, other type arguments) are not followed
 
-contract-positions.ts:15:32 - error SC7006: the NoThrow contract is not checked in this position (NoThrow wraps a function's written return type)
+contract-positions.ts:16:32 - error SC7006: the NoThrow contract is not checked in this position (NoThrow wraps a function's written return type)
 
-  14 | const id: NodeId = 3;
-  15 | const callback: (x: number) => NoThrow<number> = (x) => x;
+  15 | const id: NodeId = 3;
+  16 | const callback: (x: number) => NoThrow<number> = (x) => x;
      |                                ^~~~~~~~~~~~~~~
-  16 | const table: Map<string, Immutable<number[]>> = new Map();
+  17 | const table: Map<string, Immutable<number[]>> = new Map();
 
   hint: write it as the function's return type annotation: function f(): NoThrow<T>
 
-contract-positions.ts:16:26 - error SC7006: the Immutable contract is not checked in this position (Immutable is checked on parameters, variables, class instance fields and function results)
+contract-positions.ts:17:26 - error SC7006: the Immutable contract is not checked in this position (Immutable is checked on parameters, variables, class instance fields and function results)
 
-  15 | const callback: (x: number) => NoThrow<number> = (x) => x;
-  16 | const table: Map<string, Immutable<number[]>> = new Map();
+  16 | const callback: (x: number) => NoThrow<number> = (x) => x;
+  17 | const table: Map<string, Immutable<number[]>> = new Map();
      |                          ^~~~~~~~~~~~~~~~~~~
-  17 | let last: NoThrow<number> = 0;
+  18 | let last: NoThrow<number> = 0;
 
   hint: write Immutable directly as the annotation of the declaration; type aliases, interface members and types nested in other types (arrays, unions, type arguments) are not followed
 
-contract-positions.ts:17:11 - error SC7006: the NoThrow contract is not checked in this position (NoThrow wraps a function's written return type)
+contract-positions.ts:18:11 - error SC7006: the NoThrow contract is not checked in this position (NoThrow wraps a function's written return type)
 
-  16 | const table: Map<string, Immutable<number[]>> = new Map();
-  17 | let last: NoThrow<number> = 0;
+  17 | const table: Map<string, Immutable<number[]>> = new Map();
+  18 | let last: NoThrow<number> = 0;
      |           ^~~~~~~~~~~~~~~
-  18 | 
+  19 | 
 
   hint: write it as the function's return type annotation: function f(): NoThrow<T>

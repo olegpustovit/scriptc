@@ -14,7 +14,7 @@ const loader: ProgramLoader = () => {
   // Resource-ownership tests inject only the load fields the orchestration
   // reads. Real program loading and native execution have integration tests.
   const load = {
-    entry: { fileName: "/main.ts", text: "", statements: [] },
+    entry: { fileName: "/main.ts", text: "", statements: { pos: 0, end: 0, nodes: [] } },
     moduleOrder: [],
     dispose: vi.fn(),
   } as unknown as ReturnType<ProgramLoader>;
@@ -101,4 +101,27 @@ test("preserves the original failure and continues cleanup when a disposer throw
   expect(() => runFrontend("/main.ts", loader, ["fixture"])).toThrow("probe failed");
   expect(opened).toHaveLength(3);
   for (const load of opened) expect(load.dispose).toHaveBeenCalledTimes(1);
+});
+
+test("reports program type errors instead of refusing the package", () => {
+  // The program fails to typecheck against the package's inferred surface
+  // and against its declarations alike: the errors are the program's.
+  preflight.mockReturnValueOnce([]).mockReturnValue([typeError]);
+  const frontend = runFrontend("/main.ts", loader, ["fixture"]);
+  expect(frontend.npmStatic).toEqual([]);
+  expect(frontend.preflight).toEqual([typeError]);
+  frontend.dispose();
+});
+
+test("reports program type errors that name the package's module", () => {
+  const missingExport: ScrDiagnostic = {
+    code: "SC0001",
+    message: `Module '"fixture"' has no exported member 'open'.`,
+    loc: { file: "/main.ts", start: 9, end: 13 },
+  };
+  preflight.mockReturnValueOnce([]).mockReturnValue([missingExport]);
+  const frontend = runFrontend("/main.ts", loader, ["fixture"]);
+  expect(frontend.npmStatic).toEqual([]);
+  expect(frontend.preflight).toEqual([missingExport]);
+  frontend.dispose();
 });

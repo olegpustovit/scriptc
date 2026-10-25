@@ -15,6 +15,9 @@ export function withLibraryRuntimeFlavors(matrix) {
     "scr_zlib.c",
     "scr_copying.c",
     "scr_dyn_invoke.c",
+    "scr_bytes_dyn.c",
+    "scr_js_value.c",
+    "scr_js_object.c",
   ]);
   const libraryUnits = [
     ...matrix.runtime_units.filter(
@@ -27,7 +30,11 @@ export function withLibraryRuntimeFlavors(matrix) {
     },
   ].map((unit) => ({
     ...unit,
-    variants: unit.variants.filter((variant) => !variant.defines.includes("SCR_WORKERS")),
+    // Libraries run neither workers nor the young-in nursery (an
+    // executable-only experiment).
+    variants: unit.variants.filter(
+      (variant) => !variant.defines.includes("SCR_WORKERS") && !variant.defines.includes("SCR_YIN"),
+    ),
   }));
   const flavors = { ...matrix.flavors };
   for (const [flavor, spec] of Object.entries(matrix.flavors)) {

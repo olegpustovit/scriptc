@@ -168,28 +168,32 @@ test("resolves a package helper, emits atomically, and caches by all native inpu
   expect(secondArtifact.dependencies).toEqual(firstArtifact.dependencies);
 });
 
-test("runtime bitcode imports reach the helper and key the native cache", async () => {
+test("profiles reach the helper and key the native cache by their bytes", async () => {
   const pkg = await fakePackage();
   const base = request(pkg.root, pkg.packageJson, join(pkg.root, "plain.o"));
   await emitNativeArtifact(base);
-  const imported = {
-    ...request(pkg.root, pkg.packageJson, join(pkg.root, "imported.o")),
-    importBitcode: {
-      paths: ["/pack/a.bc", "/pack/b.bc"],
-      digests: ["a".repeat(64), "b".repeat(64)],
-    },
-  };
-  await emitNativeArtifact(imported);
   await emitNativeArtifact({
-    ...imported,
-    outputPath: join(pkg.root, "changed.o"),
-    importBitcode: { ...imported.importBitcode, digests: ["a".repeat(64), "c".repeat(64)] },
+    ...base,
+    outputPath: join(pkg.root, "instrumented.o"),
+    profile: { generate: "/profiles/%p.profraw" },
   });
-  await emitNativeArtifact({ ...imported, outputPath: join(pkg.root, "again.o") });
+  const used = {
+    ...base,
+    outputPath: join(pkg.root, "used.o"),
+    profile: { use: { path: "/profiles/a.profdata", digest: "a".repeat(64) } },
+  };
+  await emitNativeArtifact(used);
+  await emitNativeArtifact({
+    ...used,
+    outputPath: join(pkg.root, "changed.o"),
+    profile: { use: { path: "/profiles/a.profdata", digest: "b".repeat(64) } },
+  });
+  await emitNativeArtifact({ ...used, outputPath: join(pkg.root, "again.o") });
   const calls = (await readFile(pkg.log, "utf8")).trim().split("\n");
-  expect(calls).toHaveLength(3);
-  expect(calls[0]).not.toContain("--import-bitcode");
-  expect(calls[1]).toContain("--import-bitcode /pack/a.bc --import-bitcode /pack/b.bc");
+  expect(calls).toHaveLength(4);
+  expect(calls[0]).not.toContain("--profile-");
+  expect(calls[1]).toContain("--profile-generate /profiles/%p.profraw");
+  expect(calls[2]).toContain("--profile-use /profiles/a.profdata");
 });
 
 test("chunked LLVM input preserves emitted bytes and the native cache identity", async () => {
@@ -348,11 +352,13 @@ test("sanitized native artifacts fail before helper resolution", async () => {
 
 test("program partitions depend only on module size", () => {
   const megabyte = 1024 * 1024;
-  expect(nativeProgramPartitions(4 * megabyte)).toBe(1);
-  expect(nativeProgramPartitions(4 * megabyte + 1)).toBe(2);
+  expect(nativeProgramPartitions(megabyte)).toBe(1);
+  expect(nativeProgramPartitions(megabyte + 1)).toBe(4);
+  expect(nativeProgramPartitions(2 * megabyte)).toBe(4);
+  expect(nativeProgramPartitions(2 * megabyte + 1)).toBe(8);
+  expect(nativeProgramPartitions(32 * megabyte)).toBe(8);
   // Powers of two keep every function in its partition across small edits.
-  expect(nativeProgramPartitions(13 * megabyte)).toBe(4);
-  expect(nativeProgramPartitions(16 * megabyte)).toBe(4);
+  expect(nativeProgramPartitions(32 * megabyte + 1)).toBe(16);
   expect(nativeProgramPartitions(100 * megabyte)).toBe(32);
   expect(nativeProgramPartitions(1024 * megabyte)).toBe(64);
   expect(nativePartitionPaths("/build.d/program.o", 3)).toEqual([

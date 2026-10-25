@@ -28,6 +28,7 @@ const within = (path) => {
 };
 for (const name of [
   "ts7",
+  "tsc_ts",
   "llvm_package",
   "runtime_pack",
   "runtime_sources",
@@ -93,5 +94,15 @@ if (process.argv.includes("--run")) {
   }).trim();
   if (version !== identity.version)
     throw new Error(`native command reported ${version}, expected ${identity.version}`);
+  // tsc-ts, the default checker, runs on the distribution's own platform.
+  const tscTs = resolve(dirname(binary), hostPath(toolchain.tsc_ts));
+  if (windows && !tscTs.endsWith("tsc-ts.exe"))
+    throw new Error(`tsc_ts is not tsc-ts.exe: ${tscTs}`);
+  const tscTsVersion = execFileSync(tscTs, ["--version"], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: "" },
+  }).trim();
+  if (!tscTsVersion.startsWith("Version "))
+    throw new Error(`the distribution's tsc-ts reported ${JSON.stringify(tscTsVersion)}`);
 }
 console.log(`${identity.name}@${identity.version}: native distribution verified`);

@@ -1,9 +1,11 @@
-/* node:readline and node:readline/promises — the non-terminal Interface
+/* node:readline and node:readline/promises — the Interface
  * (lib/internal/readline/interface.js) over process.stdin or a stream
  * input, linked only when the program uses it (the events gating;
  * rl.* libCalls imply events). The stream side (listeners on the input,
  * pause/resume, output writes) lives in scr_stream.c behind ScrRlIo, so
- * stdin-only programs never link the stream unit.
+ * stdin-only programs never link the stream unit. Terminal interfaces
+ * hand their input, prompts and writes to scr_readline_tty.c through
+ * scr_rl_tty_ops; the rest of this file is the non-terminal path.
  *
  * Behavior, matching Node v24.15.0:
  * - Input bytes run through a UTF-8 decoder that holds an incomplete
@@ -29,7 +31,7 @@
  * - On stdin, an interface created after stdin ended is DEAD: a question
  *   still writes its prompt, but nothing ever answers and 'close' never
  *   fires. */
-#include "scr_runtime.h"
+#include "scr_readline_internal.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -51,68 +53,9 @@ static void *scr_rl_grow(void *p, size_t *cap, size_t need, size_t elem) {
   return q;
 }
 
-/* 'history' is stored and never fires: only terminal interfaces record
- * history. */
-enum { RL_EV_LINE, RL_EV_CLOSE, RL_EV_PAUSE, RL_EV_RESUME, RL_EV_ERROR, RL_EV_HISTORY, RL_EV_COUNT };
-
-typedef void (*ScrRlLineFn)(ScrClosure *, ScrStr *); /* owns the +1 line */
-typedef void (*ScrRlErrFn)(ScrClosure *, ScrError *); /* borrows the error */
-
-/* One listener: a user closure (fn: the line or error adapter; NULL for
- * the zero-argument events), or the async iterator's own handler. */
-typedef struct {
-  ScrClosure *cb;
-  void *fn;
-  bool once;
-  bool iter;
-} RlEntry;
-
-typedef struct {
-  RlEntry *v;
-  size_t n, cap;
-} RlList;
-
-typedef struct {
-  ScrStr **q; /* queued lines (owned) */
-  size_t head, len, cap;
-  ScrPromise **waiters; /* pending next() promises (owned) */
-  size_t wn, wcap;
-  ScrError *error; /* an 'error' no next() has seen yet (owned) */
-  bool finished, paused;
-} RlIter;
-
-typedef struct ScrRl {
-  double id;
-  bool closed;
-  bool stdin_in; /* reads process.stdin through the shared consumer */
-  bool dead;     /* stdin only: created after stdin ended */
-  bool paused;
-  const ScrRlIo *io; /* the stream side, for a stream input or output */
-  void *in;  /* the input stream (+1), or NULL */
-  void *out; /* the output stream (+1), or NULL */
-  bool out_stdout;
-  ScrStr *prompt, *old_prompt;
-  ScrClosure *q_cb; /* the pending question's callback (owned) */
-  ScrRlLineFn q_fn;
-  RlList ev[RL_EV_COUNT];
-  /* the line splitter */
-  char *line_buf; /* the unfinished line (kLine_buffer), UTF-8 */
-  size_t line_len, line_cap;
-  unsigned char held[4]; /* the decoder's incomplete trailing sequence */
-  size_t n_held;
-  double saw_return_at, crlf_delay;
-  /* stdin bytes that arrived while paused */
-  char *parked;
-  size_t parked_len, parked_cap;
-  RlIter *iter;
-  ScrDyn *abort_dispose; /* the signal option's listener disposable (+1) */
-  /* The history and editing options. A non-terminal interface keeps
-   * them as given and never records history. */
-  ScrArr *history; /* the history option (+1), or NULL until first read */
-  double history_size, tab_size, escape_timeout;
-  bool remove_dups;
-  struct ScrRl *next;
-} ScrRl;
+/* The Interface, its listeners and the terminal hooks live in
+ * scr_readline_internal.h, shared with scr_readline_tty.c. */
+SCR_TL const ScrRlTtyOps *scr_rl_tty_ops = NULL;
 
 static SCR_TL ScrRl *scr_rls = NULL;
 static SCR_TL double scr_rl_next_id = 1;
@@ -120,7 +63,7 @@ static SCR_TL size_t scr_rl_stdin_open = 0; /* open stdin interfaces */
 static SCR_TL ScrClosure *scr_rl_data_cb = NULL; /* the shared stdin consumer (borrowed) */
 static SCR_TL bool scr_rl_end_registered = false;
 
-static ScrRl *scr_rl_find(double id) {
+ScrRl *scr_rl_find(double id) {
   for (ScrRl *rl = scr_rls; rl; rl = rl->next) {
     if (rl->id == id) return rl;
   }
@@ -158,7 +101,7 @@ static void scr_rl_iter_close(ScrRl *rl);
 /* emit(ev, ...): a snapshot in listener order; once-listeners leave before
  * they run (Node's onceWrapper). `line` is borrowed (each line listener
  * receives its own +1); `err` is borrowed. */
-static void scr_rl_emit(ScrRl *rl, int ev, ScrStr *line, ScrError *err) {
+void scr_rl_emit(ScrRl *rl, int ev, ScrStr *line, ScrError *err) {
   RlList *l = &rl->ev[ev];
   size_t n = l->n;
   if (n == 0) return;
@@ -188,6 +131,8 @@ static void scr_rl_emit(ScrRl *rl, int ev, ScrStr *line, ScrError *err) {
         ((ScrRlLineFn)e.fn)(e.cb, scr_str_retain(line));
       } else if (ev == RL_EV_ERROR) {
         ((ScrRlErrFn)e.fn)(e.cb, err);
+      } else if (ev == RL_EV_HISTORY && e.fn) {
+        ((ScrRlHistoryFn)e.fn)(e.cb, scr_rl_history_of(rl));
       } else {
         ((void (*)(ScrClosure *))e.cb->fn)(e.cb);
       }
@@ -197,9 +142,17 @@ static void scr_rl_emit(ScrRl *rl, int ev, ScrStr *line, ScrError *err) {
   free(snap);
 }
 
+ScrArr *scr_rl_history_of(ScrRl *rl) {
+  if (!rl->history) rl->history = scr_arr_new(SCR_ELEM_STR, 0);
+  return rl->history;
+}
+
+/* emit('history', this.history): the listeners get the array itself */
+void scr_rl_emit_history(ScrRl *rl) { scr_rl_emit(rl, RL_EV_HISTORY, NULL, NULL); }
+
 /* ── output, pause/resume ──────────────────────────────────────────── */
 
-static void scr_rl_write_out(ScrRl *rl, ScrStr *text) {
+void scr_rl_write_out(ScrRl *rl, ScrStr *text) {
   if (rl->out) rl->io->write(rl->out, text);
   else if (rl->out_stdout) scr_stdio_write_str(1, text);
 }
@@ -208,17 +161,18 @@ static void scr_rl_feed_bytes(ScrRl *rl, const char *p, size_t n);
 
 /* pause()/resume() without the closed check (Node's methods throw on a
  * closed interface; close() itself pauses first). */
-static void scr_rl_do_pause(ScrRl *rl) {
+void scr_rl_do_pause(ScrRl *rl) {
   if (rl->paused) return;
   if (rl->in) rl->io->pause(rl->in);
   rl->paused = true;
   scr_rl_emit(rl, RL_EV_PAUSE, NULL, NULL);
 }
 
-static void scr_rl_do_resume(ScrRl *rl) {
+void scr_rl_do_resume(ScrRl *rl) {
   if (!rl->paused) return;
   if (rl->in) rl->io->resume(rl->in);
   rl->paused = false;
+  if (rl->tty) scr_rl_tty_ops->resumed(rl);
   scr_rl_emit(rl, RL_EV_RESUME, NULL, NULL);
   /* stdin bytes that arrived while paused (the pipe holds them in Node) */
   if (rl->stdin_in && rl->parked_len > 0 && !rl->closed) {
@@ -231,10 +185,28 @@ static void scr_rl_do_resume(ScrRl *rl) {
   }
 }
 
+bool scr_rl_prompt_writable(ScrRl *rl) {
+  if (!rl->prompt_value) return true;
+  scr_dyn_arg_type_fail("stringToWrite", "of type string", rl->prompt_value);
+  return false;
+}
+
 static void scr_rl_prompt_now(ScrRl *rl) {
   if (rl->paused) scr_rl_do_resume(rl);
   if (scr_exc_pending()) return;
-  scr_rl_write_out(rl, rl->prompt);
+  if (rl->tty) scr_rl_tty_ops->prompt(rl, false);
+  else if (scr_rl_prompt_writable(rl)) scr_rl_write_out(rl, rl->prompt);
+}
+
+/* setPrompt(this[kOldPrompt]) when a question is answered or cancelled */
+static void scr_rl_restore_prompt(ScrRl *rl) {
+  if (!rl->old_prompt) return;
+  scr_str_release(rl->prompt);
+  rl->prompt = rl->old_prompt;
+  rl->old_prompt = NULL;
+  if (rl->prompt_value) scr_dyn_release(rl->prompt_value);
+  rl->prompt_value = rl->old_prompt_value;
+  rl->old_prompt_value = NULL;
 }
 
 /* ── close ─────────────────────────────────────────────────────────── */
@@ -250,10 +222,11 @@ static void scr_rl_detach_stdin(ScrRl *rl) {
   }
 }
 
-static void scr_rl_settle_close(ScrRl *rl) {
+void scr_rl_settle_close(ScrRl *rl) {
   if (rl->closed) return;
   scr_rl_do_pause(rl);
   if (scr_exc_pending()) return;
+  if (rl->tty) scr_rl_tty_ops->closing(rl); /* kSetRawMode(false) */
   rl->closed = true;
   /* onSelfCloseWithoutTerminal: the input listeners go first (they were
    * registered at construction). */
@@ -290,16 +263,12 @@ static void scr_rl_settle_close(ScrRl *rl) {
 /* ── lines ─────────────────────────────────────────────────────────── */
 
 /* kOnLine: a pending question takes the line, else 'line'. Moves line. */
-static void scr_rl_on_line(ScrRl *rl, ScrStr *line) {
+void scr_rl_on_line(ScrRl *rl, ScrStr *line) {
   if (rl->q_cb) {
     ScrClosure *cb = rl->q_cb;
     ScrRlLineFn fn = rl->q_fn;
     rl->q_cb = NULL;
-    if (rl->old_prompt) {
-      scr_str_release(rl->prompt);
-      rl->prompt = rl->old_prompt;
-      rl->old_prompt = NULL;
-    }
+    scr_rl_restore_prompt(rl);
     fn(cb, line);
     scr_closure_release(cb);
     return;
@@ -316,6 +285,10 @@ static void scr_rl_buf_append(ScrRl *rl, const char *p, size_t n) {
 
 /* kNormalWrite over decoded UTF-8 text. */
 static void scr_rl_feed_text(ScrRl *rl, const char *p, size_t n) {
+  if (rl->tty) {
+    scr_rl_tty_ops->feed(rl, p, n);
+    return;
+  }
   if (rl->saw_return_at != 0 && scr_now_ms() - rl->saw_return_at <= rl->crlf_delay) {
     if (n > 0 && p[0] == '\n') {
       p++;
@@ -372,7 +345,7 @@ static void scr_rl_feed_text(ScrRl *rl, const char *p, size_t n) {
 
 /* The length of an incomplete UTF-8 sequence ending the buffer (0 when the
  * buffer ends on a complete sequence or invalid bytes). */
-static size_t scr_rl_incomplete_tail(const unsigned char *p, size_t n) {
+size_t scr_rl_incomplete_tail(const unsigned char *p, size_t n) {
   for (size_t back = 1; back <= 3 && back <= n; back++) {
     unsigned char c = p[n - back];
     if ((c & 0xC0) == 0x80) continue; /* a continuation byte */
@@ -411,6 +384,10 @@ static void scr_rl_feed_bytes(ScrRl *rl, const char *p, size_t n) {
  * offered to a pending question), then close(). */
 static void scr_rl_feed_end(ScrRl *rl) {
   if (rl->closed) return;
+  if (rl->tty) {
+    scr_rl_tty_ops->end(rl);
+    return;
+  }
   if (rl->line_len > 0) {
     ScrStr *line = scr_str_new(rl->line_buf, rl->line_len);
     rl->line_len = 0;
@@ -630,6 +607,8 @@ static void scr_rl_iter_free(RlIter *it) {
   free(it);
 }
 
+static void scr_rl_ask_release_v(void *p);
+
 /* Exit-time cleanup (the events-unit precedent, before the RC audit):
  * whatever an interface still holds releases here. */
 static void scr_rl_cleanup_atexit(void) {
@@ -647,10 +626,14 @@ static void scr_rl_cleanup_atexit(void) {
     if (rl->iter) scr_rl_iter_free(rl->iter);
     if (rl->abort_dispose) scr_dyn_release(rl->abort_dispose);
     if (rl->history) scr_arr_release(rl->history);
+    if (rl->q_ask) scr_rl_ask_release_v(rl->q_ask);
+    if (rl->tty) scr_rl_tty_ops->free(rl);
     if (rl->in) rl->io->release(rl->in);
     if (rl->out) rl->io->release(rl->out);
     scr_str_release(rl->prompt);
     if (rl->old_prompt) scr_str_release(rl->old_prompt);
+    if (rl->prompt_value) scr_dyn_release(rl->prompt_value);
+    if (rl->old_prompt_value) scr_dyn_release(rl->old_prompt_value);
     free(rl->line_buf);
     free(rl->parked);
     free(rl);
@@ -739,6 +722,7 @@ double scr_rl_open(const ScrRlIo *io, void *in, void *out, bool out_stdout, doub
   /* this.crlfDelay = crlfDelay ? MathMax(kMincrlfDelay, crlfDelay) : kMincrlfDelay */
   rl->crlf_delay = isnan(crlf_delay) || crlf_delay == 0 ? 100 : fmax(100, crlf_delay);
   rl->history_size = 30; /* kHistorySize */
+  rl->history_index = -1;
   rl->tab_size = 8;
   rl->escape_timeout = 500; /* ESCAPE_CODE_TIMEOUT */
   rl->next = scr_rls;
@@ -779,7 +763,58 @@ void scr_rl_question(double id, ScrStr *query, ScrClosure *cb /*moves*/, ScrRlLi
     return;
   }
   rl->old_prompt = rl->prompt;
+  rl->old_prompt_value = rl->prompt_value;
   rl->prompt = scr_str_retain(query);
+  rl->prompt_value = NULL;
+  rl->q_cb = cb;
+  rl->q_fn = fn;
+  scr_rl_prompt_now(rl);
+}
+
+/* A prompt that is not a string: String(value) for a primitive, which is
+ * what the terminal's line refresh and getCursorPos concatenate. An
+ * object's valueOf/toString would run on every refresh, and a symbol
+ * throws there, so a terminal interface refuses them (false, the refusal
+ * pending); another interface only writes the prompt, which throws for
+ * any value that is not a string, so it keeps ''. +1. */
+static bool scr_rl_prompt_text(ScrRl *rl, ScrDyn *value, ScrStr **out) {
+  if (scr_rl_primitive_prompt(value)) {
+    *out = scr_dyn_string_coerce(value);
+    return true;
+  }
+  if (!rl->tty) {
+    *out = scr_str_new("", 0);
+    return true;
+  }
+  static const char m[] =
+      "a terminal readline prompt that is an object or a symbol has no lowering";
+  scr_throw_error_msg_code(SCR_ERR_ERROR, m, sizeof m - 1, "SC2020");
+  return false;
+}
+
+/* question(query, cb) with a checked-dynamic query: a string goes through
+ * scr_rl_question. Another value becomes the prompt, the callback is
+ * kept, and the prompt write throws ERR_INVALID_ARG_TYPE on an interface
+ * that is not a terminal (the question stays pending, as in Node). */
+void scr_rl_question_dyn(double id, ScrDyn *query, ScrClosure *cb /*moves*/, ScrRlLineFn fn) {
+  if (query->kind == SCR_DYN_STR) {
+    scr_rl_question(id, query->v.str, cb, fn);
+    return;
+  }
+  ScrRl *rl = scr_rl_find(id);
+  if (!rl || rl->closed || rl->q_cb) {
+    scr_rl_question(id, NULL, cb, fn); /* the closed throw, or the re-prompt */
+    return;
+  }
+  ScrStr *text;
+  if (!scr_rl_prompt_text(rl, query, &text)) {
+    scr_closure_release(cb);
+    return;
+  }
+  rl->old_prompt = rl->prompt;
+  rl->old_prompt_value = rl->prompt_value;
+  rl->prompt = text;
+  rl->prompt_value = scr_dyn_retain(query);
   rl->q_cb = cb;
   rl->q_fn = fn;
   scr_rl_prompt_now(rl);
@@ -861,6 +896,23 @@ static void scr_rl_ask_reject(RlAsk *a, ScrError *e /*moves*/) {
   scr_promise_reject_pending(a->p);
 }
 
+/* kQuestionReject(new AbortError(message)): the terminal's Ctrl+C and
+ * Ctrl+D on the last promise question. */
+void scr_rl_reject_question(ScrRl *rl, const char *message) {
+  RlAsk *a = rl->q_ask;
+  if (!a || a->settled) return;
+  ScrStr *m = scr_str_new(message, strlen(message));
+  ScrError *e = scr_error_new(SCR_ERR_ERROR, m);
+  scr_str_release(m);
+  /* new AbortError(message): code, then name, as own properties */
+  scr_str_release(e->name);
+  e->name = scr_str_new("AbortError", 10);
+  scr_error_set_code(e, "ABORT_ERR");
+  e->name_present = true;
+  e->name_enumerable = true;
+  scr_rl_ask_reject(a, e);
+}
+
 /* onAbort: kQuestionCancel (drops whichever question is pending, writing
  * clearLine's "\r\n"), then the rejection. */
 static ScrDyn *scr_rl_ask_abort_thunk(ScrClosure *clo, ScrDyn *const *args, size_t argc) {
@@ -871,14 +923,14 @@ static ScrDyn *scr_rl_ask_abort_thunk(ScrClosure *clo, ScrDyn *const *args, size
   if (rl && rl->q_cb) {
     scr_closure_release(rl->q_cb);
     rl->q_cb = NULL;
-    if (rl->old_prompt) {
-      scr_str_release(rl->prompt);
-      rl->prompt = rl->old_prompt;
-      rl->old_prompt = NULL;
+    scr_rl_restore_prompt(rl);
+    if (rl->tty) {
+      scr_rl_tty_ops->clear_line(rl);
+    } else {
+      ScrStr *crlf = scr_str_new("\r\n", 2);
+      scr_rl_write_out(rl, crlf);
+      scr_str_release(crlf);
     }
-    ScrStr *crlf = scr_str_new("\r\n", 2);
-    scr_rl_write_out(rl, crlf);
-    scr_str_release(crlf);
   }
   if (!a->settled) scr_rl_ask_reject(a, scr_rl_abort_error(a->signal));
   scr_rl_ask_release_v(a);
@@ -887,8 +939,11 @@ static ScrDyn *scr_rl_ask_abort_thunk(ScrClosure *clo, ScrDyn *const *args, size
 
 /* readline/promises question(query, { signal }): rejects with
  * ERR_USE_AFTER_CLOSE on a closed interface and with an AbortError when
- * the signal is (or becomes) aborted. */
-ScrPromise *scr_rl_question_promise(double id, ScrStr *query, ScrDyn *signal, ScrAbortAddFn add) {
+ * the signal is (or becomes) aborted. A checked-dynamic query (query_dyn,
+ * query NULL) that is not a string rejects with what question() throws,
+ * as Node's promise executor does. */
+static ScrPromise *scr_rl_ask(double id, ScrStr *query, ScrDyn *query_dyn, ScrDyn *signal,
+                              ScrAbortAddFn add) {
   RlAsk *a = calloc(1, sizeof *a);
   if (!a) scr_rl_oom();
   a->rc = 1;
@@ -930,13 +985,35 @@ ScrPromise *scr_rl_question_promise(double id, ScrStr *query, ScrDyn *signal, Sc
     scr_rl_ask_release_v(a);
     return result;
   }
+  /* this[kQuestionReject] = reject */
+  if (rl->q_ask) scr_rl_ask_release_v(rl->q_ask);
+  rl->q_ask = scr_rl_ask_retain_v(a);
   ScrClosure *cb = scr_closure_new((void *)&scr_rl_ask_answer, 2);
   cb->caps[0] = scr_box_new_obj(&scr_rl_ask_retain_v, &scr_rl_ask_release_v, NULL);
   scr_box_set_ref(cb->caps[0], a); /* the creation reference moves here */
   cb->caps[1] = scr_box_new_obj(&scr_rl_dyn_retain_v, &scr_rl_dyn_release_v, NULL);
   scr_box_set_ref(cb->caps[1], dispose); /* moves (NULL without a signal) */
-  scr_rl_question(id, query, cb, &scr_rl_ask_answer);
+  if (!query_dyn) {
+    scr_rl_question(id, query, cb, &scr_rl_ask_answer);
+    return result;
+  }
+  scr_rl_ask_retain_v(a);
+  scr_rl_question_dyn(id, query_dyn, cb, &scr_rl_ask_answer);
+  if (scr_exc_pending() && !a->settled) {
+    a->settled = true;
+    scr_promise_reject_pending(a->p);
+  }
+  scr_rl_ask_release_v(a);
   return result;
+}
+
+ScrPromise *scr_rl_question_promise(double id, ScrStr *query, ScrDyn *signal, ScrAbortAddFn add) {
+  return scr_rl_ask(id, query, NULL, signal, add);
+}
+
+ScrPromise *scr_rl_question_promise_dyn(double id, ScrDyn *query, ScrDyn *signal,
+                                        ScrAbortAddFn add) {
+  return scr_rl_ask(id, NULL, query, signal, add);
 }
 
 void scr_rl_close(double id) {
@@ -971,16 +1048,107 @@ void scr_rl_prompt(double id) {
   scr_rl_prompt_now(rl);
 }
 
+/* prompt(preserveCursor): a terminal interface keeps its cursor */
+void scr_rl_prompt_with(double id, bool preserve) {
+  ScrRl *rl = scr_rl_find(id);
+  if (!rl || rl->closed) {
+    scr_rl_throw_closed();
+    return;
+  }
+  if (!rl->tty || !preserve) {
+    scr_rl_prompt_now(rl);
+    return;
+  }
+  if (rl->paused) scr_rl_do_resume(rl);
+  if (scr_exc_pending()) return;
+  scr_rl_tty_ops->prompt(rl, true);
+}
+
 void scr_rl_set_prompt(double id, ScrStr *prompt) {
   ScrRl *rl = scr_rl_find(id);
   if (!rl) return;
   scr_str_release(rl->prompt);
   rl->prompt = scr_str_retain(prompt);
+  if (rl->prompt_value) scr_dyn_release(rl->prompt_value);
+  rl->prompt_value = NULL;
+}
+
+/* setPrompt(value) with a checked-dynamic value; borrows. */
+void scr_rl_set_prompt_dyn(double id, ScrDyn *prompt) {
+  if (prompt->kind == SCR_DYN_STR) {
+    scr_rl_set_prompt(id, prompt->v.str);
+    return;
+  }
+  ScrRl *rl = scr_rl_find(id);
+  if (!rl) return;
+  ScrStr *text;
+  if (!scr_rl_prompt_text(rl, prompt, &text)) return;
+  scr_str_release(rl->prompt);
+  rl->prompt = text;
+  if (rl->prompt_value) scr_dyn_release(rl->prompt_value);
+  rl->prompt_value = scr_dyn_retain(prompt);
 }
 
 ScrStr *scr_rl_get_prompt(double id) {
   ScrRl *rl = scr_rl_find(id);
+  if (rl && rl->prompt_value) {
+    static const char m[] = "rl.getPrompt() of a prompt that is not a string has no lowering";
+    scr_throw_error_msg_code(SCR_ERR_ERROR, m, sizeof m - 1, "SC2020");
+    return scr_str_new("", 0);
+  }
   return rl ? scr_str_retain(rl->prompt) : scr_str_new("", 0);
+}
+
+/* Called after a node:readline/promises interface opens: its Interface
+ * class is not node:readline's, which instanceof tells apart. */
+void scr_rl_mark_promises(double id) {
+  ScrRl *rl = scr_rl_find(id);
+  if (rl) rl->promises = true;
+}
+
+bool scr_rl_is_promises(double id) {
+  ScrRl *rl = scr_rl_find(id);
+  return rl && rl->promises;
+}
+
+bool scr_rl_is_terminal(double id) {
+  ScrRl *rl = scr_rl_find(id);
+  return rl && rl->tty;
+}
+
+/* rl.line: '' on a non-terminal interface */
+ScrStr *scr_rl_line(double id) {
+  ScrRl *rl = scr_rl_find(id);
+  if (!rl || !rl->tty) return scr_str_new("", 0);
+  return scr_rl_tty_ops->line(rl);
+}
+
+/* rl.cursor: a non-terminal interface has none (undefined) */
+double scr_rl_cursor(double id) {
+  ScrRl *rl = scr_rl_find(id);
+  if (rl && rl->tty) return scr_rl_tty_ops->cursor(rl);
+  static const char m[] = "rl.cursor of an interface that is not a terminal has no lowering";
+  scr_throw_error_msg_code(SCR_ERR_ERROR, m, sizeof m - 1, "SC2020");
+  return 0;
+}
+
+/* write(data, key): a non-terminal interface writes data alone
+ * (kNormalWrite ignores undefined) */
+void scr_rl_write_key(double id, bool has_data, ScrStr *data, bool has_key, bool has_name,
+                      ScrStr *name, bool ctrl, bool meta, bool shift) {
+  ScrRl *rl = scr_rl_find(id);
+  if (!rl || rl->closed) {
+    scr_rl_throw_closed();
+    return;
+  }
+  if (rl->paused) scr_rl_do_resume(rl);
+  if (scr_exc_pending()) return;
+  if (rl->tty) {
+    scr_rl_tty_ops->write_key(rl, has_data ? data : NULL, has_key, has_name ? name : NULL, ctrl,
+                              meta, shift);
+  } else if (has_data) {
+    scr_rl_feed_text(rl, data->data, data->len);
+  }
 }
 
 /* write(data): the text runs through the line splitter as if it were
@@ -993,7 +1161,8 @@ void scr_rl_write(double id, ScrStr *data) {
   }
   if (rl->paused) scr_rl_do_resume(rl);
   if (scr_exc_pending()) return;
-  scr_rl_feed_text(rl, data->data, data->len);
+  if (rl->tty) scr_rl_tty_ops->write(rl, data); /* kTtyWrite(d) */
+  else scr_rl_feed_text(rl, data->data, data->len);
 }
 
 /* on/once for 'line' (fn: the line adapter), 'close', 'pause', 'resume'
@@ -1077,14 +1246,287 @@ double scr_rl_num_prop(double id, double which) {
   ScrRl *rl = scr_rl_find(id);
   switch ((int)which) {
   case 0: return rl ? rl->history_size : 30;
-  case 1: return -1; /* historyIndex: nothing recalled */
+  case 1: return rl ? rl->history_index : -1;
   case 2: return rl ? rl->crlf_delay : 100;
   case 3: return rl ? rl->tab_size : 8;
   default: return rl ? rl->escape_timeout : 500;
   }
 }
 
+/* ── the cursor helpers (internal/readline/callbacks.js) ───────────── */
+
+/* CSI`${v}` + final: v as JS ToString renders it */
+static void scr_rl_csi_num(ScrJsonBuf *b, double v, char final) {
+  scr_jb_puts(b, "\x1b[");
+  scr_jb_put_number(b, v);
+  scr_jb_putc(b, final);
+}
+
+static SCR_COLD void scr_rl_nan_arg(const char *name) {
+  /* ERR_INVALID_ARG_VALUE(name, NaN) */
+  ScrDyn *nan = scr_dyn_new_num(NAN);
+  scr_dyn_arg_value_fail(name, NULL, nan);
+  scr_dyn_release(nan);
+}
+
+/* The data a helper writes (+1), after its argument checks (may throw):
+ * kind 0 cursorTo(x, y?), 1 moveCursor(dx, dy) ('' when !(dx || dy)),
+ * 2 clearLine(dir), 3 clearScreenDown(), 4 cursorTo(stream, undefined, y)
+ * (always throws). */
+ScrStr *scr_rl_seq(double kind, double a, double b, bool has_b) {
+  ScrJsonBuf out;
+  scr_jb_init(&out);
+  switch ((int)kind) {
+  case 0:
+    if (isnan(a)) {
+      scr_rl_nan_arg("x");
+      break;
+    }
+    if (has_b && isnan(b)) {
+      scr_rl_nan_arg("y");
+      break;
+    }
+    if (!has_b) {
+      scr_rl_csi_num(&out, a + 1, 'G');
+    } else {
+      /* CSI`${y + 1};${x + 1}H` */
+      scr_jb_puts(&out, "\x1b[");
+      scr_jb_put_number(&out, b + 1);
+      scr_jb_putc(&out, ';');
+      scr_jb_put_number(&out, a + 1);
+      scr_jb_putc(&out, 'H');
+    }
+    break;
+  case 1:
+    if (a < 0) scr_rl_csi_num(&out, -a, 'D');
+    else if (a > 0) scr_rl_csi_num(&out, a, 'C');
+    if (b < 0) scr_rl_csi_num(&out, -b, 'A');
+    else if (b > 0) scr_rl_csi_num(&out, b, 'B');
+    break;
+  case 2:
+    scr_jb_puts(&out, a < 0 ? "\x1b[1K" : a > 0 ? "\x1b[0K" : "\x1b[2K");
+    break;
+  case 4: {
+    /* cursorTo(stream, undefined, y) */
+    if (isnan(b)) {
+      scr_rl_nan_arg("y");
+      break;
+    }
+    static const char m[] = "Cannot set cursor row without setting its column";
+    scr_throw_error_msg_code(SCR_ERR_TYPE, m, sizeof m - 1, "ERR_INVALID_CURSOR_POS");
+    break;
+  }
+  default:
+    scr_jb_puts(&out, "\x1b[0J");
+    break;
+  }
+  return scr_jb_finish(&out);
+}
+
+/* moveCursor writes unless !(dx || dy) */
+bool scr_rl_moves(double dx, double dy) { return (dx != 0 && !isnan(dx)) || (dy != 0 && !isnan(dy)); }
+
+/* ── readline/promises Readline (internal/readline/promises.js) ────── */
+
+/* A Readline over process.stdout/stderr (fd) or a writable stream (io).
+ * Actions queue until commit(), or are written on the next tick with
+ * autoCommit. */
+typedef struct ScrRlUi {
+  double id;
+  int fd;     /* 1 or 2; 0 for a stream */
+  void *out;  /* the stream (+1), or NULL */
+  const ScrRlIo *io;
+  bool auto_commit;
+  char *todo; /* the pending actions (#todo joined) */
+  size_t todo_len, todo_cap;
+  struct ScrRlUi *next;
+} ScrRlUi;
+
+static SCR_TL ScrRlUi *scr_rl_uis = NULL;
+static SCR_TL double scr_rl_ui_next_id = 1;
+
+static void scr_rl_ui_cleanup(void) {
+  while (scr_rl_uis) {
+    ScrRlUi *u = scr_rl_uis;
+    scr_rl_uis = u->next;
+    if (u->out) u->io->release(u->out);
+    free(u->todo);
+    free(u);
+  }
+}
+
+double scr_rl_ui_open(const ScrRlIo *io, void *out /*moves*/, double fd, bool auto_commit) {
+  static SCR_TL bool registered = false;
+  if (!registered) {
+    registered = true;
+    scr_atexit(scr_rl_ui_cleanup);
+  }
+  ScrRlUi *u = calloc(1, sizeof *u);
+  if (!u) scr_trap("scriptc: out of memory\n");
+  u->id = scr_rl_ui_next_id++;
+  u->fd = (int)fd;
+  u->out = out;
+  u->io = io;
+  u->auto_commit = auto_commit;
+  u->next = scr_rl_uis;
+  scr_rl_uis = u;
+  return u->id;
+}
+
+double scr_rl_ui_open_fd(double fd, bool auto_commit) {
+  return scr_rl_ui_open(NULL, NULL, fd, auto_commit);
+}
+
+static ScrRlUi *scr_rl_ui_find(double id) {
+  for (ScrRlUi *u = scr_rl_uis; u; u = u->next) {
+    if (u->id == id) return u;
+  }
+  return NULL;
+}
+
+/* stream.write(text, cb): cb (moves, or NULL) runs once the write is done;
+ * process.stdout/stderr complete on the next tick */
+static void scr_rl_ui_write(ScrRlUi *u, ScrStr *text, ScrClosure *cb) {
+  if (u->fd) {
+    scr_stdio_write_str(u->fd, text);
+    if (cb) scr_next_tick(cb);
+  } else {
+    u->io->write_cb(u->out, text, cb);
+  }
+}
+
+static void scr_rl_ui_tick_write(ScrClosure *job) {
+  ScrRlUi *u = scr_rl_ui_find(scr_box_get_f64(job->caps[0]));
+  ScrStr *text = scr_box_get_ref(job->caps[1]);
+  if (u) scr_rl_ui_write(u, text, NULL);
+  scr_str_release(text);
+}
+
+/* autoCommit: process.nextTick(() => stream.write(data)); else
+ * #todo.push(data). Moves data. */
+static void scr_rl_ui_push(ScrRlUi *u, ScrStr *data) {
+  if (u->auto_commit) {
+    ScrClosure *job = scr_closure_new((void *)&scr_rl_ui_tick_write, 2);
+    job->caps[0] = scr_box_new(SCR_BOX_F64);
+    scr_box_set_f64(job->caps[0], u->id);
+    job->caps[1] = scr_box_new(SCR_BOX_STR);
+    scr_box_set_ref(job->caps[1], data);
+    scr_next_tick(job);
+    return;
+  }
+  u->todo = scr_rl_grow(u->todo, &u->todo_cap, u->todo_len + data->len, 1);
+  memcpy(u->todo + u->todo_len, data->data, data->len);
+  u->todo_len += data->len;
+  scr_str_release(data);
+}
+
+/* validateInteger(value, name, min, max) for a number */
+static bool scr_rl_check_int(const char *name, double v, double min, double max) {
+  if (v != trunc(v) || isnan(v)) {
+    scr_rl_out_of_range(name, "an integer", v);
+    return false;
+  }
+  if (v < min || v > max) {
+    char range[96];
+    char lo[40], hi[40];
+    lo[scr_f64_to_str(min, lo)] = '\0';
+    hi[scr_f64_to_str(max, hi)] = '\0';
+    snprintf(range, sizeof range, ">= %s && <= %s", lo, hi);
+    scr_rl_out_of_range(name, range, v);
+    return false;
+  }
+  return true;
+}
+
+#define SCR_RL_SAFE 9007199254740991.0
+
+void scr_rl_ui_cursor_to(double id, double x, bool has_y, double y) {
+  ScrRlUi *u = scr_rl_ui_find(id);
+  if (!scr_rl_check_int("x", x, -SCR_RL_SAFE, SCR_RL_SAFE)) return;
+  if (has_y && !scr_rl_check_int("y", y, -SCR_RL_SAFE, SCR_RL_SAFE)) return;
+  if (u) scr_rl_ui_push(u, scr_rl_seq(0, x, y, has_y));
+}
+
+void scr_rl_ui_move_cursor(double id, double dx, double dy) {
+  ScrRlUi *u = scr_rl_ui_find(id);
+  if (!scr_rl_moves(dx, dy)) return;
+  if (!scr_rl_check_int("dx", dx, -SCR_RL_SAFE, SCR_RL_SAFE)) return;
+  if (!scr_rl_check_int("dy", dy, -SCR_RL_SAFE, SCR_RL_SAFE)) return;
+  if (u) scr_rl_ui_push(u, scr_rl_seq(1, dx, dy, true));
+}
+
+void scr_rl_ui_clear_line(double id, double dir) {
+  ScrRlUi *u = scr_rl_ui_find(id);
+  if (!scr_rl_check_int("dir", dir, -1, 1)) return;
+  if (u) scr_rl_ui_push(u, scr_rl_seq(2, dir, 0, false));
+}
+
+void scr_rl_ui_clear_screen_down(double id) {
+  ScrRlUi *u = scr_rl_ui_find(id);
+  if (u) scr_rl_ui_push(u, scr_rl_seq(3, 0, 0, false));
+}
+
+void scr_rl_ui_rollback(double id) {
+  ScrRlUi *u = scr_rl_ui_find(id);
+  if (u) u->todo_len = 0;
+}
+
+static void scr_rl_ui_resolve(ScrClosure *cb) {
+  ScrPromise *p = scr_box_get_ref(cb->caps[0]);
+  scr_promise_fulfill_void(p);
+  scr_promise_release(p);
+}
+
+/* commit(): writes the pending actions now; the promise resolves when
+ * the write completes (+1) */
+ScrPromise *scr_rl_ui_commit(double id) {
+  ScrPromise *p = scr_promise_new();
+  ScrRlUi *u = scr_rl_ui_find(id);
+  if (!u) {
+    scr_promise_fulfill_void(p);
+    return p;
+  }
+  ScrStr *text = scr_str_new(u->todo ? u->todo : "", u->todo_len);
+  u->todo_len = 0;
+  ScrClosure *cb = scr_closure_new((void *)&scr_rl_ui_resolve, 1);
+  cb->caps[0] = scr_box_new_obj(&scr_promise_retain_v, &scr_promise_release_v, NULL);
+  scr_box_set_ref(cb->caps[0], scr_promise_retain(p));
+  scr_rl_ui_write(u, text, cb);
+  scr_str_release(text);
+  return p;
+}
+
 /* ── the runtime-provided adapters ─────────────────────────────────── */
+
+/* A (history: string[]) listener: the callee owns its argument, and the
+ * interface keeps the array. */
+void scr_rl_history_thunk_arr(ScrClosure *cb, ScrArr *history) {
+  ((void (*)(ScrClosure *, ScrArr *))cb->fn)(cb, scr_arr_retain(history));
+}
+
+/* A checked-dynamic (history) listener: it gets a dyn copy of the
+ * history, and its changes to the copy are written back to the
+ * interface's array when it returns. */
+void scr_rl_history_thunk_dyn(ScrClosure *cb, ScrArr *history) {
+  ScrDyn *copy = scr_dyn_new_arr();
+  double n = scr_arr_len(history);
+  for (double i = 0; i < n; i++) {
+    ScrStr *s = scr_arr_peek_ref(history, i);
+    scr_dyn_arr_push(copy, s ? scr_dyn_new_str(s) : scr_dyn_retain(scr_dyn_undefined()));
+  }
+  ((void (*)(ScrClosure *, ScrDyn *))cb->fn)(cb, scr_dyn_retain(copy));
+  if (!scr_exc_pending()) {
+    double m = scr_dyn_arr_len(copy);
+    scr_arr_set_len(history, 0);
+    for (double i = 0; i < m; i++) {
+      ScrDyn *e = scr_dyn_arr_at(copy, i);
+      ScrStr *s = e->kind == SCR_DYN_STR ? scr_str_retain(e->v.str) : scr_dyn_string_coerce(e);
+      scr_arr_push_ref(history, s);
+      scr_dyn_release(e);
+    }
+  }
+  scr_dyn_release(copy);
+}
 
 /* A zero-param line/answer callback: the text is ignored. */
 void scr_rl_answer_thunk0(ScrClosure *cb, ScrStr *answer) {

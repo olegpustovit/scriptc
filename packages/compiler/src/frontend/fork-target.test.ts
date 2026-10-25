@@ -7,6 +7,7 @@ import { fallbackDtsPath } from "./dts-paths.js";
 import { Ts7Host } from "./ts7/program-host.js";
 import { Ts7Api } from "./ts7/rpc-api.js";
 import { ModuleKind, ModuleResolutionKind } from "./ts7/enums.js";
+import { getTextOfNode } from "./ts7/node-functions.js";
 
 test("fork discovery batches only candidate bindings and preserves aliases and shadowing", () => {
   const directory = mkdtempSync(join(tmpdir(), "scriptc-fork-discovery-"));
@@ -49,7 +50,7 @@ test("fork discovery batches only candidate bindings and preserves aliases and s
       ["first.ts", "second.ts", "third.ts"].map((name) => join(directory, name)),
     );
     expect(batch).toHaveBeenCalledTimes(1);
-    expect(batch.mock.calls[0]![0].map((node) => node.getText())).toEqual([
+    expect(batch.mock.calls[0]![0].map((node) => getTextOfNode(node))).toEqual([
       "start",
       "child",
       "launch",

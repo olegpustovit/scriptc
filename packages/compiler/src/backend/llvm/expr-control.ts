@@ -7,6 +7,8 @@ import { DYN_KIND } from "./dyn.js";
 import { LlvmUnsupportedError } from "./unsupported.js";
 import type { LlvmEmitterContext, ExprOf, LlValue } from "./expr-context.js";
 import { f64Lit } from "./common.js";
+import { NULLABLE_NULL, SHAPE_WORD_INDEX, shapeWordHeader } from "./nullable-unions.js";
+import { emitUnionTag } from "./union-repr.js";
 
 export function emitControlExpr(
   host: LlvmEmitterContext,
@@ -52,13 +54,15 @@ export function emitControlExpr(
     case "toBool":
       return { name: host.truthy(host.emitUnionProjection(e.operand)), type: e.type };
     case "logical": {
+      const tagSet = e.op === "||" ? unionTagSet(e) : null;
+      if (tagSet) return { name: emitUnionTagSet(host, tagSet), type: e.type };
       // JS value semantics: the result is the deciding operand itself.
       // Left evaluates once, ownership moves into the result slot; when
       // the branch takes the right operand the stale left releases first
       // and the right runs in its own frame.
       const ty = host.llType(e.type);
       const l = host.emitExpr(e.left);
-      host.moveTemp(l);
+      host.toFrame(l);
       const slot = B.slot();
       B.entryAllocas.push(`${slot} = alloca ${ty}`);
       B.line(`store ${ty} ${l.name}, ptr ${slot}`);
@@ -73,7 +77,7 @@ export function emitControlExpr(
       if (e.op === "&&") B.condBr(truthy, rightLabel, joinLabel);
       else B.condBr(truthy, joinLabel, rightLabel);
       B.startBlock(rightLabel);
-      if (isRefCounted(e.type)) host.releaseValue(l.name, e.type);
+      if (isRefCounted(e.type)) host.releaseFrame(l.name, e.type);
       const rightInteger = host.emitBranchInto(slot, e.right, integerSlot);
       B.br(joinLabel);
       B.startBlock(joinLabel);
@@ -157,7 +161,7 @@ export function emitControlExpr(
           host.chainSlots.set(e.id, { name: bind, type: e.receiver.type, slot: true });
           host.frames.push([]);
           host.emitExpr(e.body);
-          host.releaseFrame(host.frames.pop()!);
+          host.releaseTemps(host.frames.pop()!);
           host.chainSlots.delete(e.id);
           B.br(lj);
           B.startBlock(lj);
@@ -203,7 +207,7 @@ export function emitControlExpr(
         bindPresent();
         host.frames.push([]);
         host.emitExpr(e.body);
-        host.releaseFrame(host.frames.pop()!);
+        host.releaseTemps(host.frames.pop()!);
         host.chainSlots.delete(e.id);
         B.br(lj);
         B.startBlock(lj);
@@ -272,7 +276,7 @@ export function emitControlExpr(
       const v = B.tmp();
       B.line(`${v} = load ${host.llType(bound.type)}, ptr ${bound.name}`);
       if (!isRefCounted(e.type)) return { name: v, type: e.type };
-      return host.own({ name: host.retainValue(v, e.type), type: e.type });
+      return host.own({ name: host.retainFrame(v, e.type), type: e.type });
     }
     case "orDefault": {
       // `u || d` narrowed to the single non-unit arm: nullish's dance
@@ -309,7 +313,7 @@ export function emitControlExpr(
         return host.own({ name: t, type: e.type });
       }
       const l = host.emitExpr(e.left);
-      host.moveTemp(l);
+      host.toFrame(l);
       const ty = host.llType(e.type);
       const slot = B.slot();
       B.entryAllocas.push(`${slot} = alloca ${ty}`);
@@ -330,18 +334,18 @@ export function emitControlExpr(
         );
         B.line(`store ${ty} ${t}, ptr ${slot}`);
         if (host.mayThrow.has(e.retag)) host.emitPendingCheck();
-      } else if (host.nullableUnions.has(e.left.type.unionId)) {
+      } else if (host.nullableUnions.single(e.left.type.unionId)) {
         // The owned nullable pointer IS the owned arm value.
         B.line(`store ${ty} ${l.name}, ptr ${slot}`);
       } else {
         B.line(
           `store ${ty} ${host.unionExtract(l.name, e.left.type.unionId, e.type)}, ptr ${slot}`,
         );
-        host.releaseValue(l.name, e.left.type);
+        host.releaseFrame(l.name, e.left.type);
       }
       B.br(lj);
       B.startBlock(lf);
-      host.releaseValue(l.name, e.left.type);
+      host.releaseFrame(l.name, e.left.type);
       host.emitBranchInto(slot, e.right);
       B.br(lj);
       B.startBlock(lj);
@@ -359,7 +363,7 @@ export function emitControlExpr(
         // The native checked-value kind decides whether the left is
         // nullish; the right runs lazily in its branch.
         const l = host.emitExpr(e.left);
-        host.moveTemp(l);
+        host.toFrame(l);
         host.declare(`declare zeroext i1 @scr_dyn_is_nullish(ptr)`);
         const slot = B.slot();
         B.entryAllocas.push(`${slot} = alloca ptr`);
@@ -370,7 +374,7 @@ export function emitControlExpr(
         const lj = B.newLabel("nuld.j");
         B.condBr(isN, lu, lv);
         B.startBlock(lu);
-        host.releaseValue(l.name, e.left.type);
+        host.releaseFrame(l.name, e.left.type);
         host.emitBranchInto(slot, e.right);
         B.br(lj);
         B.startBlock(lv);
@@ -426,7 +430,7 @@ export function emitControlExpr(
         return host.own({ name: t, type: e.type });
       }
       const l = host.emitExpr(e.left);
-      host.moveTemp(l);
+      host.toFrame(l);
       const ty = host.llType(e.type);
       const slot = B.slot();
       B.entryAllocas.push(`${slot} = alloca ${ty}`);
@@ -436,16 +440,16 @@ export function emitControlExpr(
       const lj = B.newLabel("nul.j");
       B.condBr(isUnit, lu, lv);
       B.startBlock(lu);
-      host.releaseValue(l.name, e.left.type);
+      host.releaseFrame(l.name, e.left.type);
       host.emitBranchInto(slot, e.right);
       B.br(lj);
       B.startBlock(lv);
-      if (typeEquals(e.type, e.left.type) || host.nullableUnions.has(def.id)) {
+      if (typeEquals(e.type, e.left.type) || host.nullableUnions.single(def.id)) {
         // Pass-through, or a nullable pointer that IS its owned arm value.
         B.line(`store ${ty} ${l.name}, ptr ${slot}`);
       } else {
         B.line(`store ${ty} ${host.unionExtract(l.name, def.id, e.type)}, ptr ${slot}`);
-        host.releaseValue(l.name, e.left.type);
+        host.releaseFrame(l.name, e.left.type);
       }
       B.br(lj);
       B.startBlock(lj);
@@ -510,9 +514,13 @@ export function emitOptionalChainReceiver(
     // pointer itself, through a private stack box when the union's own
     // representation is boxed (emitUnionProjection's form).
     const owner = host.emitReadReceiver(e.receiver.obj);
-    const { ptr } = host.classFieldPtr(owner.name, e.receiver.className, e.receiver.field);
-    const p = B.tmp();
-    B.line(`${p} = load ptr, ptr ${ptr}${host.fieldAliasAttachment(ptr)}`);
+    const { ptr } = host.classFieldPtr(
+      owner.name,
+      e.receiver.className,
+      e.receiver.field,
+      "compressed",
+    );
+    const p = host.loadRef(ptr);
     r = {
       name: host.nullableUnions.get(def.id) ? p : host.stackNullableBox(p, nullableField),
       type: e.receiver.type,
@@ -533,7 +541,7 @@ export function emitOptionalChainReceiver(
   const isUnit = host.tagInSet(r.name, def.id, unitTags);
   const extract = (): string =>
     multiple
-      ? host.retainValue(r.name, narrowed)
+      ? host.retainFrame(r.name, narrowed)
       : borrowBind
         ? host.unionPeek(r.name, def.id)
         : host.unionExtract(r.name, def.id, narrowed);
@@ -609,4 +617,86 @@ function emitNullishOptionalChain(host: LlvmEmitterContext, e: ExprOf<"nullish">
 function literalChoice(e: IrExpr): boolean {
   if (e.kind === "strLit") return true;
   return e.kind === "ternary" && literalChoice(e.then) && literalChoice(e.else_);
+}
+
+type TagSet = { unionId: string; value: IrExpr; tags: Set<number> };
+
+/** An `||` chain of two or more tag tests of one local (`isTag(u, 1) ||
+ * isTag(u, 4) || ...`, the shape of a union conversion's identity test). */
+function unionTagSet(e: IrExpr & { kind: "logical" }): TagSet | null {
+  const leaves: IrExpr[] = [];
+  const collect = (x: IrExpr): void => {
+    if (x.kind === "logical" && x.op === "||") {
+      collect(x.left);
+      collect(x.right);
+    } else leaves.push(x);
+  };
+  collect(e);
+  const first = leaves[0]!;
+  if (first.kind !== "unionIsTag" || first.value.kind !== "varRef") return null;
+  const localId = first.value.localId;
+  const tags = new Set<number>();
+  for (const leaf of leaves) {
+    if (
+      leaf.kind !== "unionIsTag" ||
+      leaf.negated ||
+      leaf.unionId !== first.unionId ||
+      leaf.value.kind !== "varRef" ||
+      leaf.value.localId !== localId
+    )
+      return null;
+    tags.add(leaf.tag);
+  }
+  return { unionId: first.unionId, value: first.value, tags };
+}
+
+/** i1: the union value holds one of the tags. One read of the tag and one
+ * switch over the set; a shape union switches on the record's shape word
+ * after its unit encodings. */
+function emitUnionTagSet(host: LlvmEmitterContext, set: TagSet): string {
+  const B = host.B;
+  const u = host.emitUnionProjection(set.value).name;
+  const nullable = host.nullableUnions.get(set.unionId);
+  const yes = B.newLabel("tags.y");
+  const no = B.newLabel("tags.n");
+  const join = B.newLabel("tags.j");
+  const target = (tag: number): string => (set.tags.has(tag) ? yes : no);
+  if (nullable?.repr === "shapes") {
+    if (nullable.unitTag >= 0) {
+      const isNull = B.tmp();
+      const next = B.newLabel("tags.r");
+      B.line(`${isNull} = icmp eq ptr ${u}, null`);
+      B.condBr(isNull, target(nullable.unitTag), next);
+      B.startBlock(next);
+    }
+    if (nullable.nullTag >= 0) {
+      const isNullArm = B.tmp();
+      const next = B.newLabel("tags.r");
+      B.line(`${isNullArm} = icmp eq ptr ${u}, ${NULLABLE_NULL}`);
+      B.condBr(isNullArm, target(nullable.nullTag), next);
+      B.startBlock(next);
+    }
+    const wp = B.tmp();
+    const w = B.tmp();
+    B.line(
+      `${wp} = getelementptr inbounds ${shapeWordHeader(host.sizeType)}, ptr ${u}, i32 0, i32 ${SHAPE_WORD_INDEX}`,
+    );
+    B.line(`${w} = load i32, ptr ${wp}`);
+    const cases = nullable.arms
+      .filter((arm) => set.tags.has(arm.tag))
+      .map((arm) => `i32 ${host.nullableUnions.shapeNumber(arm.shapeId)}, label %${yes}`);
+    B.terminate(`switch i32 ${w}, label %${no} [ ${cases.join(" ")} ]`);
+  } else {
+    const tag = nullable ? emitUnionTag(B, nullable, u) : host.unionTag(u, set.unionId);
+    const cases = [...set.tags].map((t) => `i32 ${t}, label %${yes}`);
+    B.terminate(`switch i32 ${tag}, label %${no} [ ${cases.join(" ")} ]`);
+  }
+  B.startBlock(yes);
+  B.br(join);
+  B.startBlock(no);
+  B.br(join);
+  B.startBlock(join);
+  const t = B.tmp();
+  B.line(`${t} = phi i1 [ true, %${yes} ], [ false, %${no} ]`);
+  return t;
 }

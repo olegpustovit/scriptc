@@ -354,6 +354,12 @@ ScrStr *scr_error_stack(ScrError *e) {
   return scr_str_retain(e->stack);
 }
 
+void scr_error_set_stack(ScrError *e, ScrStr *stack) {
+  ScrStr *replacement = scr_str_retain(stack);
+  scr_str_release(e->stack);
+  e->stack = replacement;
+}
+
 bool scr_error_is(const void *obj) {
   const ScrVt *vt = ((const ScrError *)obj)->vt;
   return scr_error_vts[SCR_ERR_ERROR].pre <= vt->pre &&
@@ -378,21 +384,51 @@ void scr_error_set_code(ScrError *e, const char *code) {
   e->code = scr_str_new(code, strlen(code));
 }
 
+/* new AbortError(undefined, { cause: reason }) as Node's AbortController
+ * paths build it: message "The operation was aborted", code ABORT_ERR,
+ * then name AbortError as own enumerable properties. `reason` is
+ * borrowed; NULL stands for undefined. +1. */
+ScrError *scr_error_abort(struct ScrDyn *reason) {
+  ScrStr *message = scr_str_new("The operation was aborted", 25);
+  ScrError *e = scr_error_new(SCR_ERR_ERROR, message);
+  scr_str_release(message);
+  scr_str_release(e->name);
+  e->name = scr_str_new("AbortError", 10);
+  scr_error_set_code(e, "ABORT_ERR");
+  e->name_present = true;
+  e->name_enumerable = true;
+  scr_error_define_cause(e, reason ? reason : scr_dyn_undefined());
+  return e;
+}
+
+/* The error object behind an event-error message, while a fire site whose
+ * payload is an Error (not only a message) runs its listeners; the error
+ * listener adapters answer it in place of an Error built from the
+ * message. Borrowed for the duration of the fire. */
+SCR_TL ScrError *scr_event_error_payload = NULL;
+
 /* The code Node attaches to the runtime's event-error messages whose text
  * carries no errno name: connResetException's "socket hang up" and
- * "aborted", the HTTP parser's header overflow, and the TLS verification
- * failures (the openssl reason Node reports as the code). NULL for any
+ * "aborted", the TLS client's disconnect before the handshake completes,
+ * the HTTP parser's header overflow, and the TLS verification failures (the openssl reason Node reports as the code). NULL for any
  * other message. */
 const char *scr_error_message_code(const ScrStr *msg) {
   static const struct { const char *prefix; bool whole; const char *code; } known[] = {
     { "socket hang up", true, "ECONNRESET" },
     { "aborted", true, "ECONNRESET" },
+    { "Client network socket disconnected before secure TLS connection was established", true,
+      "ECONNRESET" },
     { "Parse Error: Header overflow", true, "HPE_HEADER_OVERFLOW" },
     { "certificate has expired", true, "CERT_HAS_EXPIRED" },
     { "self-signed certificate in certificate chain", true, "SELF_SIGNED_CERT_IN_CHAIN" },
     { "self-signed certificate", false, "DEPTH_ZERO_SELF_SIGNED_CERT" },
     { "unable to verify the first certificate", false, "UNABLE_TO_VERIFY_LEAF_SIGNATURE" },
     { "Hostname/IP does not match certificate's altnames", false, "ERR_TLS_CERT_ALTNAME_INVALID" },
+    { "error:0A000460:SSL routines:ssl3_read_bytes:tlsv1 alert no application protocol", true,
+      "ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL" },
+    { "error:0A00042E:SSL routines:ssl3_read_bytes:tlsv1 alert protocol version", true,
+      "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION" },
+    { "error:0A0000BF:SSL routines::no protocols available", true, "ERR_SSL_NO_PROTOCOLS_AVAILABLE" },
   };
   for (size_t i = 0; i < sizeof known / sizeof known[0]; i++) {
     size_t n = strlen(known[i].prefix);

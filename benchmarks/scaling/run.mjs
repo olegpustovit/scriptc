@@ -35,7 +35,8 @@ const SQ = [250, 500, 1000, 2000];
 // [file, case, sizes]
 const CASES = [
   ...[
-    "push", "pop", "shift", "queue", "splice-tail", "slice-small", "concat", "indexOf",
+    "push", "pop", "shift", "queue", "queue-grow", "splice-front", "deque", "splice-tail",
+    "slice-small", "concat", "indexOf",
     "includes-str", "sort-num", "sort-sorted", "sort-str", "sort-obj", "reverse", "in-arr",
     "in-arr-str", "holes", "sparse", "spread", "map-filter-reduce", "array-from", "join",
     "flat", "lastIndexOf", "findIndex", "nested2d", "length-truncate",

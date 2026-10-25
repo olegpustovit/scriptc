@@ -42,6 +42,7 @@ export function relocateToolchain(manifest, sourceDirectory, destinationDirector
   const pathFrom = (value) => relative(destinationDirectory, resolve(sourceDirectory, value));
   for (const name of [
     "ts7",
+    "tsc_ts",
     "llvm_package",
     "runtime_pack",
     "runtime_sources",
@@ -96,6 +97,7 @@ export function installNativeCli(
   if (process.platform !== "win32") {
     for (const path of [
       manifest.ts7,
+      ...(manifest.tsc_ts === undefined ? [] : [manifest.tsc_ts]),
       manifest.comptime,
       join(manifest.llvm_package, "bin/scriptc-llvm-codegen"),
     ]) {

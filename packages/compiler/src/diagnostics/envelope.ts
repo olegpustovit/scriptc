@@ -16,6 +16,8 @@
  * bumps it. */
 import { readFileSync } from "node:fs";
 import type { ScrDiagnostic } from "./diagnostic.js";
+import { isPerformanceCode } from "./dynamic-tier.js";
+import type { WasmModuleReport } from "../wasm/discover.js";
 
 export const DIAGNOSTICS_SCHEMA = "scriptc-diagnostics";
 export const DIAGNOSTICS_SCHEMA_VERSION = 1;
@@ -24,12 +26,14 @@ export const DIAGNOSTICS_SCHEMA_VERSION = 1;
  *  - invalid-source: the program itself is wrong (TypeScript errors, bad JSON modules)
  *  - unsupported: valid TypeScript/JavaScript scriptc cannot compile yet
  *  - divergence: compiles, but the native program behaves differently from Node
+ *  - performance: compiles and behaves as under Node, but runs slower than typed code would
  *  - environment: project configuration, scriptc's type world, toolchain or target
  *  - internal: a compiler bug */
 export type DiagnosticCategory =
   | "invalid-source"
   | "unsupported"
   | "divergence"
+  | "performance"
   | "environment"
   | "internal";
 
@@ -63,6 +67,9 @@ export interface LocatedDiagnostic extends SourcePosition {
   hint: string;
   /** The id of the root-cause group this site belongs to. */
   group: string;
+  /** Deferred scope only: the statement is module top-level code, so it
+   * runs when its module loads. */
+  startup?: true;
 }
 
 export interface DiagnosticGroup {
@@ -81,6 +88,34 @@ export interface DiagnosticGroup {
   sites: SourcePosition[];
 }
 
+export interface TierUnitPosition extends SourcePosition {
+  kind: "binding" | "field" | "function" | "class" | "module";
+  name: string;
+  owner?: string;
+}
+
+/** `scriptc coverage --explain-dynamic --print=diagnostics`: the tier
+ * assignment of frontend/tier-analysis.ts with source positions. */
+export interface TiersEnvelope {
+  mode: "auto" | "static-only";
+  statementsDynamic: number;
+  dynamicFunctions: (SourcePosition & {
+    name: string;
+    operation: string;
+    operationAt: SourcePosition;
+    statements: number;
+  })[];
+  requests: (SourcePosition & {
+    unit: TierUnitPosition;
+    enclosing: TierUnitPosition;
+    seed: string;
+    scope: string;
+    code: string;
+    message: string;
+  })[];
+  units: (TierUnitPosition & { requests: number; sites: number })[];
+}
+
 export interface DiagnosticsEnvelope {
   schema: typeof DIAGNOSTICS_SCHEMA;
   schemaVersion: typeof DIAGNOSTICS_SCHEMA_VERSION;
@@ -97,8 +132,10 @@ export interface DiagnosticsEnvelope {
   stats?: {
     statementsTotal: number;
     statementsStatic: number;
-    /** Always 0: every compiled statement is native. Kept so schema
-     * version 1 consumers keep reading the same fields. */
+    /** The compiled statements (counted in statementsStatic, which covers
+     * every statement that compiles to native code) that belong to
+     * dynamic-tier functions: code operating on values whose types are only
+     * known at runtime. */
     statementsDynamic: number;
     statementsFailed: number;
     functionsSkipped: number;
@@ -106,6 +143,11 @@ export interface DiagnosticsEnvelope {
   };
   /** build only: the produced artifact path. */
   artifact?: string;
+  /** coverage --explain-dynamic only: the report-only tier assignment. */
+  tiers?: TiersEnvelope;
+  /** coverage only: the WebAssembly modules the build can see, with their
+   * size, validity, proposals and the sources that found them. */
+  wasmModules?: WasmModuleReport[];
   groups: DiagnosticGroup[];
   diagnostics: LocatedDiagnostic[];
 }
@@ -113,12 +155,13 @@ export interface DiagnosticsEnvelope {
 /** The divergence band: compiles, but the program can behave differently
  * from Node. Warnings, never build failures. */
 export function isDivergenceCode(code: string): boolean {
-  return /^SC6\d{3}$/.test(code);
+  return /^SC60\d{2}$/.test(code);
 }
 
 export function categoryOf(diag: ScrDiagnostic): DiagnosticCategory {
   const code = diag.code;
   if (isDivergenceCode(code)) return "divergence";
+  if (isPerformanceCode(code)) return "performance";
   if (code === "SC0001") return diag.typeWorld === true ? "environment" : "invalid-source";
   if (code === "SC0003") return "invalid-source";
   if (code === "SC0002" || code === "SC0004") return "environment";
@@ -238,7 +281,7 @@ export function locateDiagnostic(
   return {
     code: diag.code,
     category: categoryOf(diag),
-    severity: isDivergenceCode(diag.code) ? "warning" : "error",
+    severity: isDivergenceCode(diag.code) || isPerformanceCode(diag.code) ? "warning" : "error",
     scope,
     file: diag.loc.file,
     line: start.line,
@@ -250,6 +293,7 @@ export function locateDiagnostic(
     message: diag.message,
     hint: hintOf(diag),
     group: groupId(diag, scope),
+    ...(scope === "deferred" && diag.startup === true ? { startup: true as const } : {}),
   };
 }
 

@@ -15,6 +15,9 @@
  * (port 443 default, `ca` / rejectUnauthorized for local-CA flows —
  * cert/key/ca all arrive as borrowed PEM bytes). */
 ScrNetServer *scr_tls_create_server(const char *cert, size_t cert_len, const char *key, size_t key_len, ScrClosure *handler /*moves, nullable*/, ScrNetConnFn fn); /* +1 */
+/* The SNICallback form: sni_cb (moves, nullable) receives (servername, answer), and
+ * sni_answer_fn is the emitted thunk that hands the answer to scr_tls_sni_answer. */
+ScrNetServer *scr_tls_create_server_sni(const char *cert, size_t cert_len, const char *key, size_t key_len, ScrClosure *handler /*moves, nullable*/, ScrNetConnFn fn, ScrClosure *sni_cb /*moves, nullable*/, void *sni_answer_fn); /* +1 */
 
 /* ── RUNTIME tls/https options records (the divergence-66 stance: a
  * non-literal options value reads its members at runtime; members whose
@@ -59,6 +62,10 @@ ScrDyn *scr_tls_sock_get_cipher(ScrNetSocket *s);    /* +1: object, undefined or
 ScrDyn *scr_tls_sock_alpn_protocol(ScrNetSocket *s); /* +1: string, false or null */
 void scr_tls_sock_on_secure_connect(ScrNetSocket *s, ScrClosure *cb /*moves*/, bool once);
 void scr_tls_sock_on_session(ScrNetSocket *s, ScrClosure *cb /*moves*/, void *fn, bool once);
+/* The 'secure' event: fires when the handshake completes (after the
+ * secureConnect listeners on a client); released unread on a plain socket
+ * or after the handshake. */
+void scr_tls_sock_on_secure(ScrNetSocket *s, ScrClosure *cb /*moves*/, bool once);
 
 /* ── h2 over TLS (scr_tls.c ↔ scr_http2.c): the ALPN=h2 server wrap and
  * the https-authority client wrap. scr_http2.c calls both directly —
@@ -90,6 +97,11 @@ ScrSecureCtx *scr_tls_create_secure_context(const char *cert, size_t cert_len, c
  * validations first, then the pem walk (+1, or NULL with the exception
  * pending). Borrowed. */
 ScrSecureCtx *scr_tls_create_secure_context_dyn(const ScrDyn *opts);
+/* new tls.TLSSocket(socket, options) in server mode: a fresh TLS socket
+ * takes over socket's connection and runs the server handshake, serving
+ * ctx (options.secureContext; borrowed, nullable) or the options record's
+ * cert and key. +1, or NULL with the exception pending. */
+ScrNetSocket *scr_tls_wrap_socket(ScrNetSocket *raw, const ScrDyn *opts /*borrowed*/, ScrSecureCtx *ctx /*borrowed, nullable*/);
 /* tls.getCACertificates(type): validateString + the documented name set,
  * then the compiler-rendered fence — always leaves an exception pending. */
 void scr_tls_ca_certs_chk(const ScrDyn *type, const ScrStr *fence);

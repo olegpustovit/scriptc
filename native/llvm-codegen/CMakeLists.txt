@@ -80,6 +80,7 @@ add_executable(scriptc-llvm-codegen
   src/emit.cpp
   src/main.cpp
   src/partition.cpp
+  src/profile.cpp
   src/runtime-import.cpp
   src/runtime-unit.cpp
   src/target.cpp
@@ -180,7 +181,7 @@ if(SCRIPTC_STATIC_LINUX_BUILD)
     endif()
   endfunction()
 
-  set(SCRIPTC_LLVM_LINK_ROOTS ${SCRIPTC_LLVM_TARGET_LIBS} BitReader BitWriter IRReader LTO Linker Passes TransformUtils)
+  set(SCRIPTC_LLVM_LINK_ROOTS ${SCRIPTC_LLVM_TARGET_LIBS} BitReader BitWriter IRReader LTO Linker Passes ProfileData TransformUtils)
   foreach(component IN LISTS SCRIPTC_LLVM_LINK_ROOTS)
     if(TARGET "LLVM${component}")
       scriptc_collect_llvm_target("LLVM${component}")
@@ -209,6 +210,7 @@ else()
     LTO
     Linker
     Passes
+    ProfileData
     Support
     Target
     TransformUtils

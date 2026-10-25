@@ -558,6 +558,10 @@ describe("determinism attestation ↔ fence parity", () => {
       // witnessed Date method; assigning it to getTime would also deny
       // valueOf/toISOString/etc. under a getTime-only fence.
       "date.checkedValue",
+      // Makes a Date from the time value a Date local holds
+      // (date-values.ts) without reading ambient state. The local's
+      // initializer is the Date expression the fences witness.
+      "date.fromTime",
     ]);
     const missing = Object.keys(LIB_FN_SIGS).filter(
       (fn) =>

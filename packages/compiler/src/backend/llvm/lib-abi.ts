@@ -85,7 +85,7 @@ export function callbackAdapter(
   symbol: string,
   params: string[],
 ): AbiArgument[] {
-  host.moveTemp(value);
+  host.toHeap(value);
   host.declare(`declare void @${symbol}(${params.join(", ")})`);
   return [ptr(value.name), ptr(`@${symbol}`)];
 }

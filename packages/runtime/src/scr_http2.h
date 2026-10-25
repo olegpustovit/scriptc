@@ -166,6 +166,9 @@ long scr_http2_live_count(void);
 ScrNetServer *scr_https_create_server(const char *cert, size_t cert_len, const char *key, size_t key_len, ScrClosure *handler /*moves*/, ScrHttpReqFn fn); /* +1 */
 /* The runtime-options-record twin (the tls block's divergence-66 walk). */
 ScrNetServer *scr_https_create_server_dyn(const struct ScrDyn *opts /*borrowed*/, ScrClosure *handler /*moves, nullable*/, ScrHttpReqFn fn); /* +1 or NULL+pending */
+/* https.request's servername option (borrowed), stored for the next
+ * https request construction call. */
+void scr_https_set_next_servername(ScrStr *name);
 ScrHttpClientReq *scr_https_request(ScrStr *host /*borrowed*/, double port,
                                      ScrStr *path /*borrowed*/, ScrStr *method /*borrowed*/,
                                      double timeout_ms, ScrArr *header_pairs /*borrowed*/,
@@ -193,6 +196,13 @@ ScrHttpClientReq *scr_https_request_agent(ScrStr *host /*borrowed*/, double port
  * the fresh socket. The ctx moves into the transport at wrap time. */
 void *scr_tls_fetch_client_ctx(ScrStr *host /*borrowed*/, bool reject_unauthorized);
 void scr_tls_fetch_client_wrap(ScrNetSocket *sock, void *ctx);
+/* The fetch tunnel through an https:// proxy: TLS to the proxy, the
+ * CONNECT head (copied) inside it, then TLS to target_host inside the
+ * tunnel (NULL target_host: an http:// target's plaintext). The ctx moves
+ * into the socket's transport at wrap time. */
+void *scr_tls_fetch_tunnel_ctx(ScrStr *proxy_host /*borrowed*/, ScrStr *target_host /*borrowed, nullable*/,
+                               const char *request, size_t len);
+void scr_tls_fetch_tunnel_wrap(ScrNetSocket *sock, void *ctx);
 /* The loop-side registration (scr_async.c, always linked): `pending`
  * joins the exhaustion test (a live handle keeps the process alive, like
  * Node's active TCP handles), `dispatch` runs at every turn top like the

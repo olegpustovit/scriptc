@@ -15,6 +15,8 @@ import {
   emitNumberMapGetScalar,
   emitStringMapGetScalar,
   emitStringMapGetRef,
+  compactMapValues,
+  noteNumberMapKey,
 } from "./map-number-lookup.js";
 import { mapKeyAccess, mapKeyParamType } from "./shapes.js";
 import { rememberMapEntry } from "./map-entry-fusion.js";
@@ -264,6 +266,7 @@ export function emitMapLookupKey(
   const value = borrow ? host.emitReadReceiver(key) : host.emitExpr(key);
   const access = mapKeyAccess(key.type);
   const type = mapKeyParamType(access);
+  if (access === "f64") noteNumberMapKey(host, value, key);
   return { access, types: type, args: `${type} ${value.name}`, value: value.name };
 }
 
@@ -313,6 +316,7 @@ export function emitStackMapRead(host: LlvmEmitterContext, read: LocalMapRead): 
       // Booleans are stored as 0/1, already the widened union payload.
       const scalar = emitNumberMapGetScalar(host, receiver.name, number);
       found = scalar.found;
+      rememberMapEntry(host, read.expr, receiver.name, number, scalar.entry, "double");
       B.line(`store i64 ${scalar.bits}, ptr ${payload}`);
     }
   } else if (string !== null && !isRefCounted(read.value)) {
@@ -323,7 +327,10 @@ export function emitStackMapRead(host: LlvmEmitterContext, read: LocalMapRead): 
   } else if (isRefCounted(read.value)) {
     const stringKey = entryStringKey(key);
     let raw: string;
-    if (stringKey !== null) raw = emitStringMapGetRef(host, receiver.name, stringKey, read.value);
+    const mapType = read.receiver.type;
+    const compact = mapType.kind === "map" && compactMapValues(host, mapType.key, mapType.value);
+    if (stringKey !== null)
+      raw = emitStringMapGetRef(host, receiver.name, stringKey, read.value, compact);
     else {
       raw = B.tmp();
       host.declare(`declare ptr @scr_map_get_${access}_ref(ptr, ${keyType})`);

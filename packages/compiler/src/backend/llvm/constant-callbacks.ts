@@ -1,15 +1,40 @@
-import type { IrExpr, IrModule } from "../../ir/ir.js";
-import { exprFunctionReference, moduleFunctionReferences } from "../../ir/function-references.js";
+import type { IrExpr, IrFunction, IrModule } from "../../ir/ir.js";
+import {
+  exprFunctionReference,
+  FUNCTION_REFERENCE_KINDS,
+  moduleFunctionReferences,
+} from "../../ir/function-references.js";
+import { writtenLocals } from "../../ir/callback-specialization.js";
+import { eachNodeOfKinds, type IrNodeIndex, type IrNodeKind } from "../../ir/node-index.js";
 import { everyStmtList } from "../../ir/traverse.js";
 import type { CallLifetimes } from "./call-lifetimes.js";
+
+/** The nodes the body census below reads. */
+const CENSUS_KINDS: readonly IrNodeKind[] = [
+  "varDecl",
+  "assign",
+  "forOf",
+  "rethrow",
+  "tryCatch",
+  "call",
+  "callValue",
+  "assignExpr",
+  "incDec",
+  ...FUNCTION_REFERENCE_KINDS,
+];
 
 /** Closed direct-call consumers can devirtualize a callback when every
  * incoming call supplies the same function. Keep its evaluated environment,
  * arguments and ordinary ownership; only the loaded code pointer changes.
- * Escaped, exported, recursive forwarding and unknown targets stay indirect. */
+ * A call that forwards the consumer's own unchanged parameter (recursion)
+ * agrees with the others; a parameter forwarded to another consumer, or
+ * captured unchanged by a closure, resolves through the incoming calls of
+ * the function that declares it. Escaped, exported, mutually recursive
+ * forwarding and unknown targets stay indirect. */
 export function findConstantCallbacks(
   mod: IrModule,
   lifetimes: CallLifetimes,
+  index?: IrNodeIndex,
 ): Map<string, Map<string, string>> {
   const functions = new Map(mod.functions.map((fn) => [fn.name, fn]));
   const definitions = new Map<string, Map<string, IrExpr>>();
@@ -24,12 +49,16 @@ export function findConstantCallbacks(
     mod.functions
       .filter(
         (fn) =>
-          // Authored declarations, plus the frontend's synthetic array
-          // HOF loops (`%arr.<method>.<n>`): those are plain direct-call
-          // functions, and a literal callback gets a helper of its own.
+          // Authored declarations, plus the frontend's synthetic array and
+          // typed-array HOF loops (`%arr.<method>.<n>`, `%bytes.<method>.<n>`):
+          // those are plain direct-call functions, and a literal callback
+          // gets a helper of its own.
           // Generator declarations are entered through their spawn wrapper,
           // which moves the same arguments into the generator's frame.
-          (fn.ownsPrototype || fn.name.startsWith("%arr.") || fn.generator !== undefined) &&
+          (fn.ownsPrototype ||
+            fn.name.startsWith("%arr.") ||
+            fn.name.startsWith("%bytes.") ||
+            fn.generator !== undefined) &&
           (!fn.async || fn.generator !== undefined) &&
           !fn.captures &&
           !fn.classCaptures &&
@@ -39,6 +68,9 @@ export function findConstantCallbacks(
   );
   const globals = new Map<string, IrExpr>();
   const writes = new Set<string>();
+  // Parameters and captures each function (or a closure sharing the
+  // binding) writes after entry.
+  const rebinds = writtenLocals(mod, index);
   // A function named anywhere but as a direct call's callee can be entered
   // by a generated adapter or the runtime, which a direct-call census cannot
   // specialize: the entry, exports, class helpers and methods here, and
@@ -54,6 +86,7 @@ export function findConstantCallbacks(
   // The initializer of each immutable function-typed local declared once:
   // its only write, even when a capture box (not a stable slot) holds it.
   const constDefinitions = new Map<string, Map<string, IrExpr | null>>();
+  const scan = index?.scan(CENSUS_KINDS);
   for (const fn of mod.functions) {
     const defs = new Map<string, IrExpr>();
     const consts = new Map<string, IrExpr | null>();
@@ -73,51 +106,64 @@ export function findConstantCallbacks(
     const emptyDecls = new Map<string, number>();
     const assigned = new Map<string, IrExpr[]>();
     const rebound = new Set<string>();
-    everyStmtList(fn.body, {
-      stmt: (stmt) => {
-        if (stmt.kind === "varDecl" && stmt.init?.type.kind === "func" && stable?.has(stmt.localId))
-          defs.set(stmt.localId, stmt.init);
-        if (stmt.kind === "varDecl" && immutable.has(stmt.localId))
-          consts.set(stmt.localId, consts.has(stmt.localId) ? null : stmt.init);
-        if (stmt.kind === "varDecl" && hoisted.has(stmt.localId)) {
-          if (stmt.init !== null) rebound.add(stmt.localId);
-          emptyDecls.set(stmt.localId, (emptyDecls.get(stmt.localId) ?? 0) + 1);
-        }
-        if (stmt.kind === "assign" && hoisted.has(stmt.localId)) {
-          const values = assigned.get(stmt.localId) ?? [];
-          values.push(stmt.value);
-          assigned.set(stmt.localId, values);
-        }
-        if (stmt.kind === "forOf" || stmt.kind === "rethrow") rebound.add(stmt.localId);
-        if (stmt.kind === "tryCatch" && stmt.catchLocalId !== null) rebound.add(stmt.catchLocalId);
-        if (stmt.kind === "assign") {
-          if (globalIds.has(stmt.localId)) {
-            if (globals.has(stmt.localId)) writes.add(stmt.localId);
-            else globals.set(stmt.localId, stmt.value);
+    eachNodeOfKinds(fn, scan, (node) => {
+      switch (node.kind) {
+        case "varDecl":
+          if (node.init?.type.kind === "func" && stable?.has(node.localId))
+            defs.set(node.localId, node.init);
+          if (immutable.has(node.localId))
+            consts.set(node.localId, consts.has(node.localId) ? null : node.init);
+          if (hoisted.has(node.localId)) {
+            if (node.init !== null) rebound.add(node.localId);
+            emptyDecls.set(node.localId, (emptyDecls.get(node.localId) ?? 0) + 1);
           }
+          return;
+        case "assign":
+          if (hoisted.has(node.localId)) {
+            const values = assigned.get(node.localId) ?? [];
+            values.push(node.value);
+            assigned.set(node.localId, values);
+          }
+          if (globalIds.has(node.localId)) {
+            if (globals.has(node.localId)) writes.add(node.localId);
+            else globals.set(node.localId, node.value);
+          }
+          return;
+        case "forOf":
+        case "rethrow":
+          rebound.add(node.localId);
+          return;
+        case "tryCatch":
+          if (node.catchLocalId !== null) rebound.add(node.catchLocalId);
+          return;
+        case "call":
+          if (consumers.has(node.callee)) {
+            const calls = incoming.get(node.callee) ?? [];
+            calls.push({ owner: fn.name, args: node.args });
+            incoming.set(node.callee, calls);
+          }
+          return;
+        case "callValue":
+          if (node.callee.kind === "varRef") callees.add(node.callee.localId);
+          return;
+        case "closure": {
+          escaped.add(node.fnName);
+          const sites = closureSites.get(node.fnName) ?? [];
+          sites.push({ owner: fn.name, captures: node.captures });
+          closureSites.set(node.fnName, sites);
+          return;
         }
-        return true;
-      },
-      expr: (expr) => {
-        if (expr.kind === "call" && consumers.has(expr.callee)) {
-          const calls = incoming.get(expr.callee) ?? [];
-          calls.push({ owner: fn.name, args: expr.args });
-          incoming.set(expr.callee, calls);
+        case "orDefault": {
+          const referenced = exprFunctionReference(node);
+          if (referenced !== undefined) escaped.add(referenced);
+          return;
         }
-        if (expr.kind === "callValue" && expr.callee.kind === "varRef")
-          callees.add(expr.callee.localId);
-        const referenced = exprFunctionReference(expr);
-        if (referenced !== undefined) escaped.add(referenced);
-        if (expr.kind === "closure") {
-          const sites = closureSites.get(expr.fnName) ?? [];
-          sites.push({ owner: fn.name, captures: expr.captures });
-          closureSites.set(expr.fnName, sites);
-        }
-        if ((expr.kind === "assignExpr" || expr.kind === "incDec") && globalIds.has(expr.localId))
-          writes.add(expr.localId);
-        if (expr.kind === "assignExpr" || expr.kind === "incDec") rebound.add(expr.localId);
-        return true;
-      },
+        case "assignExpr":
+        case "incDec":
+          if (globalIds.has(node.localId)) writes.add(node.localId);
+          rebound.add(node.localId);
+          return;
+      }
     });
     for (const [id, values] of assigned)
       if (emptyDecls.get(id) === 1 && values.length === 1 && !rebound.has(id))
@@ -175,10 +221,18 @@ export function findConstantCallbacks(
     const next = definitions.get(owner)?.get(id);
     if (next) return resolve(owner, next, seen);
     const fn = functions.get(owner);
+    const parameter = fn?.params.findIndex((param) => param.localId === id) ?? -1;
+    if (fn && parameter >= 0) return parameterTarget(fn, parameter, seen);
     const index = fn?.captures?.findIndex((capture) => capture.localId === id) ?? -1;
     const local = fn?.locals.find((candidate) => candidate.id === id);
     const sites = closureSites.get(owner);
-    if (index < 0 || !local || local.mutable || !sites?.length) return null;
+    if (
+      index < 0 ||
+      !local ||
+      (local.mutable && rebinds.get(owner)?.has(id) !== false) ||
+      !sites?.length
+    )
+      return null;
     let target: string | null = null;
     for (const site of sites) {
       const outer = site.captures[index];
@@ -194,20 +248,60 @@ export function findConstantCallbacks(
     }
     return target;
   }
+  // The one function every incoming call passes in a consumer's callback
+  // parameter that its body never rebinds. Results are cached: helpers
+  // forwarding one callback through several calls resolve it once.
+  const parameterTargets = new Map<string, string | null>();
+  function parameterTarget(fn: IrFunction, index: number, seen: Set<string>): string | null {
+    const param = fn.params[index]!;
+    const key = `%param:${fn.name}:${index}`;
+    const cached = parameterTargets.get(key);
+    if (cached !== undefined) return cached;
+    if (
+      seen.has(key) ||
+      param.type.kind !== "func" ||
+      !consumers.has(fn.name) ||
+      escaped.has(fn.name) ||
+      rebinds.get(fn.name)?.has(param.localId) !== false
+    )
+      return null;
+    seen.add(key);
+    const calls = incoming.get(fn.name) ?? [];
+    let target: string | null = null;
+    for (const call of calls) {
+      const value = call.args[index];
+      if (call.owner === fn.name && value?.kind === "varRef" && value.localId === param.localId)
+        continue;
+      const next = value ? resolve(call.owner, value, new Set(seen)) : null;
+      if (!next || (target && target !== next)) {
+        target = null;
+        break;
+      }
+      target = next;
+    }
+    parameterTargets.set(key, target);
+    return target;
+  }
   // Global targets are module facts. Resolve them once, and copy only
   // entries actually used as indirect callees in each body. A module-wide
   // global/function cross product would dominate large-source emission.
   const globalTargets = new Map<string, string>();
+  const result = new Map<string, Map<string, string>>();
+  // Only indirect callees get targets: without one, nothing resolves.
+  if (![...indirectCallees.values()].some((callees) => callees.size > 0)) return result;
   for (const [id, value] of globals) {
     const target = resolve(null, value);
     if (target) globalTargets.set(id, target);
   }
-  const result = new Map<string, Map<string, string>>();
   for (const fn of mod.functions) {
     const needed = indirectCallees.get(fn.name)!;
     if (!needed.size) continue;
     const targets = new Map<string, string>();
+    const params = new Set(fn.params.map((param) => param.localId));
     for (const id of needed) {
+      // A parameter called in its own body resolves below, only where the
+      // body borrows it.
+      if (params.has(id)) continue;
       if (localIds.get(fn.name)?.has(id)) {
         const target = resolveLocal(fn.name, id, new Set());
         if (target) targets.set(id, target);
@@ -228,16 +322,7 @@ export function findConstantCallbacks(
               : lifetimes.borrowed.get(fn.name)?.has(index))
           )
             return;
-          let target: string | null = null;
-          for (const call of calls) {
-            const value = call.args[index];
-            const next = value ? resolve(call.owner, value) : null;
-            if (!next || (target && target !== next)) {
-              target = null;
-              break;
-            }
-            target = next;
-          }
+          const target = parameterTarget(fn, index, new Set());
           if (target) targets.set(param.localId, target);
         });
     }

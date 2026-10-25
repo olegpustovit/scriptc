@@ -27,8 +27,9 @@ test("util.format %f lowers a boolean argument once", async () => {
     const helpers = mod.functions
       .map((f) => f.name)
       .filter((name) => name.startsWith("%arr."))
-      .map((name) => name.replace(/\.\d+$/, ""));
-    expect(helpers).toEqual(["%arr.some", "%arr.every"]);
+      .map((name) => name.replace(/\.[0-9a-f]+$/, ""))
+      .sort();
+    expect(helpers).toEqual(["%arr.every", "%arr.some"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

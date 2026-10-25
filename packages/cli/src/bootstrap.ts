@@ -66,6 +66,12 @@ async function tryFastPath(): Promise<number | null> {
     values["emit-ir"] ||
     values.lib ||
     values["provenance-sources"] ||
+    // The full compiler keys these builds by the profile's bytes.
+    values["profile-generate"] !== undefined ||
+    values["profile-use"] !== undefined ||
+    values.sparse ||
+    // The full compiler resolves `native` against the build host.
+    values["target-cpu"] !== undefined ||
     (values["external-types"] ?? []).length > 0
   )
     return null;
@@ -116,6 +122,13 @@ async function tryFastPath(): Promise<number | null> {
   // the whole compiler graph to rediscover it.
   const helperRuntimePackTarget = !values.sanitize ? startup.precompiledRuntimePackTarget() : null;
   const helperObjectRoute = helperRuntimePackTarget !== null;
+  // The full compiler reports a checker it cannot find.
+  let checker: string | undefined;
+  try {
+    checker = startup.checkerCacheIdentity();
+  } catch {
+    return null;
+  }
   const hit = await startup.readRoutedExecutableCache(root, {
     entryPath: input,
     outDir,
@@ -126,6 +139,7 @@ async function tryFastPath(): Promise<number | null> {
     ...(optimization === "dev" || optimization === "speed" ? { optimization } : {}),
     ...(values.strip ? { strip: true as const } : {}),
     ...(values["detached-exit"] ? { detachedExit: true as const } : {}),
+    ...(checker === undefined ? {} : { checker }),
     npmStatic,
     ffiProfile: ffiPath === null ? null : { path: ffiPath, bytes: ffiBytes! },
     target: `${process.env["SCRIPTC_TARGET"] ?? "native"}:${buildPlatform}:${process.arch}:${
@@ -148,6 +162,10 @@ async function tryFastPath(): Promise<number | null> {
   if (hit === null) return null;
   if (!values["keep-llvm"]) await rm(hit.llvmPath, { force: true });
   if (command === "build") {
+    // A cached build repeats its performance warning (SC6101).
+    const performance = hit.performance ?? [];
+    if (performance.length > 0 && values["dynamic-tier-warning"] !== false)
+      process.stderr.write(startup.renderPerformanceWarnings(performance) + "\n");
     process.stdout.write(`${outPath}\n`);
     return 0;
   }
@@ -184,6 +202,7 @@ async function coverageFastPath(
     values.emit !== undefined ||
     values.strip ||
     values["detached-exit"] ||
+    values["target-cpu"] !== undefined ||
     values.lib ||
     values.profile !== undefined ||
     values.ffi !== undefined ||
@@ -205,6 +224,7 @@ async function coverageFastPath(
   const hit = await startup.readCoverageVerdict(resolve(inputArg), {}).catch(() => null);
   if (hit === null) return null;
   const { coverage, sourceTexts } = hit;
+  if (values["dynamic-tier-warning"] === false) delete coverage.performance;
   if (print === "diagnostics") {
     const envelope = startup.coverageEnvelope(coverage, {
       compilerVersion: packageVersion(),

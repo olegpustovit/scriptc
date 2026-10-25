@@ -20,7 +20,7 @@ export function isImportMeta(expr: ts.Expression): boolean {
 /** File-backed metadata is fixed by the compiled module graph. Reads share
  * one implementation across dot access, folded keys and selected bindings. */
 export function importMetaField(lowerer: Lowerer, node: ts.Node, name: string): IrExpr {
-  const sf = node.getSourceFile();
+  const sf = ts.getSourceFileOfNode(node);
   const fileName =
     lowerer.targetPlatform === "wasi"
       ? (wasiGuestPath(sf.fileName) ?? sf.fileName.replace(/\\/g, "/"))
@@ -65,7 +65,7 @@ export function importMetaBindingSource(
 ): IrExpr | null {
   if (!isImportMeta(initializer) || !ts.isObjectBindingPattern(pattern)) return null;
   const fields: { name: string; value: IrExpr }[] = [];
-  for (const el of pattern.elements) {
+  for (const el of pattern.elements.nodes) {
     if (el.dotDotDotToken)
       lowerer.unsupported(
         "SC1031",

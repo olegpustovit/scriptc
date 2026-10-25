@@ -176,7 +176,10 @@ async function readRuntimeHeader(
  * no linkage symbol the emitter could declare, so a declare against one
  * must report as missing. */
 async function parseHeader(): Promise<{ protos: Map<string, CProto>; dataSyms: Set<string> }> {
-  const raw = await readRuntimeHeader();
+  // The dynamic tier's units declare their entry points in scr_js.h, which
+  // static runtime units never include (packages/runtime/test/headers).
+  const seen = new Set<string>();
+  const raw = `${await readRuntimeHeader("scr_runtime.h", seen)}\n${await readRuntimeHeader("scr_js.h", seen)}`;
   const src = raw
     .replace(/\\\r?\n/g, "")
     .replace(/\/\*[\s\S]*?\*\//g, " ")
@@ -190,6 +193,12 @@ async function parseHeader(): Promise<{ protos: Map<string, CProto>; dataSyms: S
   }
   const ptrTypedefs = new Set<string>();
   for (const m of src.matchAll(/typedef\s+[^;{()]*\(\s*\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\(/g)) {
+    ptrTypedefs.add(m[1]!);
+  }
+  // Object-pointer typedefs (ScrJsVal).
+  for (const m of src.matchAll(
+    /typedef\s+[A-Za-z_][A-Za-z0-9_ ]*\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*;/g,
+  )) {
     ptrTypedefs.add(m[1]!);
   }
   const types: HeaderTypes = { enums, ptrTypedefs };

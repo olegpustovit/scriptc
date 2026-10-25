@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import {
   compileRegexMatcher,
   regexLiteralBailReason,
+  regexLiteralCaptures,
   regexLiteralCompiles,
 } from "./regex-matchers.js";
 
@@ -10,6 +11,30 @@ function body(pattern: string, flags = "", vector = true): string {
   if (code === null) throw new Error(`/${pattern}/${flags} did not compile`);
   return code.lines.join("\n");
 }
+
+describe("regex literal captures", () => {
+  test("counts captures with the whole match and marks the ones every match sets", () => {
+    expect(regexLiteralCaptures("[&<>]", "g")).toEqual({ count: 1, always: [true] });
+    expect(regexLiteralCaptures("(\\w+)=(\\d)+", "")).toEqual({
+      count: 3,
+      always: [true, true, true],
+    });
+    expect(regexLiteralCaptures("(?<k>a)(b)?|(c)", "")).toEqual({
+      count: 4,
+      always: [true, false, false, false],
+    });
+    expect(regexLiteralCaptures("x(?:(a)|(b))y(c)*(d){0,2}(e){1,3}", "")).toEqual({
+      count: 6,
+      always: [true, false, false, false, false, true],
+    });
+  });
+
+  test("answers null outside the parsed subset", () => {
+    expect(regexLiteralCaptures("(?=a)(b)", "")).toBeNull();
+    expect(regexLiteralCaptures("(a)\\1", "")).toBeNull();
+    expect(regexLiteralCaptures("a", "v")).toBeNull();
+  });
+});
 
 describe("regex literal matcher subset", () => {
   test.each([
@@ -83,6 +108,25 @@ describe("regex literal matcher code", () => {
     expect(body("\\d+", "", false)).not.toContain("<16 x i8>");
     // A bounded count below 32 stays scalar.
     expect(body("a\\d{1,3}")).not.toContain("<16 x i8>");
+  });
+
+  test("fixed leading characters filter 16 start positions at once", () => {
+    // Both alternatives' first characters are tested at every offset and
+    // combined, and the reads reach seven characters past the block.
+    const text = body("agggtaaa|tttaccct", "gi");
+    expect(text.match(/load <16 x i8>/g)!.length).toBeGreaterThanOrEqual(16);
+    expect(text).toMatch(/and i16 /);
+    expect(text).toMatch(/or i16 /);
+    expect(text).toMatch(/add i32 %t\d+, 7\n/);
+    // A class sequence with a fixed count extends the filter.
+    expect(body("[cg]x{3}y")).toMatch(/and i16 /);
+    // An optional first character, a single first character and a
+    // variable-length start keep the first-character search.
+    expect(body("[ab]?cd")).not.toMatch(/and i16 /);
+    expect(body("[ab]*cd")).not.toMatch(/and i16 /);
+    expect(body("xy|zw")).toMatch(/and i16 /);
+    expect(body("[ab]|cd")).not.toMatch(/and i16 /);
+    expect(body("agggtaaa|tttaccct", "gi", false)).not.toContain("<16 x i8>");
   });
 
   test("loops no continuation can share push no backtrack entries", () => {

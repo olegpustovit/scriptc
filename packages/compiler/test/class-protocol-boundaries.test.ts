@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { expect, test } from "vitest";
 import { compile } from "../src/index.js";
 
-test("generic protocol dispatch without a concrete body fails during compilation", async () => {
+test("generic protocol dispatch without a concrete body calls the erased method", async () => {
   const directory = mkdtempSync(join(tmpdir(), "scriptc-protocol-boundary-"));
   try {
     const entry = join(directory, "main.ts");
@@ -23,17 +23,9 @@ console.log(read(new Value()));`,
       outPath: join(directory, "program.ir"),
       outputKind: "ir",
     });
-    expect(result.ok).toBe(false);
-    if (result.ok) throw new Error("expected generic protocol diagnostic");
-    expect(result.diagnostics).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          code: "SC1090",
-          message: expect.stringContaining("runtime class must be provable"),
-        }),
-      ]),
-    );
-    expect(result.diagnostics.some((diagnostic) => diagnostic.code === "SC9001")).toBe(false);
+    if (!result.ok)
+      throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+    expect(result.ok).toBe(true);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

@@ -221,3 +221,29 @@ console.log(describe(items[4]!));
 `);
   expect(signature(unproven, "describe")).toBe("describe(Item|undefined): string");
 });
+
+test("a type assertion keeps an unchecked read from widening its callee", async () => {
+  const module = await lower(`
+function hot(n: number): number {
+  return (n * 2) | 0;
+}
+function cold(xs: number[]): number {
+  let s = 0;
+  for (let i = 0; i < xs.length; i++) s = (s + hot(xs[i] as number)) | 0;
+  return s;
+}
+function drain(stack: number[]): number {
+  let s = 0;
+  while (stack.length > 0) s = (s + hot(stack.pop() as number)) | 0;
+  return s;
+}
+function lookup(m: Map<string, number>): number {
+  return hot(<number>m.get("a"));
+}
+console.log(cold([1, 2, 3]), drain([4, 5]), lookup(new Map([["a", 6]])));
+`);
+  expect(signature(module, "hot")).toBe("hot(f64): f64");
+  const llvm = emitLlvmModule(module);
+  for (const caller of ["cold", "drain", "lookup"])
+    expect(body(llvm, caller)).not.toContain("@scr_union_new");
+});

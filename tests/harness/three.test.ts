@@ -72,7 +72,11 @@ test.for(cases)(
     const previousTarget = process.env["SCRIPTC_TARGET"];
     const previousCc = process.env["SCRIPTC_CC"];
     const wasm = target === "wasm32-wasi";
-    const sanitize = !wasm && process.env["SCRIPTC_SAN"] === "1";
+    // The sanitized nodes program is one 1.14 GB LLVM module, whose clang
+    // compile needs about 16 GB, more than the CI runners have. It runs
+    // unsanitized until sanitized dev builds compile large programs in
+    // shards; every other fixture keeps the sanitizer.
+    const sanitize = !wasm && fixture !== "nodes" && process.env["SCRIPTC_SAN"] === "1";
     try {
       if (wasm) {
         process.env["SCRIPTC_TARGET"] = target;

@@ -292,8 +292,6 @@ static bool scr_et_listener_same(const ScrDyn *a, const ScrDyn *b) {
 
 /* ── the warnings Node prints through process.emitWarning ───────────── */
 
-static SCR_TL bool scr_et_trace_hint_shown;
-
 typedef struct {
   char name[48];
   ScrStr *message;
@@ -315,8 +313,8 @@ static void scr_et_warn_tick(ScrClosure *cb) {
   fflush(stdout);
   fprintf(stderr, "(node:%ld) %s: %.*s\n", SCR_ET_PID(), w->name, (int)w->message->len,
           w->message->data);
-  if (!scr_et_trace_hint_shown) {
-    scr_et_trace_hint_shown = true;
+  if (!scr_warning_trace_hint_shown) {
+    scr_warning_trace_hint_shown = true;
     fputs("(Use `node --trace-warnings ...` to show where the warning was created)\n", stderr);
   }
 }
@@ -785,7 +783,8 @@ static ScrEventObj *scr_event_obj_of(const ScrDyn *d);
 
 static ScrEvent *scr_event_of(const ScrDyn *d) {
   if (d && d->kind == SCR_DYN_HANDLE &&
-      (d->v.handle.tag == SCR_DYNH_EVENT || d->v.handle.tag == SCR_DYNH_CUSTOM_EVENT)) {
+      (d->v.handle.tag == SCR_DYNH_EVENT || d->v.handle.tag == SCR_DYNH_CUSTOM_EVENT ||
+       d->v.handle.tag == SCR_DYNH_MESSAGE_EVENT)) {
     return (ScrEvent *)d->v.handle.ptr;
   }
   ScrEventObj *obj = scr_event_obj_of(d);
@@ -1044,6 +1043,9 @@ static ScrDyn *scr_et_method_value(const char *key, size_t len, bool target) {
     const char *name = scr_et_method_names[i];
     if (strlen(name) != len || memcmp(name, key, len) != 0) continue;
     if (!scr_et_method_values[i]) {
+      /* An AbortSignal answers these without the unit ever installing:
+       * exit releases the cached function either way. */
+      scr_et_register_teardown();
       ScrClosure *clo = scr_closure_new(NULL, 1);
       clo->caps[0] = scr_box_new(SCR_BOX_F64);
       scr_box_set_f64(clo->caps[0], (double)i);
@@ -1053,6 +1055,10 @@ static ScrDyn *scr_et_method_value(const char *key, size_t len, bool target) {
     return scr_dyn_retain(scr_et_method_values[i]);
   }
   return NULL;
+}
+
+ScrDyn *scr_event_target_method_value(const char *key, size_t len) {
+  return scr_et_method_value(key, len, true);
 }
 
 static ScrDyn *scr_event_target_value(const ScrEvent *ev) {
@@ -1079,6 +1085,17 @@ static ScrDyn *scr_event_get(void *ptr, const char *key, size_t len) {
   if (scr_et_key(key, len, "isTrusted")) return scr_dyn_new_bool(ev->trusted);
   if (ev->custom && scr_et_key(key, len, "detail"))
     return ev->detail ? scr_dyn_retain(ev->detail) : scr_dyn_new_null();
+  if (ev->message) {
+    if (scr_et_key(key, len, "data")) return ev->detail ? scr_dyn_retain(ev->detail) : scr_dyn_new_null();
+    if (scr_et_key(key, len, "origin") || scr_et_key(key, len, "lastEventId")) {
+      ScrStr *empty = scr_str_new("", 0);
+      ScrDyn *value = scr_dyn_new_str(empty);
+      scr_str_release(empty);
+      return value;
+    }
+    if (scr_et_key(key, len, "source")) return scr_dyn_new_null();
+    if (scr_et_key(key, len, "ports")) return scr_dyn_new_arr();
+  }
   return scr_et_method_value(key, len, false);
 }
 
@@ -1164,6 +1181,16 @@ static ScrDyn *scr_event_inspect_view(void *ptr) {
 
 static const ScrDynHandleOps scr_event_ops = {
     .cls = "Event",
+    .retain = scr_event_retain_v,
+    .release = scr_event_release_v,
+    .invoke = scr_event_invoke,
+    .get = scr_event_get,
+    .set = scr_event_set,
+    .inspect_view = scr_event_inspect_view,
+};
+
+static const ScrDynHandleOps scr_message_event_ops = {
+    .cls = "MessageEvent",
     .retain = scr_event_retain_v,
     .release = scr_event_release_v,
     .invoke = scr_event_invoke,
@@ -1493,6 +1520,7 @@ static void scr_et_install(void) {
   installed = true;
   scr_dyn_handle_install(SCR_DYNH_EVENT, &scr_event_ops);
   scr_dyn_handle_install(SCR_DYNH_CUSTOM_EVENT, &scr_custom_event_ops);
+  scr_dyn_handle_install(SCR_DYNH_MESSAGE_EVENT, &scr_message_event_ops);
   scr_dyn_handle_install(SCR_DYNH_EVENT_TARGET, &scr_event_target_ops);
   scr_event_ref_hooks = &scr_event_obj_ref_hooks;
   scr_et_register_teardown();
@@ -1592,6 +1620,46 @@ ScrDyn *scr_custom_event_new(ScrDyn *args) {
   return out;
 }
 
+/* ── BroadcastChannel's EventTarget side ───────────────────────────── */
+
+static ScrEventTargetCore *scr_et_broadcast_core_new(const char *cls) {
+  ScrEventTargetCore *core = scr_et_calloc(sizeof *core);
+  scr_et_core_init(core, 10, cls);
+  return core;
+}
+
+static void scr_et_broadcast_core_free(ScrEventTargetCore *core) {
+  scr_et_core_drop(core);
+  free(core);
+}
+
+/* the 'message' MessageEvent (not trusted, as in Node) with the data */
+static void scr_et_broadcast_dispatch(ScrEventTargetCore *core, ScrDyn *self, ScrDyn *data) {
+  ScrEvent *ev = scr_event_alloc(scr_str_new("message", 7), false);
+  ev->message = true;
+  ev->detail = scr_dyn_retain(data);
+  scr_event_track(ev);
+  ScrDyn *event = scr_dyn_new_handle(ev, SCR_DYNH_MESSAGE_EVENT);
+  scr_event_release_v(ev);
+  scr_et_dispatch(core, self, event);
+  scr_dyn_release(event);
+}
+
+static ScrDyn *scr_et_broadcast_method_value(const char *name, size_t length) {
+  return scr_et_method_value(name, length, true);
+}
+
+static const ScrEtBroadcastOps scr_et_broadcast_table = {
+    &scr_et_broadcast_core_new,     &scr_et_broadcast_core_free, &scr_et_broadcast_dispatch,
+    &scr_et_target_method,          &scr_et_broadcast_method_value,
+    &scr_et_handler_get,            &scr_et_handler_set,
+};
+
+void scr_et_broadcast_install(void) {
+  scr_et_install();
+  scr_et_broadcast_ops = &scr_et_broadcast_table;
+}
+
 bool scr_event_is(const ScrDyn *v, double kind) {
   if (v->kind == SCR_DYN_TYPED_REF) {
     /* Compiled subclasses extend Event or EventTarget (never CustomEvent). */
@@ -1600,7 +1668,8 @@ bool scr_event_is(const ScrDyn *v, double kind) {
   }
   if (v->kind != SCR_DYN_HANDLE) return false;
   ScrDynHandleTag tag = v->v.handle.tag;
-  if (kind == 0) return tag == SCR_DYNH_EVENT || tag == SCR_DYNH_CUSTOM_EVENT;
+  if (kind == 0)
+    return tag == SCR_DYNH_EVENT || tag == SCR_DYNH_CUSTOM_EVENT || tag == SCR_DYNH_MESSAGE_EVENT;
   if (kind == 1) return tag == SCR_DYNH_CUSTOM_EVENT;
   return tag == SCR_DYNH_EVENT_TARGET ||
          (scr_et_signal_core_fn != NULL && tag == SCR_DYNH_ABORT_SIGNAL);
@@ -1682,4 +1751,214 @@ ScrDyn *scr_events_add_abort_listener(ScrDyn *signal, ScrDyn *listener) {
     dispose->caps[1] = scr_et_dyn_box(listener);
   }
   return scr_dyn_new_func(dispose, scr_et_abort_listener_dispose, 0, "()", "[Symbol.dispose]");
+}
+
+/* ── node:timers/promises with { signal } ─────────────────────────────
+ * setTimeout(delay, value, { signal, ref }) and setImmediate(value,
+ * { signal, ref }), as lib/timers/promises.js runs them. An undefined
+ * signal takes the plain form. A value that is not an AbortSignal rejects
+ * with ERR_INVALID_ARG_TYPE, and an aborted signal rejects with an
+ * AbortError whose cause is signal.reason, both without arming the timer.
+ * Otherwise an 'abort' listener clears the timer (or immediate) and
+ * rejects with that AbortError. The result settles like the timer's
+ * promise once the listener is removed (scr_tp_abort_entry). */
+typedef struct {
+  size_t rc;
+  ScrPromise *inner;  /* settled by the timer or the abort; owned */
+  ScrPromise *result; /* the returned promise; owned */
+  ScrDyn *signal;     /* owned */
+  ScrDyn *listener;   /* owned, NULL until registered */
+  double handle;
+  bool immediate;
+  int step;           /* the next step of scr_tp_abort_entry */
+  bool settled;       /* the timer fired or the signal aborted */
+} ScrTpAbort;
+
+static void *scr_tp_abort_retain_v(void *p) {
+  ((ScrTpAbort *)p)->rc++;
+  return p;
+}
+
+static void scr_tp_abort_release_v(void *p) {
+  ScrTpAbort *t = p;
+  if (--t->rc != 0) return;
+  scr_promise_release(t->inner);
+  scr_promise_release(t->result);
+  scr_dyn_release(t->signal);
+  if (t->listener) scr_dyn_release(t->listener);
+  free(t);
+}
+
+static ScrBox *scr_tp_abort_box(ScrTpAbort *t) {
+  ScrBox *box = scr_box_new_obj(&scr_tp_abort_retain_v, &scr_tp_abort_release_v, NULL);
+  scr_box_set_ref(box, scr_tp_abort_retain_v(t));
+  return box;
+}
+
+/* new AbortError(undefined, { cause: signal.reason }), thrown. */
+static void scr_tp_throw_abort(ScrDyn *signal) {
+  ScrStr *message = scr_str_new("The operation was aborted", 25);
+  ScrError *e = scr_error_new(SCR_ERR_ERROR, message);
+  scr_str_release(message);
+  scr_str_release(e->name);
+  e->name = scr_str_new("AbortError", 10);
+  /* AbortError assigns code, then name: own enumerable properties */
+  scr_error_set_code(e, "ABORT_ERR");
+  e->name_present = true;
+  e->name_enumerable = true;
+  ScrStr *k = scr_str_new("reason", 6);
+  ScrDyn *reason = scr_dyn_handle_key_get(signal, k);
+  scr_str_release(k);
+  scr_error_define_cause(e, reason ? reason : scr_dyn_undefined());
+  if (reason) scr_dyn_release(reason);
+  scr_throw_obj(e, &scr_error_retain_v, &scr_error_release_v, scr_error_trace_arg());
+}
+
+/* The timer or immediate fired: the timer's promise takes the value. */
+static void scr_tp_abort_fire(ScrClosure *self) {
+  ScrTpAbort *t = scr_box_get_ref(self->caps[0]);
+  ScrPromise *value = scr_box_get_ref(self->caps[1]);
+  if (!t->settled) {
+    t->settled = true;
+    scr_promise_adapt_copy(t->inner, value);
+  }
+  scr_promise_release(value);
+  scr_tp_abort_release_v(t);
+}
+
+/* The 'abort' listener: clear the timer, reject the timer's promise. */
+static ScrDyn *scr_tp_abort_thunk(ScrClosure *clo, ScrDyn *const *args, size_t argc) {
+  (void)args;
+  (void)argc;
+  ScrTpAbort *t = scr_box_get_ref(clo->caps[0]);
+  if (!t->settled) {
+    t->settled = true;
+    if (t->immediate) scr_clear_immediate(t->handle);
+    else scr_clear_interval(t->handle);
+    scr_tp_throw_abort(t->signal);
+    scr_promise_reject_pending(t->inner);
+  }
+  scr_tp_abort_release_v(t);
+  return scr_dyn_retain(scr_dyn_undefined());
+}
+
+/* The steps after the timer's promise settles, one promise job each:
+ * Node's SafePromisePrototypeFinally wraps the promise in
+ * `new Promise((a, b) => new SafePromise((a, b) => p.then(a, b))
+ * .finally(remove).then(a, b))`, so the listener comes off in the second
+ * job and the result settles in the fifth. Native fibers take each job as
+ * an await hop; on wasm32 a runtime waiter cannot suspend, so each job is
+ * a waiter spawned after a settled promise. */
+static void scr_tp_abort_entry(ScrFiber *self, void *opaque) {
+  (void)self;
+  ScrTpAbort *t = opaque;
+  for (;;) {
+    if (t->step == 0) {
+      scr_await_void(t->inner);
+      if (scr_exc_pending()) scr_exc_clear();
+    } else if (t->step == 1) {
+      bool aborted;
+      ScrEventTargetCore *core =
+          scr_et_signal_core_fn ? scr_et_signal_core_fn(t->signal, &aborted) : NULL;
+      if (core && t->listener) {
+        ScrStr *abort = scr_str_new("abort", 5);
+        ScrDyn *type = scr_dyn_new_str(abort);
+        scr_str_release(abort);
+        ScrDyn *remove_args[2] = {type, t->listener};
+        ScrDyn *r = scr_et_remove_listener(core, remove_args, 2);
+        if (r) scr_dyn_release(r);
+        scr_dyn_release(type);
+      }
+      /* The listener's closure holds this state: dropping it here ends
+       * the cycle once the signal no longer holds the listener. */
+      if (t->listener) {
+        scr_dyn_release(t->listener);
+        t->listener = NULL;
+      }
+    } else if (t->step == 4) {
+      scr_promise_adapt_copy(t->result, t->inner);
+      scr_tp_abort_release_v(t);
+      return;
+    }
+    t->step++;
+#ifdef __wasi__
+    ScrPromise *settled = scr_promise_settled_void();
+    scr_promise_release(scr_async_spawn_after(settled, &scr_tp_abort_entry, t));
+    scr_promise_release(settled);
+    return;
+#else
+    scr_await_hop();
+#endif
+  }
+}
+
+static ScrPromise *scr_tp_signal(double ms, ScrPromise *value, bool ref, ScrDyn *signal,
+                                 bool immediate) {
+  if (signal->kind == SCR_DYN_UNDEF) {
+    return immediate ? scr_tp_set_immediate_value(value, ref)
+                     : scr_tp_set_timeout_value(ms, value, ref);
+  }
+  bool aborted = false;
+  ScrEventTargetCore *core = scr_et_signal_core_fn ? scr_et_signal_core_fn(signal, &aborted) : NULL;
+  ScrPromise *result = scr_promise_new();
+  if (!core) {
+    scr_dyn_prop_type_fail("options.signal", "an instance of AbortSignal", signal);
+    scr_promise_reject_pending(result);
+    return result;
+  }
+  if (aborted) {
+    scr_tp_throw_abort(signal);
+    scr_promise_reject_pending(result);
+    return result;
+  }
+  ScrTpAbort *t = scr_et_calloc(sizeof *t);
+  t->rc = 1;
+  t->inner = scr_promise_new();
+  t->result = scr_promise_retain(result);
+  t->signal = scr_dyn_retain(signal);
+  t->immediate = immediate;
+  ScrClosure *fire = scr_closure_new((void *)&scr_tp_abort_fire, 2);
+  fire->caps[0] = scr_tp_abort_box(t);
+  fire->caps[1] = scr_box_new_obj(scr_promise_retain_v, scr_promise_release_v, scr_promise_trace_v);
+  scr_box_set_ref(fire->caps[1], scr_promise_retain(value));
+  if (immediate) {
+    t->handle = scr_set_immediate(fire);
+    if (!ref) scr_immediate_unref(t->handle);
+  } else {
+    t->handle = scr_set_timeout_handle(fire, ms);
+    if (!ref) scr_timer_unref(t->handle);
+  }
+  ScrClosure *clo = scr_closure_new((void *)&scr_tp_abort_thunk, 1);
+  clo->caps[0] = scr_tp_abort_box(t);
+  t->listener = scr_dyn_new_func(clo, &scr_tp_abort_thunk, 0, "()", "cancelListenerHandler");
+  ScrStr *abort = scr_str_new("abort", 5);
+  bool duplicate;
+  (void)scr_et_append(core, abort, t->listener, SCR_ET_RESIST, &duplicate);
+  scr_str_release(abort);
+  /* The creation reference moves to the finally waiter. */
+  scr_promise_release(scr_async_spawn_after(t->inner, &scr_tp_abort_entry, t));
+  return result;
+}
+
+ScrPromise *scr_tp_set_timeout_signal(double ms, ScrPromise *value, bool ref, ScrDyn *signal) {
+  return scr_tp_signal(ms, value, ref, signal, false);
+}
+
+ScrPromise *scr_tp_scheduler_wait_signal(double ms, ScrPromise *value, bool ref, ScrDyn *signal) {
+  if (scr_mt_wait_state == 2) {
+    static const char msg[] = "Value of \"this\" must be of type Scheduler";
+    scr_throw_error_msg_code(SCR_ERR_TYPE, msg, sizeof msg - 1, "ERR_INVALID_THIS");
+    return NULL;
+  }
+  if (scr_mt_wait_state == 1) {
+    static const char msg[] =
+        "scheduler.wait with a signal while mock.timers mocks it has no lowering";
+    scr_throw_error_msg_code(SCR_ERR_ERROR, msg, sizeof msg - 1, "SC2020");
+    return NULL;
+  }
+  return scr_tp_signal(ms, value, ref, signal, false);
+}
+
+ScrPromise *scr_tp_set_immediate_signal(ScrPromise *value, bool ref, ScrDyn *signal) {
+  return scr_tp_signal(0, value, ref, signal, true);
 }

@@ -10,10 +10,10 @@ import { ts7Executable } from "./rpc-api.js";
 import { Ts7Session } from "./session.js";
 import { SemanticChecker } from "./semantic-checker.js";
 import { SemanticSnapshot } from "./semantic-model.js";
-import { TypeFlags } from "./enums.js";
+import { SignatureKind, SymbolFlags, TypeFlags } from "./enums.js";
 import { createProgram, Ts7Host } from "./program-adapter.js";
 import type { AstNode } from "./ast-node.js";
-import type { SourceFile } from "./ast-types.js";
+import type { Identifier, SourceFile } from "./ast-types.js";
 
 const tempRoot = process.platform === "win32" ? tmpdir() : "/tmp";
 const protocolPath = (path: string) => path.replaceAll("\\", "/");
@@ -52,9 +52,9 @@ function connect(files: Record<string, string>) {
 }
 
 function declaration(root: SourceFile, name: string): AstNode {
-  for (const statement of root.statements) {
+  for (const statement of root.statements.nodes) {
     if (statement.name?.text === name) return statement;
-    for (const node of statement.declarationList?.declarations ?? [])
+    for (const node of statement.declarationList?.declarations?.nodes ?? [])
       if (node.name?.text === name) return node;
   }
   throw new Error(`Missing declaration ${name}`);
@@ -80,7 +80,7 @@ test("unchanged AST identities receive independent semantic answers after a depe
     const oldType = old.getTypeAtLocation(name);
     const oldSymbol = old.getSymbolAtLocation(name)!;
     expect(old.typeToString(oldType)).toBe("number");
-    expect(old.valueDeclarationOf(oldSymbol)).toBe(declaration(root, "result"));
+    expect(oldSymbol.valueDeclaration).toBe(declaration(root, "result"));
 
     h.paths.set(h.path("dependency.ts"), 'export const value: string = "changed";');
     const second = h.session.updateSnapshot({
@@ -165,11 +165,14 @@ test("all public query and prefetch entry points reject a disposed facade before
     facade.typeToString(type);
     facade.prefetchSourceFile(root);
     const calls: Record<string, () => unknown> = {
-      declarationsOf: () => facade.declarationsOf(symbol),
-      valueDeclarationOf: () => facade.valueDeclarationOf(symbol),
-      signatureDeclaration: () => facade.signatureDeclaration(signature),
       getCallSignatures: () => facade.getCallSignatures(type),
       getConstructSignatures: () => facade.getConstructSignatures(type),
+      getSignaturesOfType: () => facade.getSignaturesOfType(type, SignatureKind.Call),
+      resolveName: () => facade.resolveName("value", SymbolFlags.Value, name),
+      getResolvedSymbol: () => facade.getResolvedSymbol(name as Identifier),
+      getAnyType: () => facade.getAnyType(),
+      getNeverType: () => facade.getNeverType(),
+      getBigIntType: () => facade.getBigIntType(),
       getPropertyOfType: () => facade.getPropertyOfType(type, "missing"),
       prefetchSourceFile: () => facade.prefetchSourceFile(root),
       prefetchSourceFileStructures: () => facade.prefetchSourceFileStructures([]),
@@ -280,8 +283,9 @@ test("negative assignability answers remain independent in both directions", () 
       requests.push(query);
       return JSON.stringify(query.source === 1 && query.target === 2);
     },
-    binary: () => {
-      throw new Error("unexpected binary request");
+    // Object replies are read as bytes; they carry the same JSON.
+    binary(method, payload) {
+      return Buffer.from(this.text(method, payload), "utf8");
     },
   });
   const project = snapshot.addProject("project", () => undefined);
@@ -321,8 +325,9 @@ test("property lookup caches hits and misses by type and name within each projec
         checkFlags: 0,
       });
     },
-    binary: () => {
-      throw new Error("unexpected binary request");
+    // Object replies are read as bytes; they carry the same JSON.
+    binary(method, payload) {
+      return Buffer.from(this.text(method, payload), "utf8");
     },
   });
   const first = snapshot.addProject("first", () => undefined);
@@ -394,8 +399,9 @@ test("member type batches are bounded, reuse warm entries, and isolate absent or
       if (ids.includes(7)) throw new Error("checker panic");
       return JSON.stringify(ids.map((id) => (id === 11 ? null : { id, flags: TypeFlags.Number })));
     },
-    binary: () => {
-      throw new Error("unexpected binary query");
+    // Object replies are read as bytes; they carry the same JSON.
+    binary(method, payload) {
+      return Buffer.from(this.text(method, payload), "utf8");
     },
   });
   const project = snapshot.addProject("members", () => undefined);
