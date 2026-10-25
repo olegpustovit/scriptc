@@ -51,4 +51,6 @@ direct.external = 2;
 console.log("external write snapshot", external, lib.external);
 const { pair: { left, right } } = require("./table.cjs");
 console.log("nested getter pattern", left, right, table.value);
+const { doubled } = require("./split-let.cjs");
+console.log("getter reading this", doubled, table.doubled);
 console.log("main: done");

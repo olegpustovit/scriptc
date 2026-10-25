@@ -750,27 +750,40 @@ function writeRunsAfterInit(write: ts.Node, exporter: ts.SourceFile): boolean {
 export function cjsExportChangesAfterInit(lowerer: Lowerer, symbol: ts.Symbol): boolean {
   const cached = lowerer.cjsLateWrittenExports.get(symbol);
   if (cached !== undefined) return cached;
-  const key = ts.symbolName(symbol);
   const exporter = symbol.declarations[0] && ts.getSourceFileOfNode(symbol.declarations[0]);
   const changes =
     exporter !== undefined &&
-    (memberWritesByName(lowerer).get(key) ?? []).some((write) => {
-      if (!writeRunsAfterInit(write, exporter)) return false;
-      let target = lowerer.checker.getSymbolAtLocation(
-        ts.isPropertyAccessExpression(write) ? write.name : write.argumentExpression,
-      );
-      if (
-        target === undefined &&
-        (isCjsModuleExports(lowerer, write.expression) ||
-          isCjsExportsIdentifier(lowerer, write.expression))
-      )
-        target = lowerer.cjsModuleExportSymbol(ts.getSourceFileOfNode(write), key);
-      if (target !== undefined && target.flags & ts.SymbolFlags.Alias)
-        target = lowerer.checker.getAliasedSymbol(target);
-      return target === symbol;
-    });
+    (memberWritesByName(lowerer).get(ts.symbolName(symbol)) ?? []).some(
+      (write) => writeRunsAfterInit(write, exporter) && writesExport(lowerer, write, symbol),
+    );
   lowerer.cjsLateWrittenExports.set(symbol, changes);
   return changes;
+}
+
+/** Writes to a CommonJS export from modules other than its own. */
+export function cjsExportWritesFromOtherModules(
+  lowerer: Lowerer,
+  symbol: ts.Symbol,
+): MemberWrite[] {
+  const exporter = symbol.declarations[0] && ts.getSourceFileOfNode(symbol.declarations[0]);
+  return (memberWritesByName(lowerer).get(ts.symbolName(symbol)) ?? []).filter(
+    (write) => ts.getSourceFileOfNode(write) !== exporter && writesExport(lowerer, write, symbol),
+  );
+}
+
+function writesExport(lowerer: Lowerer, write: MemberWrite, symbol: ts.Symbol): boolean {
+  let target = lowerer.checker.getSymbolAtLocation(
+    ts.isPropertyAccessExpression(write) ? write.name : write.argumentExpression,
+  );
+  if (
+    target === undefined &&
+    (isCjsModuleExports(lowerer, write.expression) ||
+      isCjsExportsIdentifier(lowerer, write.expression))
+  )
+    target = lowerer.cjsModuleExportSymbol(ts.getSourceFileOfNode(write), ts.symbolName(symbol));
+  if (target !== undefined && target.flags & ts.SymbolFlags.Alias)
+    target = lowerer.checker.getAliasedSymbol(target);
+  return target === symbol;
 }
 
 /** Require destructuring needs storage for getters and data exports that

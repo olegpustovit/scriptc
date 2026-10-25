@@ -95,6 +95,7 @@ import { lowerIdentifierExpr } from "./expressions/identifiers.js";
 import { lowerFieldCompoundValue, lowerIncDec } from "./expressions/updates.js";
 import { lowerTernary } from "./expressions/narrowing.js";
 import {
+  cjsExportTableAccessorOf,
   classFieldTarget,
   lowerPropertyAccessExpr,
   lowerUnionKeyedRead,
@@ -502,6 +503,15 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
     }
   }
   if (expr.kind === ts.SyntaxKind.ThisKeyword) {
+    // A lifted export-table accessor has no receiver: `this.<member>` reads
+    // resolve statically (property-access.ts), and other uses are refused.
+    if (cjsExportTableAccessorOf(expr) !== null) {
+      lowerer.unsupported(
+        "SC1090",
+        expr,
+        "uses of 'this' in a CommonJS export-table accessor other than reading one of its members",
+      );
+    }
     // Only arrows can see an enclosing method's `this` (JS lexical-this);
     // `this` in plain nested functions is already a tsc error under
     // noImplicitThis, so the generic scope walk here is preflight-safe.

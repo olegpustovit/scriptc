@@ -61,13 +61,13 @@ import {
 import { lowerNavigatorMember } from "../builtins/navigator.js";
 import { NODE_COMPAT_VERSION } from "../builtins/process.js";
 import {
+  cjsExportValueByName,
   inlineNamespaceRequireOf,
   lowerWithInlineRequireInit,
   wholeExportValue,
 } from "../cjs-inline-require.js";
 import {
   type FieldTarget,
-  cjsAccessorCall,
   constInitializerOf,
   exactUnionWidening,
   hasClassPayload,
@@ -2576,38 +2576,45 @@ function lowerReplacedExportsRead(
 /** `this.<name>` INSIDE a CJS export-table accessor (test/common's
  * `get localhostIPv4() { if (this.inFreeBSDJail) ... }`): Node binds the
  * getter's receiver to module.exports, so the read is the SIBLING table
- * property — a sibling GETTER's lifted call (per-read evaluation, like
- * any accessor read). Only arrows inherit the binding (a nested function
- * expression's `this` is its own). Null everywhere else — non-getter
- * siblings and absent names keep their per-site fences (none of the
- * probed suite shapes read them). */
+ * member — a sibling getter's lifted call (per-read evaluation, like any
+ * accessor read) or a data member's export value. Only arrows inherit the
+ * binding (a nested function expression's `this` is its own). Members
+ * without a static value are refused. */
 function lowerCjsExportTableThisMember(
   lowerer: Lowerer,
   expr: ts.PropertyAccessExpression,
 ): IrExpr | null {
   if (expr.expression.kind !== ts.SyntaxKind.ThisKeyword || expr.questionDotToken) return null;
-  if (!isJsSourceFile(ts.getSourceFileOfNode(expr))) return null;
-  // The enclosing accessor, crossing only arrow boundaries (arrows
-  // inherit `this`; any other function form rebinds it).
-  let n: ts.Node | undefined = expr.parent;
+  const n = cjsExportTableAccessorOf(expr.expression);
+  if (n === null) return null;
+  const value = cjsExportValueByName(lowerer, ts.getSourceFileOfNode(n), expr.name.text, expr);
+  if (value === null) {
+    lowerer.unsupported(
+      "SC1090",
+      expr,
+      `reading 'this.${expr.name.text}' in a CommonJS export-table accessor (the member has no static value)`,
+    );
+  }
+  return value;
+}
+
+/** The CommonJS export-table accessor whose `this` a `this` expression
+ * reads, crossing only arrow boundaries (arrows inherit `this`; any other
+ * function form rebinds it). */
+export function cjsExportTableAccessorOf(
+  thisExpr: ts.Node,
+): ts.GetAccessorDeclaration | ts.SetAccessorDeclaration | null {
+  if (!isJsSourceFile(ts.getSourceFileOfNode(thisExpr))) return null;
+  let n: ts.Node | undefined = thisExpr.parent;
   while (n !== undefined && !ts.isGetAccessorDeclaration(n) && !ts.isSetAccessorDeclaration(n)) {
-    if (ts.isFunctionLike(n) && !ts.isArrowFunction(n)) return null;
-    if (ts.isSourceFile(n)) return null;
+    if ((ts.isFunctionLike(n) && !ts.isArrowFunction(n)) || ts.isSourceFile(n)) return null;
     n = n.parent;
   }
-  if (
-    n === undefined ||
-    !ts.isObjectLiteralExpression(n.parent) ||
-    !isCjsExportTableLiteral(n.parent)
-  ) {
-    return null;
-  }
-  const sibling = n.parent.properties.nodes.find(
-    (p): p is ts.GetAccessorDeclaration =>
-      ts.isGetAccessorDeclaration(p) && ts.isIdentifier(p.name) && p.name.text === expr.name.text,
-  );
-  if (!sibling) return null;
-  return cjsAccessorCall(lowerer, sibling, locOf(expr));
+  return n !== undefined &&
+    ts.isObjectLiteralExpression(n.parent) &&
+    isCjsExportTableLiteral(n.parent)
+    ? n
+    : null;
 }
 
 /** RegExp.prototype's flag getters and the flag each one reads. */

@@ -12,6 +12,9 @@ module.exports = {
   get value() {
     return ++reads;
   },
+  get doubled() {
+    return this.n * 2;
+  },
   get pair() {
     reads++;
     return { left: reads, right: reads };

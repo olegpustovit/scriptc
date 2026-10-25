@@ -8,6 +8,8 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { bindingNeverReassigned } from "./binding-analysis.js";
 import { isRebindableFunction } from "./rebindable-functions.js";
+import { cjsExportWritesFromOtherModules } from "./cjs-inline-require.js";
+import { isCjsJsFile } from "../program.js";
 
 /** The function an export binding holds, when its declaration shows it. */
 function exportedFunction(lowerer: Lowerer, decl: ts.Node): ts.Node | null {
@@ -301,7 +303,13 @@ export function refuseModuleMemberThis(
 ): void {
   const symbol = lowerer.resolveValueSymbol(member);
   if (symbol === null) return;
-  for (const decl of symbol.declarations) {
+  const exporter = symbol.declarations[0] && ts.getSourceFileOfNode(symbol.declarations[0]);
+  // Another module can replace a CommonJS export (`lib.f = function ...`).
+  const writes =
+    exporter !== undefined && isCjsJsFile(exporter, lowerer.program)
+      ? cjsExportWritesFromOtherModules(lowerer, symbol)
+      : [];
+  for (const decl of [...symbol.declarations, ...writes]) {
     const fn = exportedFunction(lowerer, decl);
     if (fn === null || !readsOwnThis(lowerer, fn)) continue;
     lowerer.unsupported(

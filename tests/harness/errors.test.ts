@@ -482,6 +482,59 @@ console.log("after");
     );
   });
 
+  test.for([
+    [
+      "through its module binding",
+      "console.log(lib.f());",
+      "calling a module export that reads 'this' through its module binding",
+    ],
+    [
+      "through an inline require of a re-export",
+      'console.log(require("./wrap.cjs").f());',
+      `calling 'f' through require\\("\\./wrap\\.cjs"\\) when the function may read 'this'`,
+    ],
+  ])(
+    "an export another module replaces with a function that reads this keeps the receiver fence %s",
+    async ([, call, message]) => {
+      const r = await compileAndRun(
+        "replaced-export-reads-this",
+        `const lib = require("./lib.cjs");
+lib.f = function () { return this.n; };
+console.log("before");
+${call}
+`,
+        "cjs",
+        {
+          "lib.cjs": "exports.n = 7;\nexports.f = function () { return 1; };\n",
+          "wrap.cjs": 'var lib; lib = require("./lib.cjs"); module.exports = lib;\n',
+        },
+      );
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toBe("before\n");
+      expect(r.stderr).toMatch(
+        new RegExp(
+          `^Uncaught Error: ${message}.*\\[SC1090 at .*replaced-export-reads-this\\.cjs:4\\]\\n$`,
+        ),
+      );
+    },
+  );
+
+  test("an export-table getter's own 'this' keeps a named refusal", async () => {
+    const r = await compileAndRun(
+      "export-table-getter-this",
+      `console.log("before");
+console.log(require("./lib.cjs").kind);
+`,
+      "cjs",
+      { "lib.cjs": "module.exports = { get kind() { return typeof this; } };\n" },
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("before\n");
+    expect(r.stderr).toMatch(
+      /^Uncaught Error: uses of 'this' in a CommonJS export-table accessor other than reading one of its members.*\[SC1090 at .*lib\.cjs:1\]\n$/,
+    );
+  });
+
   test("a changing CommonJS export ESM-imported through two modules keeps a named refusal", async () => {
     // Node copies the export separately when each module links; scriptc
     // keeps one copy per export.
