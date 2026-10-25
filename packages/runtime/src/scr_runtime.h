@@ -31,6 +31,7 @@
 #include "scr_string_methods.h"
 #include "scr_qs.h"
 #include "scr_array.h"
+#include "scr_ieee754.h"
 #include "scr_regex.h"
 #include "scr_map.h"
 #include "scr_closure.h"
