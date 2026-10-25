@@ -1812,15 +1812,19 @@ class Analyzer {
     }
     if (ts.isPrefixUnaryExpression(e) || ts.isPostfixUnaryExpression(e)) {
       const operand = e.operand;
-      this.expr(operand);
+      const value = this.expr(operand);
+      if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.ExclamationToken)
+        return this.constNode(this.prim("boolean"));
+      // `+x` is a number (a bigint throws); `-x`, `~x`, `++`/`--` keep a bigint.
+      if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.PlusToken)
+        return this.constNode(this.prim("number"));
+      const result = this.numericResult([value]);
       if (
         e.operator === ts.SyntaxKind.PlusPlusToken ||
         e.operator === ts.SyntaxKind.MinusMinusToken
       )
-        this.assignTo(operand, this.constNode(this.prim("number")));
-      if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.ExclamationToken)
-        return this.constNode(this.prim("boolean"));
-      return this.constNode(this.prim("number"));
+        this.assignTo(operand, result);
+      return result;
     }
     if (ts.isSpreadElement(e)) return this.expr(e.expression);
     if (ts.isTaggedTemplateExpression(e)) return this.taggedTemplate(e);
@@ -2352,16 +2356,11 @@ class Analyzer {
       return n;
     }
     if (op >= ts.SyntaxKind.FirstCompoundAssignment && op <= ts.SyntaxKind.LastCompoundAssignment) {
-      this.expr(e.left);
-      this.expr(e.right);
-      const result = this.constNode(
-        op === ts.SyntaxKind.PlusEqualsToken ? this.top : this.prim("number"),
-      );
-      if (op === ts.SyntaxKind.PlusEqualsToken) {
-        this.nodes[result]!.atoms.clear();
-        this.add(result, this.prim("string"));
-        this.add(result, this.prim("number"));
-      }
+      const lv = this.expr(e.left);
+      const rv = this.expr(e.right);
+      // Arithmetic on bigints answers bigints; `+=` may also concatenate.
+      const result = this.numericResult([lv, rv]);
+      if (op === ts.SyntaxKind.PlusEqualsToken) this.add(result, this.prim("string"));
       this.assignTo(e.left, result);
       return result;
     }
@@ -2408,13 +2407,15 @@ class Analyzer {
           )
             this.add(n, this.prim("number"));
           if (a.kind === "top") this.add(n, this.prim("number"));
+          if (a.kind === "top" || (a.kind === "prim" && a.label === "bigint"))
+            this.add(n, this.prim("bigint"));
         };
         this.on(l, strOrNum);
         this.on(r, strOrNum);
         return n;
       }
       default:
-        return this.constNode(this.prim("number"));
+        return this.numericResult([l, r]);
     }
   }
 
@@ -3833,6 +3834,19 @@ class Analyzer {
     }
     this.reassignMemo.set(decl, out);
     return out;
+  }
+
+  /** The result of arithmetic over the operands: a number, or a bigint
+   * where an operand may be one. */
+  numericResult(operands: number[]): number {
+    const n = this.newNode();
+    this.add(n, this.prim("number"));
+    for (const o of operands)
+      this.on(o, (a) => {
+        if (a.kind === "top" || (a.kind === "prim" && a.label === "bigint"))
+          this.add(n, this.prim("bigint"));
+      });
+    return n;
   }
 
   /** Re-run deferred field copies until nothing new flows. */

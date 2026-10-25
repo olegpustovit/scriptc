@@ -16,6 +16,7 @@ import {
   type ShapeOverlayPlan,
 } from "./overlay.js";
 import { attributeOverlayRefusals } from "./fallback.js";
+import { checksInferredFact } from "./inferred-checks.js";
 import { planStaticObjectRewrites, type StaticObjectRewrites } from "./static-objects.js";
 import { isJsSourceFile } from "../program.js";
 import { buildShapeReport } from "./report.js";
@@ -142,10 +143,23 @@ export function beginShapeOverlayBuild(): void {
   droppedAnnotations = 0;
 }
 
+/** Turns the overlay off for the rest of the build (true), or back on
+ * (false): the pipeline compares a load without it when the overlay's
+ * program fails a check the program without it passes. */
+export function setShapeOverlayDropped(dropped: boolean): void {
+  overlayDropped = dropped;
+  droppedAnnotations = dropped ? overlayAnnotations : 0;
+}
+
 /** Whether the current load has overlay files or structural rewrites. */
 export function shapeOverlayActive(): boolean {
   const { classes, functions } = staticObjectStats;
-  return overlayFiles.size > 0 || renderedFiles.size > 0 || classes + functions > 0;
+  return (
+    overlayFiles.size > 0 ||
+    renderedFiles.size > 0 ||
+    staticRewriteFiles.size > 0 ||
+    classes + functions > 0
+  );
 }
 
 /** The overlay's answer to refused lowering diagnostics: it excludes what
@@ -361,10 +375,14 @@ export function markInferredFactChecks(
     if (x === null || typeof x !== "object") return;
     const node = x as {
       kind?: unknown;
-      loc?: { file: string; start: number };
+      loc?: { file: string; start: number; end: number };
       inferredSite?: string;
     };
-    if (node.kind === "dynCheck" && node.loc !== undefined && overlayFiles.has(node.loc.file)) {
+    if (
+      node.kind === "dynCheck" &&
+      node.loc !== undefined &&
+      checksInferredFact(program, node.loc.file, node.loc.start, node.loc.end)
+    ) {
       const pkg = npmStaticPackageOfPath(node.loc.file) ?? "";
       const rel = node.loc.file.split("/node_modules/").pop() ?? node.loc.file;
       node.inferredSite = `${pkg} ${rel}:${lineOf(node.loc.file, node.loc.start)}`;

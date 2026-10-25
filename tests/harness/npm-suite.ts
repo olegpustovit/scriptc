@@ -112,14 +112,8 @@ const KNOWN: Record<string, Known> = {
   "workspace-unclean": { build: "SC2013" },
 };
 
-/** Where the overlay changes how a case KNOWN refuses. commander's help
- * groups items in a Map the default build refuses (SC1090); the overlay
- * types that code, so `--help` prints the help and stops at the next
- * refusal, an `emit` with a computed event name (SC2020). */
-const OVERLAY_KNOWN: Record<string, Known> = {
-  "commander-calc": { run: "SC2020", argvs: [["--help"]] },
-  "commander-calc-async": { run: "SC2020", argvs: [["--help"]] },
-};
+/** Where the overlay changes how a case KNOWN refuses (none today). */
+const OVERLAY_KNOWN: Record<string, Known> = {};
 
 /** Per-case timeouts past the default 120 s: the undici cases compile the
  * built-in undici implementation's module graph, the zod 3 cases (zod3,

@@ -4,6 +4,7 @@ import {
   beginShapeOverlayBuild,
   excludeRefusedOverlay,
   restoreShapeOverlayState,
+  setShapeOverlayDropped,
   shapeOverlayActive,
   shapeOverlayReport,
 } from "./shape-inference/index.js";
@@ -536,6 +537,30 @@ function loadFrontend(
   // and library builds with a package-specific diagnostic.
   let load = reusableScout ?? loadProgram(entryPath, { npmStatic: requested, externalTypes });
   let preflight = reusablePreflight ?? checkPreflight(load);
+  // Shape inference never makes the preflight fail: when the overlay's
+  // program reports diagnostics the program without it does not (its type
+  // references can load package files the program would not), the build
+  // continues without the overlay.
+  if (preflight.length > 0 && load.shapeOverlayState !== undefined) {
+    restoreShapeOverlayState(load.shapeOverlayState);
+    if (shapeOverlayActive()) {
+      const key = (d: ScrDiagnostic): string => `${d.code}|${d.loc.file}|${d.loc.start}`;
+      setShapeOverlayDropped(true);
+      const plain = loadProgram(entryPath, { npmStatic: requested, externalTypes });
+      const plainPreflight = checkPreflight(plain);
+      const known = new Set(plainPreflight.map(key));
+      if (preflight.some((d) => !known.has(key(d)))) {
+        load.dispose();
+        load = plain;
+        preflight = plainPreflight;
+        if (process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] !== undefined)
+          process.stderr.write(`[shape-fallback] preflight: the overlay's program failed; overlay off\n`);
+      } else {
+        plain.dispose();
+        setShapeOverlayDropped(false);
+      }
+    }
+  }
   // Library mode's fixpoint: the opted-in packages' files joined the
   // program just now, and THEIR bare edges (import statements and
   // top-level requires) name packages the scout could not see. Judge each
