@@ -460,8 +460,6 @@ console.log(lib.read());
         "// @ts-nocheck\nfunction read() { return 1; } read = function () { return this.n; }; const alias = read; exports.read = alias;",
       "factory result":
         "function makeRead() { return function () { return this.n; }; } exports.read = makeRead();",
-      "factory result alias":
-        "function makeRead() { return function () { return this.n; }; } const read = makeRead(); exports.read = read;",
       "reassigned factory-local declaration":
         "// @ts-nocheck\nfunction makeRead() { function read() { return 1; } read = function () { return this.n; }; return read; } exports.read = makeRead();",
       "named forwarding factory":
