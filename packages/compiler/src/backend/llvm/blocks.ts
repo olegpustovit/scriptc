@@ -59,6 +59,18 @@ export class BlockBuilder {
     if (this.cur.term === null) this.cur.lines.push(`  ${this.withDebugLocation(s)}`);
   }
 
+  /** The current block's last instruction (with its indentation and any
+   * debug attachment), or null when the block is empty or terminated. */
+  lastLine(): string | null {
+    if (this.cur.term !== null) return null;
+    return this.cur.lines[this.cur.lines.length - 1] ?? null;
+  }
+
+  /** Removes the current block's last instruction. */
+  dropLastLine(): void {
+    if (this.cur.term === null) this.cur.lines.pop();
+  }
+
   private withDebugLocation(s: string): string {
     if (this.debugLocation === null || s.trimStart().startsWith(";")) return s;
     // Instruction comments must follow the attachment. Quoted LLVM operands

@@ -604,14 +604,15 @@ test("checked field receivers borrow only the successful projection", () => {
     else_: narrow(ref(union)),
   };
   const llvm = work(text(child(checked)), union);
-  expect(llvm).toContain("@scr_throw_node_coded");
+  // The throw tail-calls its stub, which makes the call (throw-stubs.ts).
+  expect(llvm).toContain("@sc_throw_tail.scr_throw_node_coded.");
   // The throw always leaves an exception pending: it unwinds directly.
   expect(llvm).not.toMatch(PENDING_CHECK);
   expect(llvm).not.toContain("@scr_union_retain_v");
   expect(llvm).not.toMatch(/call ptr @sc_rretain_/);
   const captured = work(text(child(checked)), union, true);
   expect(captured).not.toContain("@scr_box_get_ref");
-  expect(captured).toContain("@scr_throw_node_coded");
+  expect(captured).toMatch(/@(?:sc_throw_tail\.)?scr_throw_node_coded[.(]/);
 });
 
 function sharedFieldModule(prefixes: IrType[][], fieldType: IrType): IrModule {

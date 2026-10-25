@@ -649,9 +649,15 @@ test("published ProgramLifetime instances use the published mark every other obj
   expect(llvm).toContain("%id = and i32 %idw, 268435455");
   // The frozen-object guard of the store tests the top bit: an unpublished
   // instance stays writable.
+  // The refusal tail-calls its throw stub (throw-stubs.ts).
   const store =
-    llvm.split(/^define /m).find((fn) => fn.includes("call void @scr_throw_published_field(")) ??
-    "";
+    llvm
+      .split(/^define /m)
+      .find(
+        (fn) =>
+          fn.includes("@sc_throw_tail.scr_throw_published_field.") &&
+          !/^internal \S+ @sc_throw_tail\./.test(fn),
+      ) ?? "";
   expect(store).toMatch(/icmp slt i32 %\S+, 0/);
   expect(store).toContain("call void @scr_publish(ptr");
   // 32-bit targets use 2^31.

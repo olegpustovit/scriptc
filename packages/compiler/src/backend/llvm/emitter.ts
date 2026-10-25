@@ -125,6 +125,7 @@ import {
   SCALAR_UNION_RESULT,
   type Int32Abi,
 } from "./int32-abi.js";
+import { parseThrowCall, throwStubTypeCode, type ThrowStub } from "./throw-stubs.js";
 import { type Int32Local } from "./int32-locals.js";
 import { findIntegerClones, NO_INTEGER_CLONES, type IntegerClones } from "./integer-clones.js";
 import { exactInteger, narrowInteger, widenInteger, type LlInteger } from "./integer-values.js";
@@ -1360,6 +1361,9 @@ export class LlEmitter {
   needsBadTag = false;
   needsBadKey = false;
   needsRetainBox = false;
+  /** Throw stubs requested by tail-called throw paths, by symbol
+   * (tailThrowStub; defined in helperDefs). */
+  readonly throwStubs = new Map<string, ThrowStub>();
   /** Inline RC fast-path helpers requested by call sites (shapes.ts); null
    * when inline RC is off. */
   readonly rcHelpers: Set<string> | null;
@@ -3651,6 +3655,8 @@ export class LlEmitter {
         const t = this.llType(this.currentReturnType);
         if (t === "double" || t === "i1") terminator = `ret ${t} ${passThrough}`;
       }
+      if (!target && this.currentCoro === null && !this.inLandingPad && this.tailThrow(terminator))
+        return;
       this.B.terminate(terminator);
       return;
     }
@@ -3660,6 +3666,54 @@ export class LlEmitter {
       this.unwindCleanups.set(key, cleanup);
     }
     this.B.br(cleanup.label);
+  }
+
+  /** Ends a throw path whose block ends in the runtime throw call and whose
+   * unwind leaves the function with nothing to release: the call and the
+   * terminator become one tail call of a cold stub that makes the same call
+   * and then returns the same dummy value, or raises. The tail call compiles
+   * to a jump, so the throw path needs no stack frame and does not hold the
+   * function's register saves at its entry (LLVM's shrink-wrapping places
+   * one save point, which must dominate every block that calls). Functions
+   * that pop a stack-trace frame on return keep the call: the throw must
+   * capture the frame before the pop. */
+  private tailThrow(terminator: string): boolean {
+    const B = this.B;
+    if (B.returnEpilogue !== null) return false;
+    const line = B.lastLine();
+    if (line === null) return false;
+    const call = parseThrowCall(line);
+    if (call === null) return false;
+    const raise = terminator === UNWIND_RAISE;
+    if (!raise && !terminator.startsWith("ret ")) return false;
+    const ret = this.currentInt32Result
+      ? "i32"
+      : this.currentUnionResult
+        ? SCALAR_UNION_RESULT
+        : this.llType(this.currentReturnType);
+    const types = call.args.map((arg) => arg.type);
+    const name = `sc_throw_tail.${call.callee}.${types.map(throwStubTypeCode).join("")}.${raise ? "raise" : throwStubTypeCode(ret)}`;
+    if (!this.throwStubs.has(name)) {
+      this.throwStubs.set(name, {
+        callee: call.callee,
+        types,
+        nounwind: call.nounwind,
+        ret,
+        terminator: raise ? UNWIND_RAISE : terminator,
+      });
+    }
+    if (raise) this.declare(UNWIND_RAISE_DECLARATION);
+    B.dropLastLine();
+    const args = call.args.map((arg) => `${arg.type} ${arg.value}`).join(", ");
+    if (ret === "void") {
+      B.line(`tail call void @${name}(${args})`);
+      B.terminate("ret void");
+    } else {
+      const result = B.tmp();
+      B.line(`${result} = tail call ${ret} @${name}(${args})`);
+      B.terminate(`ret ${ret} ${result}`);
+    }
+    return true;
   }
 
   /** Loads the running thread's exact pending word (ELF worker
@@ -5317,6 +5371,7 @@ export class LlEmitter {
         needsRetainBox: this.needsRetainBox,
       },
       publishedNamesSym: this.publishedNamesSym,
+      throwStubs: [...this.throwStubs],
       rcHelpers: this.rcHelpers === null ? [] : [...this.rcHelpers],
       immortalValues: [...this.immortalValues],
       fnValues: [...this.fnValues],
@@ -5353,6 +5408,8 @@ export class LlEmitter {
     this.needsBadKey ||= flags.needsBadKey;
     this.needsRetainBox ||= flags.needsRetainBox;
     this.publishedNamesSym ??= chunk.publishedNamesSym;
+    for (const [name, stub] of chunk.throwStubs)
+      if (!this.throwStubs.has(name)) this.throwStubs.set(name, stub);
     if (this.rcHelpers !== null) for (const key of chunk.rcHelpers) this.rcHelpers.add(key);
     for (const name of chunk.immortalValues) this.immortalValues.add(name);
     for (const name of chunk.fnValues) this.fnValues.add(name);

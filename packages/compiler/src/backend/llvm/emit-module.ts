@@ -65,6 +65,7 @@ import { STRING_READ_HELPERS, stringScanDecl, stringScanInline } from "./string-
 import { emitLibraryIdentityLines } from "../library-identity-markers.js";
 import { InternalCompilerError } from "../../errors.js";
 import { targetCpuAttribute } from "../target-cpu.js";
+import { throwStubDefs } from "./throw-stubs.js";
 import type { IrFunction } from "../../ir/ir.js";
 
 /** The function bodies emitted in `chunks` contiguous ranges, each by its
@@ -1369,6 +1370,7 @@ export function helperDefs(emitter: LlEmitter): string[] {
       "scriptc: TypeError: record has no key (typed slot — no undefined is representable)\n",
     );
   }
+  defs.push(...throwStubDefs(emitter.throwStubs, FN_ATTRS));
   if (emitter.needsRetainBox) {
     // scr_box_retain is a static inline (increment-unless-immortal);
     // emitted once with internal linkage, like the record retains.

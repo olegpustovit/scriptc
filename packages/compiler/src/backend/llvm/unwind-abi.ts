@@ -248,8 +248,14 @@ export const UNWIND_RAISE_DECLARATION = "declare void @scr_unwind_raise() cold";
  * cleanups that scr_unwind_raise's forced unwind runs. */
 export const UNWIND_PERSONALITY = "personality ptr @__gcc_personality_v0";
 
-/** An unwind leaving the function: a raise, or a landing pad's `resume`. */
-const UNWINDS = /call void @scr_unwind_raise\(\)|\n\s+resume /;
+/** A tail call of a throw stub that raises (throw-stubs.ts): the calling
+ * function's raise, made from the stub's frame. */
+const RAISE_STUB_CALL = /tail call [^@\n]*@sc_throw_tail\.[\w$.-]*\.raise\(/;
+/** An unwind leaving the function: a raise, a raising throw stub's tail
+ * call, or a landing pad's `resume`. */
+const UNWINDS = new RegExp(
+  `call void @scr_unwind_raise\\(\\)|${RAISE_STUB_CALL.source}|\\n\\s+resume `,
+);
 /** A pending-flag test: the thread's exception word, the active cell, or the runtime query. */
 const PENDING_TEST = /@scr_exc_flag\b|%exc\.cell\b|@scr_exc_active\b|@scr_exc_pending\(/;
 
@@ -294,7 +300,8 @@ function argumentsEnd(line: string, open: number): number {
 function markNounwind(line: string): string {
   const call = line.indexOf("call ");
   const callee = CALLEE.exec(line.slice(call));
-  if (callee === null || callee[0] === "@scr_unwind_raise(") return line;
+  if (callee === null || callee[0] === "@scr_unwind_raise(" || RAISE_STUB_CALL.test(line))
+    return line;
   const close = argumentsEnd(line, call + callee.index + callee[0].length - 1);
   return close >= line.length
     ? line

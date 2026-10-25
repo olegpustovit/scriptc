@@ -7,6 +7,7 @@
  * and the range's text is renamed to those numbers. */
 import type { DebugRequest } from "./debug-info.js";
 import type { LlEmitter } from "./emitter.js";
+import type { ThrowStub } from "./throw-stubs.js";
 
 /** One event of a range's emission, in order. */
 export type JournalEntry =
@@ -112,6 +113,7 @@ export interface ChunkResult {
     readonly needsRetainBox: boolean;
   };
   readonly publishedNamesSym: string | null;
+  readonly throwStubs: readonly (readonly [string, ThrowStub])[];
   readonly rcHelpers: readonly string[];
   readonly immortalValues: readonly string[];
   readonly fnValues: readonly string[];
