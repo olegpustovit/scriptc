@@ -1622,6 +1622,13 @@ class Analyzer {
   varDecl(d: ts.VariableDeclaration): void {
     const b = this.binding(d);
     if (d.initializer !== undefined) this.edge(this.expr(d.initializer), b);
+    else {
+      // `let x;` holds undefined until it is assigned (a for-in/for-of
+      // binding gets its values from the loop).
+      const loop = d.parent?.parent;
+      if (loop === undefined || !(ts.isForOfStatement(loop) || ts.isForInStatement(loop)))
+        this.add(b, this.prim("undefined"));
+    }
     this.bindPattern(d.name, b);
   }
 

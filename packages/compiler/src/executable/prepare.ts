@@ -68,11 +68,14 @@ export function prepareExecutableModule(
     if (fe.preflight.length > 0) return fail(fe.preflight);
 
     try {
-      lowered = fe.lower({
-        targetPlatform: buildPlatform,
-        ...(ffi !== null ? { ffiImports: ffi.functions } : {}),
-        ...(opts.tier !== undefined ? { tierMode: opts.tier } : {}),
-      });
+      lowered = fe.lower(
+        {
+          targetPlatform: buildPlatform,
+          ...(ffi !== null ? { ffiImports: ffi.functions } : {}),
+          ...(opts.tier !== undefined ? { tierMode: opts.tier } : {}),
+        },
+        (module) => validateModule(module).length === 0,
+      );
       timing("lower");
     } catch (e) {
       // The last-resort panic fence: an upstream tsgo panic that crossed a
