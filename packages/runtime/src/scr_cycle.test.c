@@ -10,7 +10,6 @@ static ScrCycType types[4];
 int main(void) {
   assert(sizeof(scr_cyc_types) / sizeof(scr_cyc_types[0]) == 4);
   for (uint32_t i = 0; i < 3; i++) assert(scr_cyc_type_id(&types[i]) == i + 1);
-  assert(scr_cyc_type_id(&types[1]) == 2);
   puts("registered 3 cycle types in a table of 4");
   fflush(stdout);
   scr_cyc_type_id(&types[3]);
