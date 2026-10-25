@@ -2472,7 +2472,8 @@ export class Lowerer {
    * is `unknown` or `any` from a slot the program declares (a variable,
    * field, parameter, return type or `unknown[]` element; a library
    * parameter typed `any` only through a type argument), it is thrown, or
-   * it is a member of such a literal. Its value is built as a dynamic
+   * it is a member of such a literal, and it holds data only (no methods,
+   * accessors or function members). Its value is built as a dynamic
    * object: no type the program wrote gives it a native layout, and a later
    * checked cast adopts it (dyn.adoptShared), so every holder keeps one
    * identity. A library parameter the declarations type `any` or `unknown`
@@ -2480,6 +2481,21 @@ export class Lowerer {
    * the native literal. */
   untypedLiteralContext(x: ts.Expression): boolean {
     if (isJsSourceFile(ts.getSourceFileOfNode(x))) return false;
+    // Data only: a literal with methods, accessors or function members is an
+    // object with behavior, which keeps its native layout (and boxed form).
+    if (
+      ts.isObjectLiteralExpression(x) &&
+      x.properties.nodes.some((p) => {
+        if (!ts.isPropertyAssignment(p))
+          return !ts.isShorthandPropertyAssignment(p) && !ts.isSpreadAssignment(p);
+        let init: ts.Expression = p.initializer;
+        while (ts.isParenthesizedExpression(init)) init = init.expression;
+        return (
+          ts.isFunctionExpression(init) || ts.isArrowFunction(init) || ts.isClassExpression(init)
+        );
+      })
+    )
+      return false;
     let node: ts.Node = x;
     while (node.parent !== undefined && ts.isParenthesizedExpression(node.parent))
       node = node.parent;
