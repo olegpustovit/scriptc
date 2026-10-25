@@ -633,6 +633,8 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   // DOMException clone shares the option validation.
   "dyn.structuredClone",
   "dyn.declAdopt",
+  // A boxed native record or array the cast would copy into another layout.
+  "dyn.adoptShared",
   "dyn.cloneMissing",
   "dyn.cloneTransferFail",
   "dyn.cloneTransferFailWith",

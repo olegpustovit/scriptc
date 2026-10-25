@@ -50,6 +50,7 @@ import { isConstAssertionTypeNode, unitOnlyUnion } from "../../type-mapper.js";
 import { assertsGlobalObject, extractionCopiesReference } from "../assertion-identity.js";
 import { iterableSlotValue, iterableUnionOf } from "../iterable-values.js";
 import { isDeclBoundaryTypeNode } from "../../decl-projection.js";
+import { isMessageListenerCall } from "./message-listeners.js";
 
 /** `c ? a : b`. An explicit destination constructs each branch at that
  * layout before joining it. Without one, retain the expression's inferred
@@ -1575,7 +1576,7 @@ export function lowerAsExpression(
     // contains undefined, so casts over parse results keep failing on
     // non-string values with the usual path-annotated TypeError.
     if (target.kind === "union" && lowerer.dynConvertible(target)) {
-      return { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) };
+      return checkedDynCast(lowerer, expr, inner, target);
     }
     // Uint8Array targets: the checked-dynamic tree carries a bytes kind now (converted
     // stdin chunks) — the extraction validates the kind and copies out.
@@ -1619,18 +1620,131 @@ export function lowerAsExpression(
         `number, string, boolean, records, arrays, and unions of those)`,
     );
   }
-  // A record or array built from a dynamic value another holder may still
-  // reference keeps one identity with it (adoptingCast). A fresh parse
-  // result has no other holder, and keeps the fused schema-directed parse.
-  if (holdsReference(lowerer, target) && !isFreshJsonParse(inner)) {
+  return checkedDynCast(lowerer, expr, inner, target);
+}
+
+/** The checked conversion of a dynamic value. A record or array built from
+ * a value another holder may still reference keeps one identity with it
+ * (adoptingCast); only a source nothing else can hold (freshDynSource)
+ * converts outright, which keeps the fused `JSON.parse(text) as T`. */
+function checkedDynCast(
+  lowerer: Lowerer,
+  expr: ts.AsExpression | ts.TypeAssertion,
+  inner: IrExpr,
+  target: IrType,
+): IrExpr {
+  if (
+    holdsReference(lowerer, target) &&
+    !freshDynSource(lowerer, expr, inner) &&
+    !resultOnlyRead(expr)
+  ) {
     return adoptingCast(lowerer, inner, target, locOf(expr), "dyn.adoptShared");
   }
   return { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) };
 }
 
-/** `JSON.parse(text)` itself: a value nothing else references yet. */
-function isFreshJsonParse(e: IrExpr): boolean {
-  return e.kind === "libCall" && e.fn === "json.parse";
+/** A cast whose result only serves one member read (`(value as T).name`,
+ * `(value as T[]).length`, `(value as T).method()`): the converted value is
+ * never stored, compared or written, so whether it is the source itself or a
+ * copy cannot be observed. */
+function resultOnlyRead(expr: ts.AsExpression | ts.TypeAssertion): boolean {
+  let node: ts.Node = expr;
+  while (node.parent !== undefined && ts.isParenthesizedExpression(node.parent)) node = node.parent;
+  const access = node.parent;
+  if (
+    access === undefined ||
+    !(
+      (ts.isPropertyAccessExpression(access) || ts.isElementAccessExpression(access)) &&
+      access.expression === node
+    )
+  )
+    return false;
+  let use: ts.Node = access;
+  while (use.parent !== undefined && ts.isParenthesizedExpression(use.parent)) use = use.parent;
+  const parent = use.parent;
+  if (parent === undefined) return true;
+  if (
+    ts.isBinaryExpression(parent) &&
+    parent.left === use &&
+    ts.isAssignmentOperator(parent.operatorToken.kind)
+  )
+    return false;
+  if (
+    (ts.isPrefixUnaryExpression(parent) || ts.isPostfixUnaryExpression(parent)) &&
+    (parent.operator === ts.SyntaxKind.PlusPlusToken ||
+      parent.operator === ts.SyntaxKind.MinusMinusToken)
+  )
+    return false;
+  if (ts.isDeleteExpression(parent)) return false;
+  return true;
+}
+
+/** A cast operand nothing else can hold: a value this expression creates
+ * (`JSON.parse(text)`, `await response.json()`), or a structured clone the
+ * runtime delivers once and the program reads at this site only (`workerData`
+ * read nowhere else; the parameter of the program's one `"message"`
+ * listener, read nowhere else in it). Anything else is adopted. */
+function freshDynSource(
+  lowerer: Lowerer,
+  expr: ts.AsExpression | ts.TypeAssertion,
+  inner: IrExpr,
+): boolean {
+  if (inner.kind === "libCall" && inner.fn === "json.parse") return true;
+  if (
+    inner.kind === "awaitExpr" &&
+    inner.value.kind === "libCall" &&
+    inner.value.fn === "fetch.responseJson"
+  )
+    return true;
+  const facts = lowerer.structuredCloneReads();
+  if (inner.kind === "libCall" && inner.fn === "worker.data") return facts.workerData === 1;
+  let operand: ts.Expression = expr.expression;
+  while (ts.isParenthesizedExpression(operand)) operand = operand.expression;
+  if (!ts.isIdentifier(operand) || inner.kind !== "varRef" || facts.messageListeners !== 1)
+    return false;
+  const symbol = lowerer.checker.getSymbolAtLocation(operand);
+  const param = symbol?.valueDeclaration;
+  if (!param || !ts.isParameter(param) || !ts.isIdentifier(param.name)) return false;
+  const fn = param.parent;
+  if (
+    !(ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) ||
+    fn.parameters.nodes[0] !== param ||
+    !isMessageListener(fn)
+  )
+    return false;
+  let reads = 0;
+  const name = param.name.text;
+  const visit = (node: ts.Node): void => {
+    if (ts.isIdentifier(node) && node.text === name && node !== param.name) reads++;
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(fn, visit);
+  return reads === 1;
+}
+
+/** The listener argument of `<x>.on("message", fn)` (also once,
+ * addListener, prependListener, prependOnceListener) registered once: at
+ * module level, outside any function, class or loop, so one emitter can
+ * never hand the same message to two registrations of it. */
+function isMessageListener(fn: ts.Node): boolean {
+  const call = fn.parent;
+  if (!call || !ts.isCallExpression(call) || call.arguments.nodes[1] !== fn) return false;
+  if (!isMessageListenerCall(call)) return false;
+  for (let p = call.parent; p !== undefined && !ts.isSourceFile(p); p = p.parent) {
+    if (
+      ts.isFunctionLike(p) ||
+      ts.isClassDeclaration(p) ||
+      ts.isClassExpression(p) ||
+      ts.isClassStaticBlockDeclaration(p) ||
+      ts.isForStatement(p) ||
+      ts.isForInStatement(p) ||
+      ts.isForOfStatement(p) ||
+      ts.isWhileStatement(p) ||
+      ts.isDoStatement(p)
+    )
+      return false;
+  }
+  return true;
 }
 
 /** True when a type holds a record or an array somewhere (values whose

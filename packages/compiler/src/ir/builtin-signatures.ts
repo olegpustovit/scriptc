@@ -3958,8 +3958,9 @@ function buildLibFnSignatures() {
     /** dyn.declAdopt for every other checked cast of a dynamic value to a
      * record or array (`value as T`): a shared source object or array
      * becomes a live capsule of the value built from it. A node that is not
-     * plain data, or that the value holds twice, keeps its separate copy;
-     * never throws. */
+     * plain data, or that the value holds twice, keeps its separate copy.
+     * Throws the path TypeError when a boxed native record or array was
+     * copied into another layout (two objects where the program has one). */
     "dyn.adoptShared": { argTypes: [DYN, DYN], result: VOID },
     "dyn.cloneMissing": { argTypes: [], result: DYN },
     /** structuredClone with a NON-EMPTY transfer array of static values:

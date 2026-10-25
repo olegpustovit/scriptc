@@ -143,6 +143,36 @@ describe(`dynamic-boundary checks (scriptc-only${sanitize ? ", sanitized" : ""})
     ).toBe("");
   });
 
+  test("a boxed native value cast to another layout throws instead of copying", async () => {
+    // A copy would leave two objects where the program has one (Node's `as`
+    // is a no-op): the cast says how to keep one object or copy explicitly.
+    const r = await compileAndRun(
+      "native-layout-casts",
+      `type Point = { x: number; y: number };
+const dict: Record<string, number> = { x: 1, y: 2 };
+const v: unknown = dict;
+try { const p = v as Point; console.log(p.x); } catch (e) { console.log(e instanceof TypeError, (e as Error).message); }
+const raw: unknown = JSON.parse('{"inner":null}');
+(raw as Record<string, unknown>).inner = dict;
+try { const o = raw as { inner: Point }; console.log(o.inner.x); } catch (e) { console.log((e as Error).message); }
+const nums: number[] = [1, 2];
+const u: unknown = nums;
+console.log((u as number[]) === nums);
+try { const wide = u as (number | string)[]; console.log(wide.length); } catch (e) { console.log((e as Error).message); }
+console.log(JSON.stringify({ ...(v as Record<string, number>) }));
+`,
+    );
+    const want = (path: string): string =>
+      "expected a value of the cast's type (this native value has another layout, and the cast " +
+      "would copy it: declare the value with the target type, or copy it explicitly with " +
+      `{ ...value } or [...value]) at ${path}, got object`;
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe(
+      [`true ${want("$")}`, want("$.inner"), "true", want("$"), '{"x":1,"y":2}', ""].join("\n"),
+    );
+    expect(r.stderr).toBe("");
+  });
+
   test("wrong-typed field throws with the path", async () => {
     const r = await compileAndRun(
       "wrong-type",

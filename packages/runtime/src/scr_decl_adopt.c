@@ -15,7 +15,12 @@
  * value has no prototype, accessors, symbol keys or frozen state) and
  * collects the shared ones; it throws the path TypeError before anything
  * changes. Phase two converts the shared nodes in place
- * (scr_dyn_decl_become, scr_json.c). */
+ * (scr_dyn_decl_become, scr_json.c).
+ *
+ * Every other checked cast of a dynamic value to a record or array runs the
+ * same pass leniently (scr_dyn_adopt_shared): a node that cannot become a
+ * capsule keeps the cast's copy, and only a boxed native record or array
+ * the cast copied into another layout throws. */
 #include "scr_runtime.h"
 
 #include <stdlib.h>
@@ -85,9 +90,37 @@ static ScrDyn *scr_decl_capsule_ptr_holder(const ScrDeclAdoptList *list, const S
   return NULL;
 }
 
+/* A native record or array boxed as a dynamic value. */
+static bool scr_decl_native_data(const ScrDyn *n) {
+  if (n->kind != SCR_DYN_TYPED_REF || n->v.typed_ref.klass || n->v.typed_ref.bag_class) return false;
+  const char *key = n->v.typed_ref.type_key;
+  size_t len = n->v.typed_ref.type_key_len;
+  return key && ((len >= 7 && memcmp(key, "record:", 7) == 0) || (len >= 6 && memcmp(key, "array<", 6) == 0));
+}
+
+/* Whether the walk follows a child: plain objects and arrays, and outside
+ * the boundary also boxed native data (scr_decl_adopt_walk's layout check). */
+static bool scr_decl_adopt_follows(const ScrDeclAdoptList *list, const ScrDyn *child) {
+  return child && (child->kind == SCR_DYN_OBJ || child->kind == SCR_DYN_ARR ||
+                   (list->lenient && scr_decl_native_data(child)));
+}
+
 /* `capsule` is owned by the call: pushed or released. */
 static bool scr_decl_adopt_walk(ScrDeclAdoptList *list, ScrDyn *n, ScrDyn *capsule,
                                 const ScrDynPath *path, unsigned depth) {
+  /* Outside the boundary, a native record or array the cast copied into
+   * another layout (`Record<string, number>` boxed, then cast to `{ x; y }`)
+   * would leave two objects where the program has one: the cast throws. */
+  if (list->lenient && n && capsule && capsule->kind == SCR_DYN_TYPED_REF && scr_decl_native_data(n) &&
+      n->v.typed_ref.ptr != capsule->v.typed_ref.ptr) {
+    scr_dyn_release(capsule);
+    scr_dyn_check_fail(path,
+                       "a value of the cast's type (this native value has another layout, and the cast "
+                       "would copy it: declare the value with the target type, or copy it explicitly "
+                       "with { ...value } or [...value])",
+                       n);
+    return false;
+  }
   if (!n || (n->kind != SCR_DYN_OBJ && n->kind != SCR_DYN_ARR) || !capsule ||
       capsule->kind != SCR_DYN_TYPED_REF || capsule == n || depth > 4096) {
     scr_dyn_release(capsule);
@@ -116,7 +149,7 @@ static bool scr_decl_adopt_walk(ScrDeclAdoptList *list, ScrDyn *n, ScrDyn *capsu
       if (!ops->has(ptr, i)) continue;
       const ScrStr *name = ops->names[i];
       ScrDyn *child = scr_dyn_obj_get(n, name->data, name->len);
-      if (!child || (child->kind != SCR_DYN_OBJ && child->kind != SCR_DYN_ARR)) continue;
+      if (!scr_decl_adopt_follows(list, child)) continue;
       ScrDynPath p = { path, name->data, 0 };
       if (!scr_decl_adopt_walk(list, child, ops->get(ptr, i), &p, depth + 1)) {
         if (!(n->rc > 1 && n->rc != SIZE_MAX)) scr_dyn_release(capsule);
@@ -139,7 +172,7 @@ static bool scr_decl_adopt_walk(ScrDeclAdoptList *list, ScrDyn *n, ScrDyn *capsu
       size_t len = n->v.arr.len < view->v.arr.len ? n->v.arr.len : view->v.arr.len;
       for (size_t i = 0; i < len; i++) {
         ScrDyn *child = n->v.arr.items[i], *element = view->v.arr.items[i];
-        if (!child || !element || (child->kind != SCR_DYN_OBJ && child->kind != SCR_DYN_ARR)) continue;
+        if (!element || !scr_decl_adopt_follows(list, child)) continue;
         ScrDynPath p = { path, NULL, i };
         if (!scr_decl_adopt_walk(list, child, scr_dyn_retain(element), &p, depth + 1)) {
           scr_dyn_release(view);
@@ -154,7 +187,7 @@ static bool scr_decl_adopt_walk(ScrDeclAdoptList *list, ScrDyn *n, ScrDyn *capsu
     const ScrDynTypedArrayOps *ops = capsule->v.typed_ref.array;
     for (size_t i = 0; i < n->v.arr.len; i++) {
       ScrDyn *child = n->v.arr.items[i];
-      if (!child || (child->kind != SCR_DYN_OBJ && child->kind != SCR_DYN_ARR)) continue;
+      if (!scr_decl_adopt_follows(list, child)) continue;
       ScrDynPath p = { path, NULL, i };
       if (!scr_decl_adopt_walk(list, child, ops->get(ptr, (double)i), &p, depth + 1)) {
         if (!(n->rc > 1 && n->rc != SIZE_MAX)) scr_dyn_release(capsule);
