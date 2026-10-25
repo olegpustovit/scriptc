@@ -385,10 +385,13 @@ export function computeConstantGraphs(analysis: ShapeAnalysis): ConstantGraphs {
     mixedReads = 0;
   for (const op of analysis.ops) {
     if (op.kind !== "read" || op.name === null) continue;
-    const atoms = analysis.nodes[op.recv]!.atoms;
-    const constant = [...atoms].filter((a) => constantKeys.get(a)?.has(op.name!) === true);
+    // A nullish receiver throws (absent keys read undefined in the analysis).
+    const atoms = [...analysis.nodes[op.recv]!.atoms].filter(
+      (a) => !(a.kind === "prim" && (a.label === "undefined" || a.label === "null")),
+    );
+    const constant = atoms.filter((a) => constantKeys.get(a)?.has(op.name!) === true);
     if (constant.length === 0) continue;
-    if (atoms.size === 1) {
+    if (atoms.length === 1) {
       foldableReads++;
       const p = op.node.parent;
       if (p !== undefined && ts.isCallExpression(p) && p.expression === op.node) foldableCalls++;

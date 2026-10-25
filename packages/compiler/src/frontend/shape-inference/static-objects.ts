@@ -341,7 +341,12 @@ export function planStaticObjectRewrites(
         byKey.set(key, (entry = { op, atoms: new Set() }));
         mergedOps.push(entry);
       }
-      for (const a of analysis.nodes[op.recv]!.atoms) entry.atoms.add(a);
+      // A nullish receiver makes the read throw, so the rewrites decide on
+      // the other receivers (absent keys read undefined in the analysis:
+      // `ns.util` before `ns.util = {…}` runs).
+      for (const a of analysis.nodes[op.recv]!.atoms)
+        if (!(a.kind === "prim" && (a.label === "undefined" || a.label === "null")))
+          entry.atoms.add(a);
     }
   }
   const forIns: ts.Expression[] = [];
