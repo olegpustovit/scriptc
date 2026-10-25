@@ -548,7 +548,8 @@ export function planShapeOverlay(
             if (seen.has(name)) continue;
             seen.add(name);
             const t = cls !== undefined ? fieldType(cls, name) : null;
-            if (t !== null && !packageDocOf(st).type) annotate(ts.tokenStartOfNode(st), `@type {${t}}`);
+            if (t !== null && !packageDocOf(st).type)
+              annotate(ts.tokenStartOfNode(st), `@type {${t}}`);
           }
         }
       }
@@ -753,7 +754,9 @@ function packageDocOf(node: ts.Node): PackageDoc {
         ts.isParenthesizedExpression(p) ||
         ts.isExpressionStatement(p) ||
         ts.isExportAssignment(p) ||
-        (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.EqualsToken && p.right === n)
+        (ts.isBinaryExpression(p) &&
+          p.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+          p.right === n)
       )
     )
       break;

@@ -557,7 +557,9 @@ function loadFrontend(
         load = plain;
         preflight = plainPreflight;
         if (process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] !== undefined)
-          process.stderr.write(`[shape-fallback] preflight: the overlay's program failed; overlay off\n`);
+          process.stderr.write(
+            `[shape-fallback] preflight: the overlay's program failed; overlay off\n`,
+          );
       } else {
         plain.dispose();
         setShapeOverlayDropped(false);
@@ -791,7 +793,10 @@ function loadFrontend(
           process.stderr.write(
             `[shape-fallback] round ${round} level ${level}: ${refusals.length} refusals (${refusals
               .slice(0, process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] === "all" ? undefined : 3)
-              .map((d) => `${d.loc.file.split("/").pop()}:${d.loc.start} ${process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] === "all" ? d.message : d.message.slice(0, 60)}`)
+              .map(
+                (d) =>
+                  `${d.loc.file.split("/").pop()}:${d.loc.start} ${process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] === "all" ? d.message : d.message.slice(0, 60)}`,
+              )
               .join("; ")}), changed ${changed}\n`,
           );
         if (!changed) break;
@@ -827,7 +832,9 @@ function loadFrontend(
           const plainLoad = loadProgram(entryPath, { npmStatic: finalNpmStatic, externalTypes });
           const plainPreflight = checkPreflight(plainLoad);
           const plain = plainPreflight.length === 0 ? lowerLoad(plainLoad) : null;
-          const known = new Set(plain === null ? [] : fencesOf(plain).map((d) => keyOf(plainLoad, d)));
+          const known = new Set(
+            plain === null ? [] : fencesOf(plain).map((d) => keyOf(plainLoad, d)),
+          );
           const added = fences.filter((d) => !known.has(keyOf(finalLoad, d)));
           if (plain !== null && plain.diagnostics.length === 0 && added.length > 0) {
             if (process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] !== undefined)
@@ -849,9 +856,16 @@ function loadFrontend(
       }
       // A module the caller's IR validator rejects (a lowering bug the
       // overlay's types reach) compiles without the overlay.
-      if (shapeOverlayActive() && lowered.module !== null && valid !== undefined && !valid(lowered.module)) {
+      if (
+        shapeOverlayActive() &&
+        lowered.module !== null &&
+        valid !== undefined &&
+        !valid(lowered.module)
+      ) {
         if (process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] !== undefined)
-          process.stderr.write(`[shape-fallback] the IR validator rejected the module; overlay off\n`);
+          process.stderr.write(
+            `[shape-fallback] the IR validator rejected the module; overlay off\n`,
+          );
         setShapeOverlayDropped(true);
         finalLoad.dispose();
         finalLoad = loadProgram(entryPath, { npmStatic: finalNpmStatic, externalTypes });

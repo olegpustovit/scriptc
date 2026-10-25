@@ -774,7 +774,11 @@ export function planStaticObjectRewrites(
       node.parent.argumentExpression === node;
     callEdits.push({
       sf: node.getSourceFile(),
-      edit: { start: ts.tokenStartOfNode(node), end: node.end, text: key ? literal : `(${literal})` },
+      edit: {
+        start: ts.tokenStartOfNode(node),
+        end: node.end,
+        text: key ? literal : `(${literal})`,
+      },
     });
     foldedReads++;
   }

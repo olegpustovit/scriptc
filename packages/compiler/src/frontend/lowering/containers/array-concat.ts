@@ -198,7 +198,11 @@ export function arrayConcatHelper(
     ...shape.flatMap((type, i) =>
       type === "dyn"
         ? appendDyn(varRef(`x.${i}`, DYN, loc), node.arguments.nodes[i]!)
-        : append(varRef(`x.${i}`, type ? arrayOf(type) : elem, loc), type, node.arguments.nodes[i]!),
+        : append(
+            varRef(`x.${i}`, type ? arrayOf(type) : elem, loc),
+            type,
+            node.arguments.nodes[i]!,
+          ),
     ),
     { kind: "return", value: out, loc },
   ];

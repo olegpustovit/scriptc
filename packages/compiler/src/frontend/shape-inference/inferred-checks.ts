@@ -14,7 +14,12 @@ function annotated(node: ts.Node | undefined): boolean {
   for (let n = node, i = 0; n !== undefined && i < 4; n = n.parent, i++) {
     const sf = n.getSourceFile();
     if (sf.text.slice(n.pos, ts.tokenStartOfNode(n)).includes(OVERLAY_MARK)) return true;
-    if (ts.isStatement(n) || ts.isSourceFile(n) || (n.parent !== undefined && ts.isClassLikeDeclaration(n.parent))) break;
+    if (
+      ts.isStatement(n) ||
+      ts.isSourceFile(n) ||
+      (n.parent !== undefined && ts.isClassLikeDeclaration(n.parent))
+    )
+      break;
   }
   return false;
 }

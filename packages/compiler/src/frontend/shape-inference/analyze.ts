@@ -2596,8 +2596,7 @@ class Analyzer {
         else if (/^\d+$/.test(name)) {
           this.edge(this.element(a), dst);
           this.add(dst, this.prim("undefined"));
-        }
-        else {
+        } else {
           // A named property, written by name or under an unknown key; an own field shadows a method.
           if (ARRAY_METHODS.has(name)) {
             this.add(dst, this.builtin(`array.${name}`, a));
@@ -3714,7 +3713,8 @@ class Analyzer {
     const objDecl = this.resolve(obj);
     const keyDecl = this.resolve(key);
     if (objDecl === undefined || keyDecl === undefined) return false;
-    const names = (id: Node, decl: Node): boolean => ts.isIdentifier(id) && this.resolve(id) === decl;
+    const names = (id: Node, decl: Node): boolean =>
+      ts.isIdentifier(id) && this.resolve(id) === decl;
     for (let n: Node | undefined = site.parent; n !== undefined; n = n.parent) {
       if (ts.isFunctionLike(n) || ts.isSourceFile(n)) return false;
       if (!ts.isForStatement(n) || n.statement === undefined) continue;
@@ -3864,7 +3864,8 @@ class Analyzer {
       this.solve();
       for (const o of this.ops)
         if (o.kind === "delete" || o.kind === "lengthWrite")
-          for (const a of this.nodes[o.recv]!.atoms) if (a.kind === "array") this.unsafeArrays.add(a);
+          for (const a of this.nodes[o.recv]!.atoms)
+            if (a.kind === "array") this.unsafeArrays.add(a);
       for (const g of this.guardedIndexReads)
         if (!g.done && this.unsafeArrays.has(g.recv)) {
           g.done = true;
