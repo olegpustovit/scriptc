@@ -2656,21 +2656,20 @@ export function cjsAccessorSnapshotStores(
   const moduleSym = lowerer.checker.getSymbolAtLocation(cjsNamespaceTargetOf(lowerer, dep) ?? dep);
   const bound = esmBoundNamesOf(lowerer, dep);
   let shared: string | null = null;
-  const data = (moduleSym ? lowerer.checker.getExportsOfModule(moduleSym) : []).flatMap(
-    (exported) => {
-      if (bound !== null && !bound.has(ts.symbolName(exported))) return [];
-      const symbol =
-        exported.flags & ts.SymbolFlags.Alias
-          ? lowerer.checker.getAliasedSymbol(exported)
-          : exported;
-      const linked = cjsLinkedDataExport(lowerer, symbol);
-      if (linked === null) return [];
-      const first = lowerer.cjsLinkedDataModules.get(symbol);
-      if (first === undefined) lowerer.cjsLinkedDataModules.set(symbol, dep);
-      else if (first !== dep) shared ??= ts.symbolName(exported);
-      return [linked];
-    },
-  );
+  const data: { global: IrGlobal; snapshot: { id: string; type: IrType } }[] = [];
+  const exportedSymbols =
+    moduleSym === undefined ? [] : lowerer.checker.getExportsOfModule(moduleSym);
+  for (const exported of exportedSymbols) {
+    if (bound !== null && !bound.has(ts.symbolName(exported))) continue;
+    const symbol =
+      exported.flags & ts.SymbolFlags.Alias ? lowerer.checker.getAliasedSymbol(exported) : exported;
+    const linked = cjsLinkedDataExport(lowerer, symbol);
+    if (linked === null) continue;
+    const first = lowerer.cjsLinkedDataModules.get(symbol);
+    if (first === undefined) lowerer.cjsLinkedDataModules.set(symbol, dep);
+    else if (first !== dep) shared ??= ts.symbolName(exported);
+    data.push(linked);
+  }
   // Node copies the export separately at each module's link; the bindings
   // here share one copy per export.
   if (shared !== null) {
