@@ -57,7 +57,7 @@ import {
   locOf,
   orderedImportsOf,
 } from "../program.js";
-import { cjsExportChangesAfterInit } from "./cjs-inline-require.js";
+import { cjsExportChangesAfterInit, cjsNamespaceTargetOf } from "./cjs-inline-require.js";
 import { npmStaticLexerVisibleNames } from "../npm-static.js";
 import {
   type CompoundOp,
@@ -2621,11 +2621,14 @@ function esmBoundNamesOf(lowerer: Lowerer, dep: ts.SourceFile): ReadonlySet<stri
 export function cjsAccessorSnapshotStores(
   lowerer: Lowerer,
   dep: ts.SourceFile,
-  loc: SrcLoc,
+  link: ts.Statement,
 ): IrStmt[] {
+  const loc = locOf(link);
   const getters = lexerVisibleAccessors(dep);
-  const moduleSym = lowerer.checker.getSymbolAtLocation(dep);
+  // A `module.exports = require("./lib")` wrapper links lib's exports.
+  const moduleSym = lowerer.checker.getSymbolAtLocation(cjsNamespaceTargetOf(lowerer, dep) ?? dep);
   const bound = esmBoundNamesOf(lowerer, dep);
+  let shared: string | null = null;
   const data = (moduleSym ? lowerer.checker.getExportsOfModule(moduleSym) : []).flatMap(
     (exported) => {
       if (bound !== null && !bound.has(ts.symbolName(exported))) return [];
@@ -2634,9 +2637,29 @@ export function cjsAccessorSnapshotStores(
           ? lowerer.checker.getAliasedSymbol(exported)
           : exported;
       const linked = cjsLinkedDataExport(lowerer, symbol);
-      return linked === null ? [] : [linked];
+      if (linked === null) return [];
+      const first = lowerer.cjsLinkedDataModules.get(symbol);
+      if (first === undefined) lowerer.cjsLinkedDataModules.set(symbol, dep);
+      else if (first !== dep) shared ??= ts.symbolName(exported);
+      return [linked];
     },
   );
+  // Node copies the export separately at each module's link; the bindings
+  // here share one copy per export.
+  if (shared !== null) {
+    const before = lowerer.diags.length;
+    try {
+      lowerer.unsupported(
+        "SC1090",
+        link,
+        `importing '${shared}', a CommonJS export that changes after it loads, through two different modules`,
+      );
+    } catch (error) {
+      const fence = lowerer.deferToRuntimeFence(before, link, { kind: "statement" });
+      if (fence === null) throw error;
+      return [fence];
+    }
+  }
   if (getters.length === 0 && data.length === 0) return [];
   let readyId = lowerer.cjsSnapshotReady.get(dep);
   if (readyId === undefined) {

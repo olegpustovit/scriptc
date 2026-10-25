@@ -482,6 +482,30 @@ console.log("after");
     );
   });
 
+  test("a changing CommonJS export ESM-imported through two modules keeps a named refusal", async () => {
+    // Node copies the export separately when each module links; scriptc
+    // keeps one copy per export.
+    const r = await compileAndRun(
+      "esm-import-through-two-modules",
+      `import { n as direct } from "./lib.cjs";
+import "./bumper.cjs";
+import { n as wrapped } from "./wrap.cjs";
+console.log(direct, wrapped);
+`,
+      "mjs",
+      {
+        "lib.cjs": "exports.n = 7;\nexports.bump = function () { exports.n = exports.n + 1; };\n",
+        "bumper.cjs": 'require("./lib.cjs").bump();\n',
+        "wrap.cjs": 'module.exports = require("./lib.cjs");\n',
+      },
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(
+      /^Uncaught Error: importing 'n', a CommonJS export that changes after it loads, through two different modules.*\[SC1090 at .*esm-import-through-two-modules\.mjs:3\]\n$/,
+    );
+  });
+
   test("an EFFECTFUL surplus argument is a named deferred fence (JS lane)", async () => {
     // Effect-free surplus args drop at compile time, JS-exact (corpus
     // 1760 — the test-string-decoder writeSequences shape). An effectful

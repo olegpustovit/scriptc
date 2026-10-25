@@ -3116,7 +3116,7 @@ export function lowerFileInit(
               !isCjsJsFile(sf, lowerer.program) &&
               isCjsJsFile(dep, lowerer.program)
             )
-              header.push(...cjsAccessorSnapshotStores(lowerer, dep, loc));
+              header.push(...cjsAccessorSnapshotStores(lowerer, dep, stmt));
           }
         }
       }

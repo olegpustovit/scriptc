@@ -2993,6 +2993,8 @@ export class Lowerer {
   /** Export names ES-module importers bind from each CommonJS module; null
    * entries bind every name (lower-exprs.ts esmBoundNamesOf). */
   cjsEsmBoundNames: Map<ts.SourceFile, Set<string> | null> | null = null;
+  /** The module whose ES-module link first copied each changing data export. */
+  readonly cjsLinkedDataModules = new Map<ts.Symbol, ts.SourceFile>();
   /** Interned `%iter.drain.<n>` helpers (classIteratorDrainCall): one per
    * receiver class — the eager drain of a class iterable's protocol into
    * a fresh element array, behind array/call spreads. */
