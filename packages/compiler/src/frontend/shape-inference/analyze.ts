@@ -1355,6 +1355,15 @@ class Analyzer {
     this.edgeFor(site, info, args);
   }
 
+  /** The prototype object of a class declaration (`C.prototype`). */
+  classProto(decl: Node): Atom {
+    return this.atoms.intern(`cproto:${this.nodeKey(decl)}`, () => ({
+      kind: "object",
+      label: `${this.className(decl)}.prototype`,
+      node: decl,
+    }));
+  }
+
   /** Per-call-site clones of init factories: a function called from
    * module initialization (top-level code outside loops, or another such
    * clone) is analyzed once per call site, so the objects it creates are
@@ -2455,6 +2464,8 @@ class Analyzer {
           this.unknownKeysInto(a, dst);
           return;
         }
+        // Members stored on a class's prototype object after the fact.
+        for (const c of this.classChain(decl)) this.edge(this.field(this.classProto(c), name), dst);
         const member = this.lookupMember(decl, name, false);
         if (member?.kind === "method")
           this.add(
@@ -2478,7 +2489,9 @@ class Analyzer {
       case "class": {
         const decl = a.node!;
         if (name === "prototype" || name === "name") {
-          this.add(dst, name === "prototype" ? this.top : this.prim("string"));
+          // A class's prototype object: members stored on it later
+          // (`C.prototype.isVector3 = true`) are members of its instances.
+          this.add(dst, name === "prototype" ? this.classProto(decl) : this.prim("string"));
           this.fieldInto(a, name, dst);
           this.unknownKeysInto(a, dst);
           return;
@@ -2535,6 +2548,14 @@ class Analyzer {
         }
         return;
       case "object": {
+        // A read through a class's prototype object (`C.prototype.m`) may
+        // be any member: unknown, as before prototype objects were tracked.
+        if (
+          a.label.endsWith(".prototype") &&
+          a.node !== undefined &&
+          ts.isClassLikeDeclaration(a.node)
+        )
+          this.add(dst, this.top);
         this.edge(this.field(a, name), dst);
         this.edge(this.anyField(a), dst);
         if (this.namespaceAtoms.has(a) && name !== "exports") {
