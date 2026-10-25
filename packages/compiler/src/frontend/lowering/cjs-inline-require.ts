@@ -762,17 +762,6 @@ export function cjsExportChangesAfterInit(lowerer: Lowerer, symbol: ts.Symbol): 
   return changes;
 }
 
-/** Writes to a CommonJS export from modules other than its own. */
-export function cjsExportWritesFromOtherModules(
-  lowerer: Lowerer,
-  symbol: ts.Symbol,
-): MemberWrite[] {
-  const exporter = symbol.declarations[0] && ts.getSourceFileOfNode(symbol.declarations[0]);
-  return (memberWritesByName(lowerer).get(ts.symbolName(symbol)) ?? []).filter(
-    (write) => ts.getSourceFileOfNode(write) !== exporter && writesExport(lowerer, write, symbol),
-  );
-}
-
 function writesExport(lowerer: Lowerer, write: MemberWrite, symbol: ts.Symbol): boolean {
   let target = lowerer.checker.getSymbolAtLocation(
     ts.isPropertyAccessExpression(write) ? write.name : write.argumentExpression,

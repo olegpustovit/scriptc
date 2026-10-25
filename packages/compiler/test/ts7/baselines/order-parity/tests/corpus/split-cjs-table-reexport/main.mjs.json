@@ -7,7 +7,6 @@
   "<repo>/tests/corpus/split-cjs-table-reexport/initialized.cjs",
   "<repo>/tests/corpus/split-cjs-table-reexport/table.cjs",
   "<repo>/tests/corpus/split-cjs-table-reexport/split-let.cjs",
-  "<repo>/tests/corpus/split-cjs-table-reexport/writer.cjs",
   "<repo>/tests/corpus/split-cjs-table-reexport/reexport.cjs",
   "<repo>/tests/corpus/split-cjs-table-reexport/esm-reexport.mjs",
   "<repo>/tests/corpus/split-cjs-table-reexport/main.mjs"

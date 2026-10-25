@@ -4,7 +4,6 @@ exports.bump = function () {
   exports.n = exports.n + 1;
 };
 exports.fieldN = 1;
-exports.external = 1;
 exports.handler = function () {
   return "first";
 };

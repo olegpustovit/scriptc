@@ -33,7 +33,6 @@ import {
   resolveImport,
 } from "../program.js";
 import {
-  cjsExportWritesFromOtherModules,
   cjsNamespaceTargetOf,
   cjsWholeExportValueOf,
   inlineProgramRequireOf,
@@ -431,20 +430,6 @@ function computeExportCallIgnoresThis(
     }
     return undefined;
   });
-  // Replacements from other modules (`lib.f = function ...`).
-  let exported = lowerer.cjsModuleExportSymbol(sf, name);
-  if (exported !== undefined && exported.flags & ts.SymbolFlags.Alias)
-    exported = lowerer.checker.getAliasedSymbol(exported);
-  for (const write of exported ? cjsExportWritesFromOtherModules(lowerer, exported) : []) {
-    const parent = write.parent;
-    if (
-      !ts.isBinaryExpression(parent) ||
-      parent.left !== write ||
-      parent.operatorToken.kind !== ts.SyntaxKind.EqualsToken
-    )
-      return false;
-    values.push(parent.right);
-  }
   // Entries of a `module.exports = { ... }` table (direct, or a const
   // literal the statement names).
   let methodEntry: ts.MethodDeclaration | null = null;

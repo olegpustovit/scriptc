@@ -8,8 +8,6 @@ import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { bindingNeverReassigned } from "./binding-analysis.js";
 import { isRebindableFunction } from "./rebindable-functions.js";
-import { cjsExportWritesFromOtherModules } from "./cjs-inline-require.js";
-import { isCjsJsFile } from "../program.js";
 
 /** The value an export declaration or write assigns. */
 function exportedValue(decl: ts.Node): ts.Node | undefined {
@@ -322,13 +320,7 @@ export function refuseModuleMemberThis(
 ): void {
   const symbol = lowerer.resolveValueSymbol(member);
   if (symbol === null) return;
-  const exporter = symbol.declarations[0] && ts.getSourceFileOfNode(symbol.declarations[0]);
-  // Another module can replace a CommonJS export (`lib.f = function ...`).
-  const writes =
-    exporter !== undefined && isCjsJsFile(exporter, lowerer.program)
-      ? cjsExportWritesFromOtherModules(lowerer, symbol)
-      : [];
-  for (const decl of [...symbol.declarations, ...writes]) {
+  for (const decl of symbol.declarations) {
     const value = exportedValue(decl);
     if (value === undefined) continue;
     // A factory's result reads `this` through the function it returns.

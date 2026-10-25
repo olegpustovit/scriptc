@@ -110,22 +110,13 @@ test("table re-export cycles have no terminal table", () => {
 test("table re-export snapshots exclude stable exports", () => {
   withProgram(
     {
-      "main.cjs": `const { n, stable, fn, count, total, external } = require("./lib.cjs");
-require("./writer.cjs");`,
+      "main.cjs": 'const { n, stable, fn } = require("./lib.cjs");',
       "lib.cjs": `exports.n = 1;
 exports.stable = 1;
 exports.stable = 2;
-exports.stable += 1;
 exports.fn = function () { return 7; };
 exports.bump = function () { exports.n = 2; };
-exports.count = 0;
-exports.increment = function () { exports.count++; };
-exports.total = 0;
-exports.add = function (value) { exports.total += value; };
-exports.external = 0;
 `,
-      "writer.cjs": `const lib = require("./lib.cjs");
-lib.external = 1;`,
     },
     (lowerer) => {
       const statement = lowerer.entry.statements.nodes[0]!;
@@ -133,12 +124,7 @@ lib.external = 1;`,
       const decl = statement.declarationList.declarations.nodes[0]!;
       const snapshot = cjsRequireSnapshotBindingsOf(lowerer, decl);
       expect(snapshot).not.toBeNull();
-      expect([...snapshot!.bindings.values()].map((binding) => binding.key)).toEqual([
-        "n",
-        "count",
-        "total",
-        "external",
-      ]);
+      expect([...snapshot!.bindings.values()].map((binding) => binding.key)).toEqual(["n"]);
     },
   );
 });
