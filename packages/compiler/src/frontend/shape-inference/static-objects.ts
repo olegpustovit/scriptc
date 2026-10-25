@@ -343,9 +343,11 @@ export function planStaticObjectRewrites(
       }
       // A nullish receiver makes the read throw, so the rewrites decide on
       // the other receivers (absent keys read undefined in the analysis:
-      // `ns.util` before `ns.util = {…}` runs).
+      // `ns.util` before `ns.util = {…}` runs). In an optional chain a
+      // nullish receiver short-circuits instead, so it counts.
+      const optional = (op.node.flags & ts.NodeFlags.OptionalChain) !== 0;
       for (const a of analysis.nodes[op.recv]!.atoms)
-        if (!(a.kind === "prim" && (a.label === "undefined" || a.label === "null")))
+        if (optional || !(a.kind === "prim" && (a.label === "undefined" || a.label === "null")))
           entry.atoms.add(a);
     }
   }

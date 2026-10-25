@@ -386,8 +386,9 @@ export function computeConstantGraphs(analysis: ShapeAnalysis): ConstantGraphs {
   for (const op of analysis.ops) {
     if (op.kind !== "read" || op.name === null) continue;
     // A nullish receiver throws (absent keys read undefined in the analysis).
+    const optional = (op.node.flags & ts.NodeFlags.OptionalChain) !== 0;
     const atoms = [...analysis.nodes[op.recv]!.atoms].filter(
-      (a) => !(a.kind === "prim" && (a.label === "undefined" || a.label === "null")),
+      (a) => optional || !(a.kind === "prim" && (a.label === "undefined" || a.label === "null")),
     );
     const constant = atoms.filter((a) => constantKeys.get(a)?.has(op.name!) === true);
     if (constant.length === 0) continue;
