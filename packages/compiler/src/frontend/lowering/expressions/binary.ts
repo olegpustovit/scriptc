@@ -2280,6 +2280,33 @@ export function lowerStrictEquality(
   negated: boolean,
   loc: SrcLoc,
 ): IrExpr {
+  // JavaScript: a checked-dynamic name the checker's flow analysis narrowed
+  // (`let c; ... (c = s[i]) === " "`) is compared unchecked. Strict
+  // equality never throws, and the flow type is the checker's inference
+  // (an indexed read past the end is undefined whatever it says).
+  const flowNarrowed = (n: ts.Node, e: IrExpr): IrExpr | null =>
+    ts.isIdentifier(n) &&
+    e.kind === "dynCheck" &&
+    e.value.type.kind === "dyn" &&
+    isJsSourceFile(ts.getSourceFileOfNode(n))
+      ? e.value
+      : null;
+  const scalar = (e: IrExpr): boolean =>
+    e.type.kind === "string" || e.type.kind === "f64" || e.type.kind === "bool";
+  {
+    const l = flowNarrowed(leftNode, left);
+    const r = flowNarrowed(rightNode, right);
+    if ((l !== null && (scalar(right) || r !== null)) || (r !== null && scalar(left))) {
+      const cmp: IrExpr = {
+        kind: "dynScalarEq",
+        left: l ?? lowerer.coerceInto(leftNode, left, DYN),
+        right: r ?? lowerer.coerceInto(rightNode, right, DYN),
+        type: BOOL,
+        loc,
+      };
+      return negated ? { kind: "unary", op: "!", operand: cmp, type: BOOL, loc } : cmp;
+    }
+  }
   const plainBothNum = left.type.kind === "f64" && right.type.kind === "f64";
   const bothStr = left.type.kind === "string" && right.type.kind === "string";
   const indexed = tryLowerIndexedComparison(lowerer, left, right, negated, loc);

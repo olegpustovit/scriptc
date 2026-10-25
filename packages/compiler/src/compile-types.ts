@@ -56,7 +56,8 @@ export interface CompileBaseOptions {
   /** Eligible packages compile automatically. Explicit names override automatic selection heuristics. */
   npmStatic?: readonly string[] | "auto";
   /** Shape inference's typed overlay for opted-in packages' JavaScript.
-   * False disables it (`--no-shape-overlay`); a package opts out with
+   * True enables it, false disables it (`--no-shape-overlay`); unset
+   * follows SCRIPTC_SHAPE_OVERLAY. A package opts out with
    * `"scriptc": { "packages": { "<name>": { "shapes": false } } }`. */
   shapeOverlay?: boolean;
   /** Outbound native FFI manifest. Its signature-only TypeScript bindings

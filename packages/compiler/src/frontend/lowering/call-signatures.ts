@@ -182,7 +182,11 @@ export function checkedJsDocumentedParameter(
   lowerer: Lowerer,
   param: ts.ParameterDeclaration,
 ): boolean {
-  if (param.parent !== undefined && shapeOverlayAnnotated(param.parent) && documentedParameter(param))
+  if (
+    param.parent !== undefined &&
+    shapeOverlayAnnotated(param.parent) &&
+    documentedParameter(param)
+  )
     return true;
   return lowerer.checkedJsFile(ts.getSourceFileOfNode(param)) && documentedParameter(param);
 }

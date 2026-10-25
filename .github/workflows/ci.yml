@@ -17,6 +17,11 @@ on:
         type: choice
         options: [full, darwin]
         default: full
+      scope:
+        description: Every lane, or only the shape overlay validation (shape_overlay)
+        type: choice
+        options: [all, shape_overlay]
+        default: all
 
 concurrency:
   # A new push to a pull request cancels its previous run. Every push to main runs to completion in a group of
@@ -55,7 +60,10 @@ jobs:
           const upperLayer = process.env.GITHUB_EVENT_NAME === 'pull_request' &&
             sameRepository && trustedAuthor && typeof stackBase === 'string' && stackBase.length > 0 &&
             typeof prBase === 'string' && prBase.length > 0 && stackBase !== prBase;
-          const full = !upperLayer;
+          // A manual run of the shape overlay validation alone skips the other lanes.
+          const shapeOnly = process.env.GITHUB_EVENT_NAME === 'workflow_dispatch' &&
+            event.inputs?.scope === 'shape_overlay';
+          const full = !upperLayer && !shapeOnly;
           appendFileSync(process.env.GITHUB_OUTPUT, `full=${full}\n`);
           console.log(full ? 'Run full CI' : 'Defer full CI until this PR becomes the lowest unmerged layer');
           NODE
@@ -345,6 +353,81 @@ jobs:
           path: ${{ runner.temp }}
       - run: tar -xzf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
       - run: pnpm test tests/harness/effect.test.ts tests/harness/effect4.test.ts
+
+  # Shape inference's overlay (opt-in, SCRIPTC_SHAPE_OVERLAY=1) over the
+  # suites of real packages: nightly and on manual runs only (scope
+  # shape_overlay runs it alone), outside the `test` roll-up. Every case
+  # must build and run as in the default build. It builds its own native
+  # packages, so it does not depend on the other lanes.
+  shape_overlay_native:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    name: build (Linux x64 native packages, shape overlay)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - uses: ./.github/actions/llvm-linux
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/zig
+      - uses: ./.github/actions/native-packages
+        with:
+          target: linux-x64-gnu
+      - name: Preserve executable permissions in shared packages
+        run: >-
+          tar -czf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
+          packages/llvm-linux-x64-gnu/bin
+          packages/runtime-linux-x64-gnu/artifacts
+          packages/runtime-linux-x64-gnu/runtime-pack.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-x64-gnu-shape-overlay
+          path: ${{ runner.temp }}/native-linux-x64-gnu.tar.gz
+          retention-days: 1
+
+  shape_overlay:
+    needs: [shape_overlay_native]
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    name: test (Linux, shape overlay, ${{ matrix.suite }} ${{ matrix.shard }}/8)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [npm, npm-static, three, effect]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      SCRIPTC_SHAPE_OVERLAY: "1"
+      SCRIPTC_TEST_WORKERS: "1"
+      SCRIPTC_EFFECT_TEST_CONCURRENCY: "1"
+      SCRIPTC_TEST_SHARD: ${{ matrix.shard }}/8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-linux-x64-gnu-shape-overlay
+          path: ${{ runner.temp }}
+      - run: tar -xzf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
+      - name: Run the suite with the overlay on
+        run: |
+          case "${{ matrix.suite }}" in
+            npm) pnpm test tests/harness/npm-shape-overlay.test.ts ;;
+            npm-static) pnpm test tests/harness/npm-static.test.ts ;;
+            three) pnpm test tests/harness/three.test.ts ;;
+            effect) pnpm test tests/harness/effect.test.ts tests/harness/effect4.test.ts ;;
+          esac
 
   # Build each instrumented seed once. Downstream contracts retain the same
   # compiler and source artifacts without repeating seed construction.

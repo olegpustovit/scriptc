@@ -1156,7 +1156,10 @@ function jsFieldInitializerType(lowerer: Lowerer, type: IrType, expression: ts.E
   // Shape inference's overlay types a field as a record or array only when
   // the analysis proves its values never reach code that could observe a
   // copy, so those fields keep their native layout.
-  if ((type.kind === "array" || type.kind === "record") && !shapeOverlayAnnotated(expression.parent?.parent ?? expression))
+  if (
+    (type.kind === "array" || type.kind === "record") &&
+    !shapeOverlayAnnotated(expression.parent?.parent ?? expression)
+  )
     return DYN;
   // JavaScript documentation cannot guarantee that a call or an indexed
   // read returns a present number. Numeric fields receiving those values

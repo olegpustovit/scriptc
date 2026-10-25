@@ -102,6 +102,10 @@ export function jsonCallbacks(k) {
 export function revivedResult(text) { const r = { fromReviver: 1 }; return leak(JSON.parse(text, function () { return r; })); }
 export function constructedProxy() { return Reflect.construct(Proxy, [{ constructedProxy: 1 }, {}]); }
 export function globalProxy() { return new globalThis.Proxy({ globalProxy: 1 }, {}); }
+function same(value) { return value; }
+export function manyShapes() {
+  return [same({ w0: 0 }), same({ w1: 1 }), same({ w2: 2 }), same({ w3: 3 }), same({ w4: 4 }), same({ w5: 5 }), same({ w6: 6 }), same({ w7: 7 }), same({ w8: 8 }), same({ w9: 9 }), same({ w10: 10 }), same({ w11: 11 }), same({ w12: 12 }), same({ w13: 13 }), same({ w14: 14 }), same({ w15: 15 }), same({ w16: 16 }), same({ w17: 17 }), same({ w18: 18 }), same({ w19: 19 }), same({ w20: 20 }), same({ w21: 21 }), same({ w22: 22 }), same({ w23: 23 }), same({ w24: 24 }), same({ w25: 25 }), same({ w26: 26 }), same({ w27: 27 }), same({ w28: 28 }), same({ w29: 29 }), same({ w30: 30 }), same({ w31: 31 }), same({ w32: 32 }), same({ w33: 33 }), same({ w34: 34 }), same({ w35: 35 }), same({ w36: 36 }), same({ w37: 37 }), same({ w38: 38 }), same({ w39: 39 })].length;
+}
 `;
 
 const packageTypes = `
@@ -125,6 +129,7 @@ export declare function jsonCallbacks(k: string): unknown;
 export declare function revivedResult(text: string): unknown;
 export declare function constructedProxy(): unknown;
 export declare function globalProxy(): unknown;
+export declare function manyShapes(): number;
 `;
 
 const mainSource = `
@@ -134,6 +139,7 @@ import {
   computedField,
   constructedProxy,
   globalProxy,
+  manyShapes,
   jsonCallbacks,
   leak,
   obj,
@@ -165,6 +171,7 @@ const more = [
   revivedResult("{}"),
   constructedProxy(),
   globalProxy(),
+  manyShapes(),
 ];
 console.log(more.length);
 `;
@@ -284,6 +291,8 @@ test("S1 report follows values through array properties, unknown keys, callbacks
   // a proxy constructed through Reflect.construct and globalThis
   expect(site(lines, /^site \{constructedProxy\}@/)).toMatch(/: G — proxy at/);
   expect(site(lines, /^site \{globalProxy\}@/)).toMatch(/: G — proxy at/);
+  // a value set past the widening limit: its values escape
+  expect(site(lines, /^site \{w0\}@/)).toMatch(/: P-escaping — escapes: a value set too large/);
   // the existing verdicts hold
   expect(site(lines, /^site \{kept\}@main\.ts/)).toMatch(/: P-escaping — escapes: stored into ⊤/);
 });

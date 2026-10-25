@@ -924,7 +924,7 @@ export function lowerArrayMethodCall(
     // an array-of-arrays receiver given a bare inner array, where TS
     // types it as an element but JS would SPREAD it — is fenced.
     const receiver = lowerer.lowerExpr(access.expression);
-    const shape: (IrType | null)[] = [];
+    const shape: (IrType | null | "dyn")[] = [];
     const args: IrExpr[] = [];
     for (const argNode of call.arguments.nodes) {
       if (ts.isSpreadElement(argNode)) {
@@ -956,6 +956,16 @@ export function lowerArrayMethodCall(
         if (arg.type.kind !== "array") lowerer.badType(argNode, lowerer.typeOf(argNode));
         shape.push(arg.type.elem);
         args.push(arg);
+        continue;
+      }
+      // A checked-dynamic value: whether JS spreads it is decided at run
+      // time (an array spreads one level, anything else is one element).
+      if (
+        (argIr === null || argIr.kind === "dyn") &&
+        (probedArg ?? tryLowerExpression(lowerer, argNode))?.type.kind === "dyn"
+      ) {
+        shape.push("dyn");
+        args.push(lowerer.lowerExpr(argNode));
         continue;
       }
       // An element value — union elements wrap exactly like a push.

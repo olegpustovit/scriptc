@@ -146,6 +146,8 @@ import {
   shapeOverlayDone,
   shapeOverlayEnabled,
   shapeOverlayer,
+  captureShapeOverlayState,
+  type ShapeOverlayLoadState,
 } from "./shape-inference/index.js";
 import { inferredJsDiagnosticSuppressed } from "./inferred-js-diagnostics.js";
 import {
@@ -364,6 +366,9 @@ export interface TypeWorldDifferences {
 export interface LoadResult {
   program: ts.Program;
   entry: ts.SourceFile;
+  /** Shape inference's overlay state for this load (restored before its
+   * lowering: a later load resets the per-process registry). */
+  shapeOverlayState?: ShapeOverlayLoadState;
   /** User source files in Node's evaluation order: depth-first postorder
    * of the import graph from the entry, each module once. The entry is
    * last. Empty until checkPreflight runs (and empty when preflight fails
@@ -1012,6 +1017,7 @@ function loadProgram7(
     // A load without the overlay must not see an earlier load's overlay
     // files (the registry is per process).
     resetShapeOverlay();
+    const overlayOriginals = new Map<string, string | null>();
     if (overlayer !== undefined && jsx.refusal === null) {
       // Rounds: structural rewrites, then the typed overlay of the rebuilt
       // program (shape-inference/index.ts).
@@ -1019,15 +1025,23 @@ function loadProgram7(
         const overlay = overlayer(program, round);
         if (overlay === null || overlay.size === 0) break;
         const before = program;
-        for (const [file, text] of overlay) host.addVirtualFile(file, text);
-        program = host.createProgram([...programRoots, overridesDtsPath()], options);
+        // The tsc gate reads the files as written: its diagnostics are
+        // taken before the overlay's files replace them on the host, and
+        // its project world (load.projectWorld()) is built over the files
+        // as written.
         if (tscWorld === undefined)
           tscWorld = {
             program: before,
             diagnostics: ts.getPreEmitDiagnostics(before),
             projectWorld: null,
+            declWorldFallback: true,
           };
-        else if (tscWorld.program !== before) before.dispose();
+        for (const file of overlay.keys())
+          if (!overlayOriginals.has(file))
+            overlayOriginals.set(file, before.getSourceFile(file)?.text ?? null);
+        for (const [file, text] of overlay) host.addVirtualFile(file, text);
+        program = host.createProgram([...programRoots, overridesDtsPath()], options);
+        if (tscWorld.program !== before) before.dispose();
         if (shapeOverlayDone()) break;
       }
     }
@@ -1038,6 +1052,7 @@ function loadProgram7(
     return {
       program,
       entry,
+      shapeOverlayState: captureShapeOverlayState(),
       moduleOrder: [],
       configDiags: config.diags,
       ...(declBoundaryNotes.length > 0 ? { declBoundaryNotes } : {}),
@@ -1051,7 +1066,10 @@ function loadProgram7(
       externalTypeSpecifiersByFile,
       ...(tscWorld === undefined ? {} : { jsxSources: jsx.sources }),
       ...(tscWorld === undefined ? {} : { tscWorld }),
-      projectWorld: () => (projectWorld ??= host.createProgram(programRoots, options)),
+      projectWorld: () =>
+        (projectWorld ??= withFilesAsWritten(host, overlayOriginals, () =>
+          host.createProgram(programRoots, options),
+        )),
       disposeAll: () => {
         try {
           projectWorld?.dispose();
@@ -1077,6 +1095,27 @@ export interface ProgramLoadOptions {
   npmStatic?: readonly string[];
   /** Exact host module specifiers paired with their declaration paths. */
   externalTypes?: readonly (readonly [string, string])[];
+}
+
+/** Runs `build` with the overlay's files served as written (their original
+ * texts), then serves the overlay's texts again. */
+function withFilesAsWritten<T>(
+  host: ts.Ts7Host,
+  originals: ReadonlyMap<string, string | null>,
+  build: () => T,
+): T {
+  if (originals.size === 0) return build();
+  const overlaid = new Map<string, string>();
+  for (const [file, text] of originals) {
+    const current = host.virtualFileText(file);
+    if (current !== undefined) overlaid.set(file, current);
+    if (text !== null) host.addVirtualFile(file, text);
+  }
+  try {
+    return build();
+  } finally {
+    for (const [file, text] of overlaid) host.addVirtualFile(file, text);
+  }
 }
 
 export function loadProgram(

@@ -513,6 +513,27 @@ export function maybeNarrow(lowerer: Lowerer, expr: IrExpr, node: ts.Node): IrEx
         )
       )
         return expr;
+      // A `let c;` binding without a type takes its flow types from what
+      // the code assigns, and the checker's types for those values can omit
+      // undefined (`c = s[i]` past the end): reads keep the actual value.
+      if (
+        symbol &&
+        symbol.declarations.some(
+          (decl) =>
+            ts.isVariableDeclaration(decl) &&
+            decl.initializer === undefined &&
+            decl.type === undefined &&
+            ts.isIdentifier(decl.name) &&
+            decl.parent?.parent !== undefined &&
+            ts.isVariableStatement(decl.parent.parent) &&
+            !/@type\b/.test(
+              ts
+                .getSourceFileOfNode(decl)
+                .text.slice(decl.parent?.parent?.pos ?? decl.pos, ts.tokenStartOfNode(decl)),
+            ),
+        )
+      )
+        return expr;
       if (
         symbol &&
         symbol.declarations.some(

@@ -5367,6 +5367,14 @@ function inferredEvolvingLetType(lowerer: Lowerer, decl: ts.VariableDeclaration)
           invalid = true;
           return "stop";
         }
+        // An index read's checker type omits the undefined a read past the
+        // end (or of an absent key) answers.
+        let right = node.right;
+        while (ts.isParenthesizedExpression(right)) right = right.expression;
+        if (ts.isElementAccessExpression(right)) {
+          invalid = true;
+          return "stop";
+        }
         const mapped = lowerer.mapTypeOf(lowerer.typeOf(node.right));
         if (!mapped || mapped.kind === "dyn" || mapped.kind === "void" || isUnitType(mapped)) {
           invalid = true;

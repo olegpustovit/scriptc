@@ -190,6 +190,11 @@ export class Ts7Host {
     });
   }
 
+  /** The text of a registered in-memory file, or undefined. */
+  virtualFileText(path: string): string | undefined {
+    return this.virtualFiles.get(tsgoPath(path));
+  }
+
   /** Registers an in-memory file served to tsgo by the virtual-FS hooks. */
   addVirtualFile(path: string, content: string): void {
     this.ensureOpen();

@@ -44,6 +44,10 @@ export interface StaticObjectRewrites {
   readonly classes: number;
   readonly functions: number;
   readonly directCalls: number;
+  /** Calls through constant function tables dispatched directly. */
+  readonly tableDispatches: number;
+  /** Reads of constant primitive members replaced by their literal. */
+  readonly foldedReads: number;
   /** Candidates kept as written, with the condition that failed. */
   readonly kept: string[];
 }
@@ -65,6 +69,9 @@ const REFLECTIVE_CALLS = new Set([
   "seal",
   "ownKeys",
 ]);
+
+/** The most members a dispatched function table may have. */
+const MAX_TABLE_ARMS = 16;
 
 function topStatement(n: Node): ts.Statement | null {
   let p: Node = n;
@@ -88,6 +95,132 @@ function assignedFunction(fn: Node): { stmt: ts.ExpressionStatement; lhs: ts.Exp
   if (stmt === undefined || !ts.isExpressionStatement(stmt) || !ts.isSourceFile(stmt.parent))
     return null;
   return { stmt, lhs: assign.left };
+}
+
+/** A function expression stored as a member of an object literal that a
+ * top-level statement creates (`ns.registry = { run: function () {} }`,
+ * `var ns = { util: { trim: function () {} } }`, at any literal depth): the
+ * statement, and a dotted path naming the member. The function's scope is
+ * the module scope, so it can be hoisted to a module function. */
+function literalMemberFunction(fn: Node): { stmt: ts.Statement; path: string } | null {
+  if (!ts.isFunctionExpression(fn) || fn.asteriskToken !== undefined) return null;
+  if (fn.modifiers?.nodes.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) return null;
+  const keys: string[] = [];
+  let n: Node = fn;
+  for (;;) {
+    const member = n.parent;
+    if (member === undefined || !ts.isPropertyAssignment(member) || member.initializer !== n)
+      return null;
+    const name = member.name;
+    if (!ts.isIdentifier(name) && !ts.isStringLiteral(name)) return null;
+    keys.unshift(name.text);
+    const literal = member.parent;
+    if (literal === undefined || !ts.isObjectLiteralExpression(literal)) return null;
+    const holder = literal.parent;
+    if (holder !== undefined && ts.isPropertyAssignment(holder)) {
+      n = literal;
+      continue;
+    }
+    if (
+      holder !== undefined &&
+      ts.isBinaryExpression(holder) &&
+      holder.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      holder.right === literal &&
+      holder.parent !== undefined &&
+      ts.isExpressionStatement(holder.parent) &&
+      ts.isSourceFile(holder.parent.parent)
+    )
+      return { stmt: holder.parent, path: [holder.left.getText(), ...keys].join(".") };
+    if (
+      holder !== undefined &&
+      ts.isVariableDeclaration(holder) &&
+      holder.initializer === literal &&
+      ts.isIdentifier(holder.name)
+    ) {
+      const stmt = holder.parent?.parent;
+      if (stmt !== undefined && ts.isVariableStatement(stmt) && ts.isSourceFile(stmt.parent))
+        return { stmt, path: [holder.name.text, ...keys].join(".") };
+    }
+    return null;
+  }
+}
+
+/** The text of a primitive literal an object literal itself gives `key`
+ * (`{ K: 1 }`, `{ "k": "v" }`, `-1`, `true`, `null`), or null. */
+function ownLiteralMember(literal: Node, key: string): string | null {
+  if (!ts.isObjectLiteralExpression(literal)) return null;
+  let found: string | null = null;
+  for (const m of literal.properties.nodes) {
+    const name = (m as { name?: Node }).name;
+    const text =
+      name !== undefined && (ts.isIdentifier(name) || ts.isStringLiteral(name)) ? name.text : null;
+    if (text !== key) continue;
+    if (!ts.isPropertyAssignment(m) || found !== null) return null;
+    found = primitiveLiteralText(m.initializer);
+    if (found === null) return null;
+  }
+  return found;
+}
+
+function primitiveLiteralText(e: ts.Expression): string | null {
+  if (
+    ts.isNumericLiteral(e) ||
+    ts.isStringLiteral(e) ||
+    e.kind === ts.SyntaxKind.TrueKeyword ||
+    e.kind === ts.SyntaxKind.FalseKeyword ||
+    e.kind === ts.SyntaxKind.NullKeyword
+  )
+    return e.getText();
+  if (
+    ts.isPrefixUnaryExpression(e) &&
+    e.operator === ts.SyntaxKind.MinusToken &&
+    ts.isNumericLiteral(e.operand)
+  )
+    return e.getText();
+  return null;
+}
+
+/** Whether a member expression only reads: not a store target, not
+ * updated, deleted or called. */
+function isPlainRead(node: ts.Expression): boolean {
+  const p = node.parent;
+  if (p === undefined) return false;
+  if (
+    ts.isBinaryExpression(p) &&
+    p.left === node &&
+    p.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+    p.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+  )
+    return false;
+  if (ts.isPrefixUnaryExpression(p) || ts.isPostfixUnaryExpression(p)) {
+    const op = p.operator;
+    if (op === ts.SyntaxKind.PlusPlusToken || op === ts.SyntaxKind.MinusMinusToken) return false;
+  }
+  if (ts.isDeleteExpression(p)) return false;
+  if ((ts.isCallExpression(p) || ts.isNewExpression(p)) && p.expression === node) return false;
+  // Destructuring and for-in/of targets.
+  if (ts.isArrayLiteralExpression(p) || ts.isShorthandPropertyAssignment(p)) return false;
+  if ((ts.isForInStatement(p) || ts.isForOfStatement(p)) && p.initializer === node) return false;
+  if (
+    ts.isPropertyAssignment(p) &&
+    p.initializer === node &&
+    ts.isObjectLiteralExpression(p.parent!)
+  ) {
+    // `({ a: x.k } = …)`: a target only inside an assignment pattern.
+    let q: Node | undefined = p.parent;
+    while (
+      q !== undefined &&
+      (ts.isObjectLiteralExpression(q) ||
+        ts.isArrayLiteralExpression(q) ||
+        ts.isPropertyAssignment(q) ||
+        ts.isParenthesizedExpression(q))
+    ) {
+      const up: Node | undefined = q.parent;
+      if (up !== undefined && ts.isBinaryExpression(up) && up.left === q) return false;
+      q = up;
+    }
+  }
+  return true;
 }
 
 /** Whether a function body behaves the same in strict mode. */
@@ -192,6 +325,30 @@ export function planStaticObjectRewrites(
   for (const op of analysis.ops)
     if (op.kind !== "read" && op.kind !== "write" && op.kind !== "lengthWrite")
       for (const a of analysis.nodes[op.recv]!.atoms) computedRecv.add(a);
+  // One entry per (kind, syntax node): a node the analysis walked in
+  // several contexts (receiver classes, per-site clones) is rewritten only
+  // when the receivers of every context together satisfy the conditions.
+  const mergedOps: { op: (typeof analysis.ops)[number]; atoms: Set<Atom> }[] = [];
+  {
+    const byKey = new Map<string, { op: (typeof analysis.ops)[number]; atoms: Set<Atom> }>();
+    const ids = new Map<Node, number>();
+    for (const op of analysis.ops) {
+      let id = ids.get(op.node);
+      if (id === undefined) ids.set(op.node, (id = ids.size));
+      const key = `${op.kind}:${op.name ?? ""}:${id}`;
+      let entry = byKey.get(key);
+      if (entry === undefined) {
+        byKey.set(key, (entry = { op, atoms: new Set() }));
+        mergedOps.push(entry);
+      }
+      // A nullish receiver makes the read throw, so the rewrites decide on
+      // the other receivers (absent keys read undefined in the analysis:
+      // `ns.util` before `ns.util = {…}` runs).
+      for (const a of analysis.nodes[op.recv]!.atoms)
+        if (!(a.kind === "prim" && (a.label === "undefined" || a.label === "null")))
+          entry.atoms.add(a);
+    }
+  }
   const forIns: ts.Expression[] = [];
   const reflective: ts.CallExpression[] = [];
   for (const sf of analysis.files) {
@@ -402,6 +559,7 @@ export function planStaticObjectRewrites(
   // ── 2. namespace functions to direct functions ─────────────────────
   let functions = 0;
   let directCalls = 0;
+  let tableDispatches = 0;
   for (const o of graphs.objects) {
     if (o.site.kind === "prototype") continue;
     for (const f of o.fields) {
@@ -409,12 +567,17 @@ export function planStaticObjectRewrites(
       const fnAtom = f.values[0]!;
       const fnNode = fnAtom.node;
       if (fnNode === undefined || analysis.protoOf.has(fnAtom)) continue;
-      const site = assignedFunction(fnNode);
+      const assigned = assignedFunction(fnNode);
+      // Also members of object literals a top-level statement creates.
+      const site =
+        assigned !== null
+          ? { stmt: assigned.stmt as ts.Statement, path: assigned.lhs.getText() }
+          : literalMemberFunction(fnNode);
       if (site === null || !fileSet.has(fnNode.getSourceFile())) continue;
       const fn = fnNode as ts.FunctionExpression;
       if (fn.name !== undefined || usesThis(fn) || !noNameOrSource(fnAtom)) continue;
       const sf = fnNode.getSourceFile();
-      const base = `__ns_${site.lhs.getText().replace(/[^\w$]/g, "_")}`;
+      const base = `__ns_${site.path.replace(/[^\w$]/g, "_")}`;
       let name = base;
       for (let i = 1; used.has(name); i++) name = `${base}_${i}`;
       used.add(name);
@@ -428,12 +591,127 @@ export function planStaticObjectRewrites(
       functions++;
     }
   }
+  // ── cross-file references ──────────────────────────────────────────
+  // A read in another file of a constant namespace member that is a
+  // hoisted function or class refers to it through the defining module's
+  // exports: the overlay adds the binding to the module's exports literal
+  // (`module.exports = { app, __ns_app_run: __ns_app_run }`) and the
+  // reading file binds the module once, right after the top-level
+  // statement that requires it (`const __ns_mod_0 = require("lib");`).
+  // The added members are unobservable when the exports object is a
+  // constant object nothing enumerates, reflects on, or lets escape; the
+  // module is loaded by then, so the extra require only returns it; and
+  // the defining module must not require the reading file (a cycle could
+  // run the reading file's code before the module finished).
+  const exportLiterals = new Map<ts.SourceFile, ts.ObjectLiteralExpression | null>();
+  const exportLiteralOf = (sf: ts.SourceFile): ts.ObjectLiteralExpression | null => {
+    if (exportLiterals.has(sf)) return exportLiterals.get(sf)!;
+    let found: ts.ObjectLiteralExpression | null = null;
+    for (const st of sf.statements.nodes) {
+      if (!ts.isExpressionStatement(st) || !ts.isBinaryExpression(st.expression)) continue;
+      const b = st.expression;
+      if (
+        b.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        b.left.getText() === "module.exports" &&
+        ts.isObjectLiteralExpression(b.right)
+      )
+        found = found === null ? b.right : null;
+    }
+    if (found !== null) {
+      const o = graphs.objects.find((x) => x.site.node === found);
+      const atoms = new Set<Atom>(o === undefined ? [] : [o.site.atom]);
+      if (
+        o === undefined ||
+        analysis.escaped.has(o.site.atom) ||
+        computedRecv.has(o.site.atom) ||
+        enumerates(atoms, "") ||
+        reflectsOn(atoms, "")
+      )
+        found = null;
+    }
+    exportLiterals.set(sf, found);
+    return found;
+  };
+  const requiredFiles = (sf: ts.SourceFile, node: Node): ts.SourceFile[] => {
+    const out: ts.SourceFile[] = [];
+    const visit = (n: Node): void => {
+      if (
+        ts.isCallExpression(n) &&
+        ts.isIdentifier(n.expression) &&
+        n.expression.text === "require" &&
+        n.arguments.nodes.length === 1 &&
+        ts.isStringLiteral(n.arguments.nodes[0]!)
+      ) {
+        let target: Node | undefined;
+        try {
+          target = checker.getSymbolAtLocation(n.arguments.nodes[0]!)?.declarations[0];
+        } catch {
+          target = undefined;
+        }
+        if (target !== undefined && ts.isSourceFile(target)) out.push(target);
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(node);
+    void sf;
+    return out;
+  };
+  const moduleBindings = new Map<string, string>();
+  const exportAdds = new Map<ts.SourceFile, Set<string>>();
+  const crossFileReference = (
+    node: ts.PropertyAccessExpression,
+    defining: ts.SourceFile,
+    name: string,
+  ): string | null => {
+    if (process.env["SCRIPTC_SHAPE_CROSS_FILE_REFS"] === "0") return null;
+    const sf = node.getSourceFile();
+    if (!fileSet.has(sf) || exportLiteralOf(defining) === null) return null;
+    if (requiredFiles(defining, defining).includes(sf)) return null;
+    // The reading file's top-level statement that requires the module.
+    const stmts = sf.statements.nodes;
+    const at = stmts.findIndex((st) => requiredFiles(sf, st).includes(defining));
+    if (at < 0) return null;
+    const top = topStatement(node)!;
+    const inFunction = ((): boolean => {
+      for (let p: Node | undefined = node.parent; p !== undefined && p !== top; p = p.parent)
+        if (ts.isFunctionLike(p)) return true;
+      return false;
+    })();
+    if (!inFunction && stmts.indexOf(top) <= at) return null;
+    const key = `${sf.fileName}\0${defining.fileName}`;
+    let binding = moduleBindings.get(key);
+    if (binding === undefined) {
+      binding = `__ns_mod_${moduleBindings.size}`;
+      for (let i = 1; used.has(binding); i++) binding = `__ns_mod_${moduleBindings.size}_${i}`;
+      used.add(binding);
+      moduleBindings.set(key, binding);
+      const req = stmts[at]!;
+      let spec: string | null = null;
+      const find = (n: Node): void => {
+        if (
+          spec === null &&
+          ts.isCallExpression(n) &&
+          ts.isIdentifier(n.expression) &&
+          n.expression.text === "require" &&
+          requiredFiles(sf, n).includes(defining)
+        )
+          spec = n.arguments.nodes[0]!.getText();
+        ts.forEachChild(n, find);
+      };
+      find(req);
+      edit(sf, { start: req.end, end: req.end, text: `\nconst ${binding} = require(${spec!});` });
+    }
+    let adds = exportAdds.get(defining);
+    if (adds === undefined) exportAdds.set(defining, (adds = new Set()));
+    adds.add(name);
+    return `${binding}.${name}`;
+  };
+
   // Direct references: `e.k` (called, constructed or read) in the same file
   // whose receiver is exactly the constant object holding a hoisted
   // function or class.
-  for (const op of analysis.ops) {
+  for (const { op, atoms } of mergedOps) {
     if (op.kind !== "read" || op.name === null) continue;
-    const atoms = analysis.nodes[op.recv]!.atoms;
     if (atoms.size !== 1) continue;
     const recv = [...atoms][0]!;
     const o = constantAtoms.get(recv);
@@ -447,9 +725,18 @@ export function planStaticObjectRewrites(
     // operand or a plain value (the binding holds the same function).
     const parent = node.parent;
     if (parent === undefined || ts.isDeleteExpression(parent)) continue;
-    if (node.getSourceFile() !== field.values[0]!.node!.getSourceFile()) continue;
     if (!ts.isPropertyAccessExpression(node)) continue;
     if (topStatement(node) === null) continue;
+    if (node.getSourceFile() !== field.values[0]!.node!.getSourceFile()) {
+      const text = crossFileReference(node, field.values[0]!.node!.getSourceFile(), name);
+      if (text === null) continue;
+      callEdits.push({
+        sf: node.getSourceFile(),
+        edit: { start: ts.tokenStartOfNode(node), end: node.end, text },
+      });
+      directCalls++;
+      continue;
+    }
     callEdits.push({
       sf: node.getSourceFile(),
       edit: { start: ts.tokenStartOfNode(node), end: node.end, text: name },
@@ -457,21 +744,119 @@ export function planStaticObjectRewrites(
     directCalls++;
   }
 
-  // Text of a node with the direct calls inside it applied.
+  // ── 4. constant primitive members ──────────────────────────────────
+  // `e.k` whose receiver is exactly one constant object and whose member
+  // is a primitive literal written in the object's own literal (`Kind = {
+  // CIRCLE: 1 }`) reads that literal: the member exists from the moment
+  // the object does and nothing writes it, so every read sees it. (A
+  // member stored after the object was created could be read before the
+  // store; those stay reads.)
+  let foldedReads = 0;
+  for (const { op, atoms } of mergedOps) {
+    if (op.kind !== "read" || op.name === null) continue;
+    if (atoms.size !== 1) continue;
+    const o = constantAtoms.get([...atoms][0]!);
+    if (o === undefined || o.site.kind !== "literal") continue;
+    const field = o.fields.find((f) => f.key === op.name);
+    if (field === undefined || field.stores !== 1) continue;
+    const literal = ownLiteralMember(o.site.node, op.name);
+    if (literal === null) continue;
+    const node = op.node;
+    if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) continue;
+    if (!isPlainRead(node) || topStatement(node) === null) continue;
+    callEdits.push({
+      sf: node.getSourceFile(),
+      edit: { start: ts.tokenStartOfNode(node), end: node.end, text: `(${literal})` },
+    });
+    foldedReads++;
+  }
+
+  // Text of a node with the direct calls inside it applied (an edit
+  // inside another edit's range is part of that edit's text).
   const sliceWithCalls = (sf: ts.SourceFile, n: Node): string => {
     const from = ts.tokenStartOfNode(n);
     const inner = callEdits
       .filter((c) => c.sf === sf && c.edit.start >= from && c.edit.end <= n.end)
       .map((c) => c.edit)
-      .sort((a, b) => a.start - b.start);
+      .sort((a, b) => a.start - b.start || b.end - a.end);
     let out = "";
     let at = from;
     for (const e of inner) {
+      if (e.start < at) continue;
       out += sf.text.slice(at, e.start) + e.text;
       at = e.end;
     }
     return out + sf.text.slice(at, n.end);
   };
+
+  // ── 3. calls through constant function tables ──────────────────────
+  // `table[key](…)` where the table is exactly one constant object whose
+  // members are all hoisted functions and the key is a string variable:
+  // a comparison per member calls its function directly, and any other
+  // key reads the table as written. The members do not use `this`, the
+  // table has no accessors, and comparing a string runs no code, so only
+  // the representation of the call changes.
+  const tableCalls: { sf: ts.SourceFile; call: ts.CallExpression; arms: [string, string][] }[] = [];
+  for (const { op, atoms } of mergedOps) {
+    if (op.kind !== "computedRead") continue;
+    const node = op.node;
+    if (!ts.isElementAccessExpression(node) || node.questionDotToken !== undefined) continue;
+    const call = node.parent;
+    if (call === undefined || !ts.isCallExpression(call) || call.expression !== node) continue;
+    if (call.questionDotToken !== undefined || topStatement(call) === null) continue;
+    const where = `table call ${node.getText()}`;
+    if (atoms.size !== 1) {
+      kept.push(`${where}: the table may be ${atoms.size} values`);
+      continue;
+    }
+    const o = constantAtoms.get([...atoms][0]!);
+    if (o === undefined || o.fields.length === 0 || o.fields.length > MAX_TABLE_ARMS) {
+      kept.push(`${where}: not a constant object of at most ${MAX_TABLE_ARMS} members`);
+      continue;
+    }
+    const key = node.argumentExpression;
+    if (!ts.isIdentifier(key)) continue;
+    const keyDecl = declOf(key);
+    if (keyDecl === undefined) continue;
+    const keyValues = analysis.declValues(keyDecl);
+    if (
+      keyValues.size === 0 ||
+      ![...keyValues].every((a) => a.kind === "prim" && a.label === "string")
+    ) {
+      kept.push(`${where}: the key may be ${[...keyValues].map((a) => a.label).join(" | ")}`);
+      continue;
+    }
+    const arms: [string, string][] = [];
+    for (const f of o.fields) {
+      const fn = f.values.length === 1 ? f.values[0]! : undefined;
+      const name = fn === undefined ? undefined : hoisted.get(fn);
+      if (name === undefined || fn!.node!.getSourceFile() !== call.getSourceFile()) break;
+      arms.push([f.key, name]);
+    }
+    if (arms.length !== o.fields.length) {
+      kept.push(`${where}: a member is not a hoisted function of this file`);
+      continue;
+    }
+    tableCalls.push({ sf: call.getSourceFile(), call, arms });
+  }
+  for (const { sf, call, arms } of tableCalls) {
+    const node = call.expression as ts.ElementAccessExpression;
+    const key = node.argumentExpression.getText();
+    const args = call.arguments.nodes.map((a) => sliceWithCalls(sf, a)).join(", ");
+    const table = sliceWithCalls(sf, node.expression);
+    const text = arms
+      .map(([k, name]) => `${key} === ${JSON.stringify(k)} ? ${name}(${args}) : `)
+      .join("");
+    callEdits.push({
+      sf,
+      edit: {
+        start: ts.tokenStartOfNode(call),
+        end: call.end,
+        text: `(${text}${table}[${key}](${args}))`,
+      },
+    });
+    tableDispatches++;
+  }
   for (const h of hoists) {
     const params = h.fn.parameters.nodes
       .map((p) => h.sf.text.slice(ts.tokenStartOfNode(p), p.end))
@@ -508,9 +893,16 @@ export function planStaticObjectRewrites(
   }
 
   for (const c of callEdits) edit(c.sf, c.edit);
+  for (const [sf, names] of exportAdds) {
+    const literal = exportLiteralOf(sf)!;
+    const props = literal.properties.nodes;
+    const text = [...names].map((n) => `${n}: ${n}`).join(", ");
+    const at = props.length > 0 ? props[props.length - 1]!.end : ts.tokenStartOfNode(literal) + 1;
+    edit(sf, { start: at, end: at, text: props.length > 0 ? `, ${text}` : ` ${text} ` });
+  }
   const out = new Map<string, string>();
   for (const [sf, edits] of editsByFile) out.set(sf.fileName, applyEdits(sf.text, edits));
-  return { files: out, classes, functions, directCalls, kept };
+  return { files: out, classes, functions, directCalls, tableDispatches, foldedReads, kept };
 }
 
 /** Applies replacements and insertions; an edit inside an earlier
