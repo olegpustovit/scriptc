@@ -11,23 +11,42 @@ import { isRebindableFunction } from "./rebindable-functions.js";
 import { cjsExportWritesFromOtherModules } from "./cjs-inline-require.js";
 import { isCjsJsFile } from "../program.js";
 
-/** The function an export binding holds, when its declaration shows it. */
-function exportedFunction(lowerer: Lowerer, decl: ts.Node): ts.Node | null {
+/** The value an export declaration or write assigns. */
+function exportedValue(decl: ts.Node): ts.Node | undefined {
   let node: ts.Node | undefined = decl;
   if (ts.isPropertyAccessExpression(node) && node.parent && ts.isBinaryExpression(node.parent))
     node = node.parent;
   if (ts.isBinaryExpression(node)) node = node.right;
   else if (ts.isVariableDeclaration(node) || ts.isPropertyAssignment(node)) node = node.initializer;
   while (node !== undefined && ts.isParenthesizedExpression(node)) node = node.expression;
-  if (node === undefined) return null;
-  if (ts.isIdentifier(node)) return functionOfName(lowerer, node, noBindings).fn;
+  return node;
+}
+
+/** The function an export binding holds, when its declaration shows it. */
+function exportedFunction(lowerer: Lowerer, value: ts.Node): ts.Node | null {
+  if (ts.isIdentifier(value)) return functionOfName(lowerer, value, noBindings).fn;
   if (
-    ts.isFunctionDeclaration(node) ||
-    ts.isFunctionExpression(node) ||
-    ts.isMethodDeclaration(node)
+    ts.isFunctionDeclaration(value) ||
+    ts.isFunctionExpression(value) ||
+    ts.isMethodDeclaration(value)
   )
-    return node;
+    return value;
   return null;
+}
+
+/** The call of a program function an export binding holds (`makeRead()`,
+ * directly or through an immutable alias), whose result the call's
+ * arguments decide. */
+function exportedFactoryCall(lowerer: Lowerer, value: ts.Node): ts.CallExpression | null {
+  const call = ts.isIdentifier(value)
+    ? functionOfName(lowerer, value, noBindings).bound?.expr
+    : value;
+  return call !== undefined &&
+    ts.isCallExpression(call) &&
+    ts.isIdentifier(call.expression) &&
+    functionOfName(lowerer, call.expression, noBindings).fn !== null
+    ? call
+    : null;
 }
 
 /** Whether `node` is `f.apply(this, ...)` or `f.call(this, ...)`, which
@@ -310,12 +329,18 @@ export function refuseModuleMemberThis(
       ? cjsExportWritesFromOtherModules(lowerer, symbol)
       : [];
   for (const decl of [...symbol.declarations, ...writes]) {
-    const fn = exportedFunction(lowerer, decl);
-    if (fn === null || !readsOwnThis(lowerer, fn)) continue;
+    const value = exportedValue(decl);
+    if (value === undefined) continue;
+    // A factory's result reads `this` through the function it returns.
+    const factory = exportedFactoryCall(lowerer, value);
+    if (factory === null) {
+      const fn = exportedFunction(lowerer, value);
+      if (fn === null || !readsOwnThis(lowerer, fn)) continue;
+    } else if (ignoresThis(lowerer, factory, noBindings, 0)) continue;
     lowerer.unsupported(
       "SC1090",
       call,
-      `calling a module export that reads 'this' through its module binding ('${member.text}': Node passes the module object as 'this', which this call has no value for)`,
+      `calling a module export that ${factory !== null ? "may read" : "reads"} 'this' through its module binding ('${member.text}': Node passes the module object as 'this', which this call has no value for)`,
     );
   }
 }

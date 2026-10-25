@@ -7,11 +7,16 @@ import * as ts from "../ts7/adapter.js";
 import { Lowerer } from "./lowerer.js";
 import { cjsNamespaceTargetOf, cjsRequireSnapshotBindingsOf } from "./cjs-inline-require.js";
 import { cjsExportCallIgnoresThis } from "./cjs-exports-object.js";
+import { cjsAccessorSnapshotStores } from "./lower-exprs.js";
 
-function withProgram(files: Record<string, string>, run: (lowerer: Lowerer) => void): void {
+function withProgram(
+  files: Record<string, string>,
+  run: (lowerer: Lowerer) => void,
+  entry = "main.cjs",
+): void {
   const dir = mkdtempSync(join(tmpdir(), "scriptc-cjs-table-"));
   for (const [name, source] of Object.entries(files)) writeFileSync(join(dir, name), source);
-  const load = loadProgram(join(dir, "main.cjs"));
+  const load = loadProgram(join(dir, entry));
   try {
     checkPreflight(load);
     run(new Lowerer(load.program, load.entry, load.moduleOrder));
@@ -135,5 +140,25 @@ lib.external = 1;`,
         "external",
       ]);
     },
+  );
+});
+
+test.for([
+  ["named re-export", 'export { n } from "./lib.cjs";'],
+  ["star re-export", 'export * from "./lib.cjs";'],
+] as const)("ES-module %s links copies of changing CommonJS exports", ([, reexport]) => {
+  withProgram(
+    {
+      "main.mjs": 'import { n } from "./mid.mjs";\nconsole.log(n);',
+      "mid.mjs": reexport,
+      "lib.cjs": "exports.n = 7;\nexports.bump = function () { exports.n = exports.n + 1; };",
+    },
+    (lowerer) => {
+      const mid = lowerer.program.getSourceFiles().find((sf) => sf.fileName.endsWith("mid.mjs"))!;
+      const lib = lowerer.program.getSourceFiles().find((sf) => sf.fileName.endsWith("lib.cjs"))!;
+      lowerer.collectProgram(lowerer.splitFiles());
+      expect(cjsAccessorSnapshotStores(lowerer, lib, mid.statements.nodes[0]!)).toHaveLength(1);
+    },
+    "main.mjs",
   );
 });

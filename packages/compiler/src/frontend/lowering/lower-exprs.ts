@@ -2620,7 +2620,8 @@ function esmBoundNamesOf(lowerer: Lowerer, dep: ts.SourceFile): ReadonlySet<stri
     }
     lowerer.cjsEsmBoundNames = bound;
   }
-  return lowerer.cjsEsmBoundNames.get(dep) ?? new Set();
+  const names = lowerer.cjsEsmBoundNames.get(dep);
+  return names === undefined ? new Set() : names;
 }
 
 /** Node's ES-module loader reads every lexer-visible export of a CommonJS

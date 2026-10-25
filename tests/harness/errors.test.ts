@@ -421,6 +421,35 @@ console.log(lib.read());
     );
   });
 
+  test.for([
+    [
+      "factory result",
+      "function makeRead() { return function () { return this.n; }; } exports.read = makeRead();",
+    ],
+    [
+      "factory result alias",
+      "function makeRead() { return function () { return this.n; }; } const read = makeRead(); exports.read = read;",
+    ],
+  ])(
+    "split table re-exports prove factory-made exports ignore the module-binding receiver: %s",
+    async ([, publish]) => {
+      const r = await compileAndRun(
+        "split-table-reexport-factory-this",
+        `const lib = require("./wrap.cjs");
+console.log("before");
+console.log(lib.read());
+`,
+        "cjs",
+        { "lib.cjs": `${publish}\nexports.n = 7;\n`, "wrap.cjs": wrapper },
+      );
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout).toBe("before\n");
+      expect(r.stderr).toMatch(
+        /^Uncaught Error: calling a module export that may read 'this' through its module binding.*\[SC1090 at .*split-table-reexport-factory-this\.cjs:3\]\n$/,
+      );
+    },
+  );
+
   test.for(
     Object.entries({
       "function expression": "exports.read = function () { return this.n; };",
