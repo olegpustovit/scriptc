@@ -1878,7 +1878,16 @@ export function lowerStmt(lowerer: Lowerer, stmt: ts.Statement): IrStmt | IrStmt
     }
     // Exception-representable values move into the runtime's exception
     // cell. `throw f()` of a void call has no value.
-    let value = lowerer.lowerExpr(stmt.expression);
+    // A thrown object or array literal has no declared type: it is built as
+    // a dynamic object, so the catch binding's checked casts adopt it
+    // (lowerer.untypedLiteralContext).
+    let literal: ts.Expression = stmt.expression;
+    while (ts.isParenthesizedExpression(literal)) literal = literal.expression;
+    let value =
+      (ts.isObjectLiteralExpression(literal) || ts.isArrayLiteralExpression(literal)) &&
+      lowerer.untypedLiteralContext(literal)
+        ? lowerer.lowerExprExpecting(stmt.expression, DYN)
+        : lowerer.lowerExpr(stmt.expression);
     if (value.type.kind === "void")
       lowerer.badType(stmt.expression, lowerer.typeOf(stmt.expression));
     // Preserve primitive reasons and readable record identity across the

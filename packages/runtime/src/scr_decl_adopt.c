@@ -19,8 +19,8 @@
  *
  * Every other checked cast of a dynamic value to a record or array runs the
  * same pass leniently (scr_dyn_adopt_shared): a node that cannot become a
- * capsule keeps the cast's copy, and only a boxed native record or array
- * the cast copied into another layout throws. */
+ * capsule keeps the cast's copy, and only a boxed native dictionary, tuple
+ * or array the cast copied into another layout throws. */
 #include "scr_runtime.h"
 
 #include <stdlib.h>
@@ -98,6 +98,14 @@ static bool scr_decl_native_data(const ScrDyn *n) {
   return key && ((len >= 7 && memcmp(key, "record:", 7) == 0) || (len >= 6 && memcmp(key, "array<", 6) == 0));
 }
 
+/* A boxed native value whose layout a cast cannot view through another
+ * type: a dictionary (index-signature record) or tuple, or an array.
+ * Declared-field records (typed_ref.record) take a cached converted view
+ * instead (width and literal-shaped casts), as before. */
+static bool scr_decl_layout_bound(const ScrDyn *n) {
+  return scr_decl_native_data(n) && !n->v.typed_ref.record;
+}
+
 /* Whether the walk follows a child: plain objects and arrays, and outside
  * the boundary also boxed native data (scr_decl_adopt_walk's layout check). */
 static bool scr_decl_adopt_follows(const ScrDeclAdoptList *list, const ScrDyn *child) {
@@ -108,10 +116,11 @@ static bool scr_decl_adopt_follows(const ScrDeclAdoptList *list, const ScrDyn *c
 /* `capsule` is owned by the call: pushed or released. */
 static bool scr_decl_adopt_walk(ScrDeclAdoptList *list, ScrDyn *n, ScrDyn *capsule,
                                 const ScrDynPath *path, unsigned depth) {
-  /* Outside the boundary, a native record or array the cast copied into
-   * another layout (`Record<string, number>` boxed, then cast to `{ x; y }`)
-   * would leave two objects where the program has one: the cast throws. */
-  if (list->lenient && n && capsule && capsule->kind == SCR_DYN_TYPED_REF && scr_decl_native_data(n) &&
+  /* Outside the boundary, a native dictionary, tuple or array the cast
+   * copied into another layout (`Record<string, number>` boxed, then cast
+   * to `{ x; y }`) would leave two objects where the program has one: the
+   * cast throws. */
+  if (list->lenient && n && capsule && capsule->kind == SCR_DYN_TYPED_REF && scr_decl_layout_bound(n) &&
       n->v.typed_ref.ptr != capsule->v.typed_ref.ptr) {
     scr_dyn_release(capsule);
     scr_dyn_check_fail(path,

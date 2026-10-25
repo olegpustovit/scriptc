@@ -403,7 +403,8 @@ export function lowerDynObjectLiteral(
             : !boxValue &&
                 (ts.isObjectLiteralExpression(valueExpr) ||
                   (ts.isArrayLiteralExpression(valueExpr) &&
-                    holdsEvolvingArray(lowerer, valueExpr)))
+                    (holdsEvolvingArray(lowerer, valueExpr) ||
+                      lowerer.untypedLiteralContext(valueExpr))))
               ? lowerer.lowerExprExpecting(valueExpr, DYN)
               : lowerer.lowerExpr(valueExpr as ts.Expression);
       raw = fenceClosureProbe(lowerer, valueExpr, undefined, lowerValue) ?? lowerValue();

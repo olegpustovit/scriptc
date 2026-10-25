@@ -1636,18 +1636,19 @@ function checkedDynCast(
   if (
     holdsReference(lowerer, target) &&
     !freshDynSource(lowerer, expr, inner) &&
-    !resultOnlyRead(expr)
+    !resultOnlyRead(lowerer, expr)
   ) {
     return adoptingCast(lowerer, inner, target, locOf(expr), "dyn.adoptShared");
   }
   return { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) };
 }
 
-/** A cast whose result only serves one member read (`(value as T).name`,
- * `(value as T[]).length`, `(value as T).method()`): the converted value is
- * never stored, compared or written, so whether it is the source itself or a
- * copy cannot be observed. */
-function resultOnlyRead(expr: ts.AsExpression | ts.TypeAssertion): boolean {
+/** A cast whose result only serves one read of a primitive member
+ * (`(value as T).name`, `(value as T[]).length`): the converted value is
+ * never stored, compared, written or called through, and the read yields no
+ * reference into it, so whether it is the source itself or a copy cannot be
+ * observed. */
+function resultOnlyRead(lowerer: Lowerer, expr: ts.AsExpression | ts.TypeAssertion): boolean {
   let node: ts.Node = expr;
   while (node.parent !== undefined && ts.isParenthesizedExpression(node.parent)) node = node.parent;
   const access = node.parent;
@@ -1659,10 +1660,21 @@ function resultOnlyRead(expr: ts.AsExpression | ts.TypeAssertion): boolean {
     )
   )
     return false;
+  const primitive =
+    ts.TypeFlags.StringLike |
+    ts.TypeFlags.NumberLike |
+    ts.TypeFlags.BooleanLike |
+    ts.TypeFlags.BigIntLike |
+    ts.TypeFlags.Undefined |
+    ts.TypeFlags.Null;
+  const read = lowerer.typeOf(access);
+  const parts = read.isUnionType() ? ts.constituentTypes(read) : [read];
+  if (!parts.every((part) => (part.flags & primitive) !== 0)) return false;
   let use: ts.Node = access;
   while (use.parent !== undefined && ts.isParenthesizedExpression(use.parent)) use = use.parent;
   const parent = use.parent;
   if (parent === undefined) return true;
+  if (ts.isCallExpression(parent) && parent.expression === use) return false;
   if (
     ts.isBinaryExpression(parent) &&
     parent.left === use &&
