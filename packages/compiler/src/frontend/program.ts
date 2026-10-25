@@ -146,6 +146,8 @@ import {
   shapeOverlayDone,
   shapeOverlayEnabled,
   shapeOverlayer,
+  captureShapeOverlayState,
+  type ShapeOverlayLoadState,
 } from "./shape-inference/index.js";
 import { inferredJsDiagnosticSuppressed } from "./inferred-js-diagnostics.js";
 import {
@@ -364,6 +366,9 @@ export interface TypeWorldDifferences {
 export interface LoadResult {
   program: ts.Program;
   entry: ts.SourceFile;
+  /** Shape inference's overlay state for this load (restored before its
+   * lowering: a later load resets the per-process registry). */
+  shapeOverlayState?: ShapeOverlayLoadState;
   /** User source files in Node's evaluation order: depth-first postorder
    * of the import graph from the entry, each module once. The entry is
    * last. Empty until checkPreflight runs (and empty when preflight fails
@@ -1047,6 +1052,7 @@ function loadProgram7(
     return {
       program,
       entry,
+      shapeOverlayState: captureShapeOverlayState(),
       moduleOrder: [],
       configDiags: config.diags,
       ...(declBoundaryNotes.length > 0 ? { declBoundaryNotes } : {}),

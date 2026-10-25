@@ -65,6 +65,41 @@ export function shapeOverlayAnnotationCount(): number {
   return overlayAnnotations;
 }
 
+/** The overlay's per-load state (the registry is per process, and a later
+ * load resets it): a load captures it, and the lowering of that load
+ * restores it. */
+export interface ShapeOverlayLoadState {
+  readonly renderedFiles: ReadonlySet<string>;
+  readonly staticRewriteFiles: ReadonlySet<string>;
+  readonly staticObjectStats: typeof staticObjectStats;
+  readonly overlayDone: boolean;
+  readonly overlayFiles: ReadonlySet<string>;
+  readonly overlayAnnotations: number;
+  readonly overlayDeadBranches: number;
+}
+
+export function captureShapeOverlayState(): ShapeOverlayLoadState {
+  return {
+    renderedFiles,
+    staticRewriteFiles,
+    staticObjectStats,
+    overlayDone,
+    overlayFiles,
+    overlayAnnotations,
+    overlayDeadBranches,
+  };
+}
+
+export function restoreShapeOverlayState(state: ShapeOverlayLoadState): void {
+  renderedFiles = state.renderedFiles;
+  staticRewriteFiles = state.staticRewriteFiles;
+  staticObjectStats = state.staticObjectStats;
+  overlayDone = state.overlayDone;
+  overlayFiles = state.overlayFiles;
+  overlayAnnotations = state.overlayAnnotations;
+  overlayDeadBranches = state.overlayDeadBranches;
+}
+
 export function resetShapeOverlay(): void {
   renderedFiles = new Set();
   staticRewriteFiles = new Set();

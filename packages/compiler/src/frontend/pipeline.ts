@@ -3,6 +3,7 @@
 import {
   beginShapeOverlayBuild,
   excludeRefusedOverlay,
+  restoreShapeOverlayState,
   shapeOverlayActive,
   shapeOverlayReport,
 } from "./shape-inference/index.js";
@@ -700,8 +701,10 @@ function loadFrontend(
         ].map((sf) => [sf.fileName, sf.text]),
       ),
     lower: (opts) => {
-      const lowerOnce = (): LowerResult =>
-        lowerToIr(finalLoad.program, finalLoad.entry, finalLoad.moduleOrder, {
+      const lowerOnce = (): LowerResult => {
+        if (finalLoad.shapeOverlayState !== undefined)
+          restoreShapeOverlayState(finalLoad.shapeOverlayState);
+        return lowerToIr(finalLoad.program, finalLoad.entry, finalLoad.moduleOrder, {
           ...opts,
           frontendServices: finalLoad.services,
           startupCrash: finalLoad.startupCrash ?? null,
@@ -711,6 +714,7 @@ function loadFrontend(
           externalTypes: finalLoad.externalTypes,
           externalTypeSpecifiersByFile: finalLoad.externalTypeSpecifiersByFile,
         });
+      };
       let lowered = lowerOnce();
       // Shape inference never breaks compilation (shape-inference/
       // fallback.ts): refusals drop the overlay annotations they depend on
@@ -720,9 +724,19 @@ function loadFrontend(
       // annotations they are blamed on: a fence the overlay did not cause
       // stays as it is without the overlay.
       let level: "annotations" | "files" | "all" | "fences" = "annotations";
+      // Deferred refusals the coverage pass found in code the lowering
+      // judged unreached count too: that code can still run.
+      const fencesOf = (l: LowerResult): ScrDiagnostic[] => [
+        ...l.runtimeFences,
+        ...(l.unreached?.runtimeFences ?? []),
+      ];
+      if (process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] !== undefined)
+        process.stderr.write(
+          `[shape-fallback] lowered: overlay ${shapeOverlayActive()}, ${lowered.diagnostics.length} refusals, ${fencesOf(lowered).length} deferred\n`,
+        );
       for (let round = 0; shapeOverlayActive(); round++) {
         const failed = lowered.diagnostics.length > 0;
-        const refusals = failed ? lowered.diagnostics : lowered.runtimeFences;
+        const refusals = failed ? lowered.diagnostics : fencesOf(lowered);
         if (refusals.length === 0) break;
         let changed: boolean;
         if (!failed) {
@@ -741,15 +755,15 @@ function loadFrontend(
           }
           // The same round also drops what the deferred refusals blame,
           // saving a reload.
-          if (level !== "all" && lowered.runtimeFences.length > 0)
+          if (level !== "all" && fencesOf(lowered).length > 0)
             changed =
-              excludeRefusedOverlay(finalLoad.program, lowered.runtimeFences, "fences") || changed;
+              excludeRefusedOverlay(finalLoad.program, fencesOf(lowered), "fences") || changed;
         }
         if (process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] !== undefined)
           process.stderr.write(
             `[shape-fallback] round ${round} level ${level}: ${refusals.length} refusals (${refusals
               .slice(0, process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] === "all" ? undefined : 3)
-              .map((d) => `${d.loc.file.split("/").pop()}:${d.loc.start} ${d.message.slice(0, 60)}`)
+              .map((d) => `${d.loc.file.split("/").pop()}:${d.loc.start} ${process.env["SCRIPTC_DEBUG_SHAPE_FALLBACK"] === "all" ? d.message : d.message.slice(0, 60)}`)
               .join("; ")}), changed ${changed}\n`,
           );
         if (!changed) break;

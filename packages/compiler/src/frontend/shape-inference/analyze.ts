@@ -196,6 +196,25 @@ const ARRAY_METHODS: ReadonlySet<string> = new Set([
 ]);
 const MAX_STEPS = 20_000_000;
 
+/** The well-known symbols, static members of `Symbol` (Node 24). */
+const WELL_KNOWN_SYMBOLS: ReadonlySet<string> = new Set([
+  "asyncDispose",
+  "asyncIterator",
+  "dispose",
+  "hasInstance",
+  "isConcatSpreadable",
+  "iterator",
+  "match",
+  "matchAll",
+  "replace",
+  "search",
+  "species",
+  "split",
+  "toPrimitive",
+  "toStringTag",
+  "unscopables",
+]);
+
 /** The members String.prototype, Number.prototype and Boolean.prototype
  * define (Node 24); Object.prototype's come from OBJECT_PROTOTYPE_MEMBERS. */
 const PRIMITIVE_MEMBERS: Readonly<Record<"string" | "number" | "boolean", ReadonlySet<string>>> = {
@@ -609,6 +628,17 @@ class Analyzer {
    * and which function each `new F()` instance atom belongs to. */
   readonly protoOf = new Map<Atom, Atom>();
   readonly fnOfInstance = new Map<Atom, Atom>();
+  /** Per dictionary atom, the prototypes it was created with (Object.create). */
+  private readonly dictProtos = new Map<Atom, number>();
+  /** Per object literal atom, the keys it has from its creation: another
+   * key may be absent when read (flow-insensitively, before its write). */
+  private readonly literalOwnKeys = new Map<Atom, ReadonlySet<string>>();
+  private readonly protoReads = new Set<string>();
+  dictProto(d: Atom): number {
+    let id = this.dictProtos.get(d);
+    if (id === undefined) this.dictProtos.set(d, (id = this.newNode()));
+    return id;
+  }
   protoAtom(fn: Atom): Atom {
     let p = this.protoOf.get(fn);
     if (p === undefined) {
@@ -1641,7 +1671,15 @@ class Analyzer {
     const key = this.ctxKey(e);
     const memo = this.exprMemo.get(key);
     if (memo !== undefined) return memo;
-    const id = this.exprUncached(e);
+    let id = this.exprUncached(e);
+    // A member of an optional chain (`a?.b.c`, `f?.()`) is undefined when
+    // the chain short-circuits.
+    if ((e.flags & ts.NodeFlags.OptionalChain) !== 0) {
+      const out = this.newNode();
+      this.edge(id, out);
+      this.add(out, this.prim("undefined"));
+      id = out;
+    }
     this.exprMemo.set(key, id);
     if (this.traceTop && !this.nodeLabel.has(id))
       this.nodeLabel.set(
@@ -2094,6 +2132,7 @@ class Analyzer {
       if (key !== null) this.edge(value, this.field(atom, key));
       else this.edge(value, this.anyField(atom));
     }
+    if (!this.literalOwnKeys.has(atom)) this.literalOwnKeys.set(atom, new Set(keys));
     if (!this.siteAtoms.has(atom) && this.siteAtoms.add(atom))
       this.sites.push({
         atom,
@@ -2537,7 +2576,10 @@ class Analyzer {
         return;
       case "array":
         if (name === "length") this.add(dst, this.prim("number"));
-        else if (/^\d+$/.test(name)) this.edge(this.element(a), dst);
+        else if (/^\d+$/.test(name)) {
+          this.edge(this.element(a), dst);
+          this.add(dst, this.prim("undefined"));
+        }
         else {
           // A named property, written by name or under an unknown key; an own field shadows a method.
           if (ARRAY_METHODS.has(name)) {
@@ -2558,6 +2600,9 @@ class Analyzer {
           this.add(dst, this.top);
         this.edge(this.field(a, name), dst);
         this.edge(this.anyField(a), dst);
+        const own = this.literalOwnKeys.get(a);
+        if (own !== undefined && !own.has(name) && !OBJECT_PROTOTYPE_MEMBERS.has(name))
+          this.add(dst, this.prim("undefined"));
         if (this.namespaceAtoms.has(a) && name !== "exports") {
           this.loadConstraint(this.field(a, "exports"), name, dst, site);
         }
@@ -2577,10 +2622,23 @@ class Analyzer {
           this.add(dst, this.builtin(`object.${name}`, a));
         return;
       }
-      case "dictionary":
+      case "dictionary": {
         this.edge(this.anyField(a), dst);
         this.edge(this.field(a, name), dst);
+        // An absent key reads undefined, or what the prototype has.
+        this.add(dst, this.prim("undefined"));
+        const proto = this.dictProtos.get(a);
+        // Once per dictionary, name and destination: prototype chains can
+        // be cyclic in the analysis (`Object.create(this)`).
+        const key = `${a.id}:${name}:${dst}`;
+        if (proto !== undefined && !this.protoReads.has(key)) {
+          this.protoReads.add(key);
+          this.on(proto, (p) => {
+            if (p.kind !== "prim") this.loadAtom(p, name, dst, site);
+          });
+        }
         return;
+      }
       case "promise":
         if (name === "then" || name === "catch" || name === "finally")
           this.add(dst, this.builtin(`promise.${name}`, a));
@@ -2616,8 +2674,13 @@ class Analyzer {
     )
       this.add(dst, this.prim("number"));
     else if (path === "Math" && /^[A-Z0-9_]+$/.test(name)) this.add(dst, this.prim("number"));
-    else if (path === "Symbol") this.add(dst, this.prim("symbol"));
-    else if (path === "Error.instance" || path === "error") {
+    else if (path === "Symbol") {
+      // The well-known symbols are symbols; `Symbol.for` and `Symbol.keyFor`
+      // are functions (a call of a symbol would answer nothing).
+      if (WELL_KNOWN_SYMBOLS.has(name)) this.add(dst, this.prim("symbol"));
+      else if (name === "for" || name === "keyFor") this.add(dst, this.builtin(`Symbol.${name}`));
+      else this.add(dst, this.top);
+    } else if (path === "Error.instance" || path === "error") {
       if (name === "message" || name === "stack" || name === "name")
         this.add(dst, this.prim("string"));
       else this.add(dst, this.top);
@@ -2676,11 +2739,18 @@ class Analyzer {
           this.add(dst, this.top);
           return;
         case "array":
+          // An index past the end (or a hole) reads undefined.
+          this.edge(this.element(a), dst);
+          this.add(dst, this.prim("undefined"));
+          return;
         case "collection":
           this.edge(this.element(a), dst);
           return;
         case "prim":
-          if (a.label === "string") this.add(dst, this.prim("string"));
+          if (a.label === "string") {
+            this.add(dst, this.prim("string"));
+            this.add(dst, this.prim("undefined"));
+          }
           return;
         case "object":
         case "dictionary":
@@ -2699,6 +2769,8 @@ class Analyzer {
           copy();
           this.lateCopies.push(copy);
           if (a.kind === "instance" || a.kind === "class") this.add(dst, this.top);
+          // A key the object does not have reads undefined.
+          else this.add(dst, this.prim("undefined"));
           return;
         }
         default:
@@ -3398,6 +3470,9 @@ class Analyzer {
           label: `Object.create@${locLabel(site)}`,
           node: site,
         }));
+        // Its members are inherited from the prototype argument.
+        this.edge(arg(0), this.dictProto(d));
+        if (args[1] !== undefined) this.sink(args[1], `property descriptors at ${locLabel(site)}`);
         this.add(dst, d);
         return;
       }
