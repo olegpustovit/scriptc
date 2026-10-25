@@ -24,7 +24,10 @@ const cacheDir = join(repoRoot, "node_modules/.cache/scriptc-tests");
 const sanitize = process.env["SCRIPTC_SAN"] === "1";
 /* Sanitized builds of the published Effect pilots alone take 290 to 330 s on a 16-vCPU host, most of it in
  * the sanitized native link: near or past the suite's 300 s default. */
-const effectBuildTimeout = sanitize ? 900_000 : undefined;
+// The shape overlay (SCRIPTC_SHAPE_OVERLAY=1, validation runs) analyzes the
+// program and may lower it a second time without the overlay.
+const effectBuildTimeout =
+  sanitize || process.env["SCRIPTC_SHAPE_OVERLAY"] === "1" ? 900_000 : undefined;
 // Measured milliseconds per test on a CI runner (scripts/ci-test-costs.mjs).
 const testCosts = (
   JSON.parse(readFileSync(new URL("./npm-static-costs.json", import.meta.url), "utf8")) as {
