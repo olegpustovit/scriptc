@@ -3955,6 +3955,12 @@ function buildLibFnSignatures() {
      * Throws the path TypeError, changing nothing, when a converted object
      * is not plain data (a prototype, accessors, symbols, frozen state). */
     "dyn.declAdopt": { argTypes: [DYN, DYN], result: VOID },
+    /** dyn.declAdopt for every other checked cast of a dynamic value to a
+     * record or array (`value as T`): a shared source object or array
+     * becomes a live capsule of the value built from it. A node that is not
+     * plain data, or that the value holds twice, keeps its separate copy;
+     * never throws. */
+    "dyn.adoptShared": { argTypes: [DYN, DYN], result: VOID },
     "dyn.cloneMissing": { argTypes: [], result: DYN },
     /** structuredClone with a NON-EMPTY transfer array of static values:
      * nothing static is transferable, so the call always throws Node's

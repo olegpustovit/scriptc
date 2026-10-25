@@ -1619,7 +1619,18 @@ export function lowerAsExpression(
         `number, string, boolean, records, arrays, and unions of those)`,
     );
   }
+  // A record or array built from a dynamic value another holder may still
+  // reference keeps one identity with it (adoptingCast). A fresh parse
+  // result has no other holder, and keeps the fused schema-directed parse.
+  if (holdsReference(lowerer, target) && !isFreshJsonParse(inner)) {
+    return adoptingCast(lowerer, inner, target, locOf(expr), "dyn.adoptShared");
+  }
   return { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) };
+}
+
+/** `JSON.parse(text)` itself: a value nothing else references yet. */
+function isFreshJsonParse(e: IrExpr): boolean {
+  return e.kind === "libCall" && e.fn === "json.parse";
 }
 
 /** True when a type holds a record or an array somewhere (values whose
@@ -1657,6 +1668,21 @@ function declBoundaryCast(
   if (!holdsReference(lowerer, target)) {
     return { kind: "dynCheck", value: inner, type: target, loc };
   }
+  return adoptingCast(lowerer, inner, target, loc, "dyn.declAdopt");
+}
+
+/** The checked conversion of `inner` to `target` followed by adoption
+ * (`dyn.declAdopt` at the boundary, the lenient `dyn.adoptShared`
+ * elsewhere): every source object or array that something else still
+ * references becomes a live capsule of the native value built from it. */
+function adoptingCast(
+  lowerer: Lowerer,
+  inner: IrExpr,
+  target: IrType,
+  loc: SrcLoc,
+  fn: "dyn.declAdopt" | "dyn.adoptShared",
+): IrExpr {
+  const boundary = fn === "dyn.declAdopt";
   const source = lowerer.declareHiddenLocal("%boundarySource", DYN);
   const value = lowerer.declareHiddenLocal("%boundaryValue", target);
   return {
@@ -1669,7 +1695,7 @@ function declBoundaryCast(
         init: {
           kind: "dynCheck",
           value: varRef(source.id, DYN, loc),
-          adopt: true,
+          ...(boundary ? { adopt: true as const } : {}),
           type: target,
           loc,
         },
@@ -1679,7 +1705,7 @@ function declBoundaryCast(
         kind: "exprStmt",
         expr: {
           kind: "libCall",
-          fn: "dyn.declAdopt",
+          fn,
           args: [
             varRef(source.id, DYN, loc),
             {
