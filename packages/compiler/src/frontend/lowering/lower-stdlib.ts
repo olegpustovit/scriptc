@@ -35,14 +35,7 @@ import { esmNamedImportLinkCrash, isCjsJsFile, locOf, npmPackageNameOf } from ".
 import { foldedStringKeyOf, lowerDynObjectLiteral } from "./expressions/object-literals.js";
 import { noteEventListeners } from "./lower-event-target.js";
 import { PoisonError, newFnCtx, own } from "./lowerer.js";
-import {
-  NODE24_FETCH_COMPAT_PROFILE,
-  STATIC_HEADERS_CALLS,
-  STATIC_READABLE_STREAM_CALLS,
-  STATIC_READABLE_STREAM_READS,
-  STATIC_RESPONSE_CALLS,
-  STATIC_RESPONSE_READS,
-} from "../../compat/fetch-profile.js";
+import { node24FetchCompatProfile, staticFetchMembers } from "../../compat/fetch-profile.js";
 import { classGeneratorIterable } from "./class-iterables.js";
 import { generatorDrain } from "./iterator-adapters.js";
 
@@ -434,7 +427,7 @@ function fenceRequestInitObject(
     : contextual
       ? [contextual]
       : [];
-  const rows = NODE24_FETCH_COMPAT_PROFILE.inventory.entries.filter(
+  const rows = node24FetchCompatProfile().inventory.entries.filter(
     (entry) => entry.owner === "RequestInit" && entry.placement === "dictionary",
   );
   const shadowed = new Set<string>();
@@ -837,7 +830,7 @@ function fetchInventoryStatus(
   placement: "static" | "prototype" | "prototype-symbol",
 ): "static" | "unsupported" | "out-of-scope" | null {
   return (
-    NODE24_FETCH_COMPAT_PROFILE.inventory.entries.find(
+    node24FetchCompatProfile().inventory.entries.find(
       (entry) => entry.owner === owner && entry.member === member && entry.placement === placement,
     )?.status ?? null
   );
@@ -848,7 +841,7 @@ function fetchInventoryReason(
   member: string,
   placement: "static" | "prototype" | "prototype-symbol",
 ): string | undefined {
-  return NODE24_FETCH_COMPAT_PROFILE.inventory.entries.find(
+  return node24FetchCompatProfile().inventory.entries.find(
     (entry) => entry.owner === owner && entry.member === member && entry.placement === placement,
   )?.reason;
 }
@@ -951,8 +944,9 @@ export function fenceStaticResponseMember(
       member.startsWith("[Symbol.") ? "prototype-symbol" : "prototype",
     );
 
+  const projected = staticFetchMembers();
   const supported = (member: string) =>
-    use === "call" ? STATIC_RESPONSE_CALLS.has(member) : STATIC_RESPONSE_READS.has(member);
+    use === "call" ? projected.responseCalls.has(member) : projected.responseReads.has(member);
   if (members.every(supported)) return null;
   const member = members.find((candidate) => !supported(candidate))!;
   if (status(member) === "unsupported") {
@@ -993,12 +987,9 @@ export function fenceStaticHeadersMember(
       member.startsWith("[Symbol.") ? "prototype-symbol" : "prototype",
     );
 
-  if (use === "call" && members.every((member) => STATIC_HEADERS_CALLS.has(member))) {
-    return null;
-  }
-  const member = members.find(
-    (candidate) => use !== "call" || !STATIC_HEADERS_CALLS.has(candidate),
-  )!;
+  const headersCalls = staticFetchMembers().headersCalls;
+  if (use === "call" && members.every((member) => headersCalls.has(member))) return null;
+  const member = members.find((candidate) => use !== "call" || !headersCalls.has(candidate))!;
   if (status(member) === "unsupported") {
     lowerer.noLowering(
       `Headers.${member}`,
@@ -1108,7 +1099,7 @@ function fetchInterfaceInventoryOwner(
   const symbol = [type.getSymbol(), type.getAliasSymbol()].find(
     (candidate) =>
       candidate !== undefined &&
-      NODE24_FETCH_COMPAT_PROFILE.inventory.interfaces.includes(ts.symbolName(candidate)) &&
+      node24FetchCompatProfile().inventory.interfaces.includes(ts.symbolName(candidate)) &&
       lowerer.isStdlibSymbol(candidate),
   );
   return symbol ? { owner: ts.symbolName(symbol), symbol } : null;
@@ -1123,7 +1114,7 @@ function fenceFetchObjectMembers(
   if (!resolved) return;
   const { owner, symbol } = resolved;
   for (const { member, node } of members) {
-    const row = NODE24_FETCH_COMPAT_PROFILE.inventory.entries.find(
+    const row = node24FetchCompatProfile().inventory.entries.find(
       (entry) =>
         entry.owner === owner &&
         entry.member === member &&
@@ -1136,7 +1127,7 @@ function fenceFetchObjectMembers(
     // Static data properties retain the ordinary checked-dynamic keyed-read
     // lowering. Only a method extraction loses the receiver that its direct
     // call bridge would preserve; non-static rows keep their inventory fence.
-    const operation = NODE24_FETCH_COMPAT_PROFILE.operations.find(
+    const operation = node24FetchCompatProfile().operations.find(
       (candidate) => candidate.id === row.id,
     );
     if (row.status === "static" && operation?.kind === "property") {
@@ -1235,7 +1226,7 @@ export function lowerFetchElementMethodCall(
     return null;
   }
   const rows = members.map((member) =>
-    NODE24_FETCH_COMPAT_PROFILE.inventory.entries.find(
+    node24FetchCompatProfile().inventory.entries.find(
       (entry) =>
         entry.owner === resolved.owner &&
         entry.member === member &&
@@ -1397,10 +1388,11 @@ export function fenceStaticReadableStreamMember(
       member.startsWith("[Symbol.") ? "prototype-symbol" : "prototype",
     );
 
+  const projected = staticFetchMembers();
   const supported = (member: string) =>
     use === "call"
-      ? STATIC_READABLE_STREAM_CALLS.has(member)
-      : STATIC_READABLE_STREAM_READS.has(member);
+      ? projected.readableStreamCalls.has(member)
+      : projected.readableStreamReads.has(member);
   if (members.every(supported)) return null;
   const member = members.find((candidate) => !supported(candidate))!;
   if (status(member) === "unsupported") {
@@ -1630,16 +1622,22 @@ export function lowerStaticAbortControllerCall(
   call: ts.CallExpression,
 ): IrExpr | null {
   const access = call.expression;
+  // An optional chain (`controller?.abort()`) lowers the call again once it
+  // has narrowed the receiver (Lowerer.chainHandled).
   if (
-    call.questionDotToken ||
+    (call.questionDotToken && !lowerer.chainHandled.has(call)) ||
     call.arguments.nodes.some((argument) => ts.isSpreadElement(argument)) ||
     (!ts.isPropertyAccessExpression(access) && !ts.isElementAccessExpression(access)) ||
-    access.questionDotToken ||
+    (access.questionDotToken && !lowerer.chainHandled.has(access)) ||
     staticResponseMemberName(lowerer, access) !== "abort"
   ) {
     return null;
   }
-  const receiverTs = lowerer.checker.getBaseTypeOfLiteralType(lowerer.typeOf(access.expression));
+  const receiverTs = lowerer.checker.getBaseTypeOfLiteralType(
+    access.questionDotToken
+      ? lowerer.checker.getNonNullableType(lowerer.typeOf(access.expression))
+      : lowerer.typeOf(access.expression),
+  );
   const symbol = receiverTs.getAliasSymbol() ?? receiverTs.getSymbol();
   if (
     symbol === undefined ||
@@ -2216,6 +2214,8 @@ export function lowerDynamicImportCall(lowerer: Lowerer, call: ts.CallExpression
       call,
       "dynamic import() of computed specifiers (the module graph resolves at " +
         "build time — the specifier must be a string literal)",
+      undefined,
+      "dynamic-import",
     );
   }
   if (call.arguments.nodes.length !== 1) {
@@ -2566,35 +2566,8 @@ export function lowerMathProperty(
   const member = lowerer.stdlibGlobalMember(expr, "Math");
   if (member === null) return null;
   const loc = locOf(expr);
-  const staticValue = own(STATIC_MATH_PROPS, member);
-  if (staticValue !== undefined) {
-    return { kind: "numLit", value: staticValue, type: F64, loc };
-  }
-  const native = own(STATIC_MATH_FNS, member);
-  if (native && (member === "min" || member === "max" || member === "hypot"))
-    return lowerer.lowerNativeCallableValue(
-      {
-        fn: member === "min" ? "math.minArr" : member === "max" ? "math.maxArr" : "math.hypotArr",
-        params: [arrayOf(F64)],
-        result: F64,
-        valueParams: [{ mode: "rest", type: F64 }],
-      },
-      `Math.${member}`,
-      loc,
-    );
-  if (native && member !== "min" && member !== "max" && member !== "hypot") {
-    const params = Array.from({ length: native.arity }, () => F64);
-    return lowerer.lowerNativeCallableValue(
-      {
-        fn: native.fn,
-        params,
-        result: F64,
-        valueParams: params.map((type) => ({ mode: "required", type })),
-      },
-      `Math.${member}`,
-      loc,
-    );
-  }
+  const value = mathMemberValue(lowerer, member, loc);
+  if (value !== null) return value;
   const propType = own(STDLIB_SURFACE.math.props, member);
   if (propType !== undefined) {
     lowerer.refuseUnsupportedApi(`'Math.${member}'`, expr);
@@ -2606,6 +2579,40 @@ export function lowerMathProperty(
     lowerer.unsupported("SC1090", expr, `Math methods as values (call '${member}' directly)`);
   }
   return null; // declared-but-untabled members fall through generically
+}
+
+/** The value of the Math member `member`: a constant, or the interned
+ * native function value of a Math function. Null for other members. */
+export function mathMemberValue(lowerer: Lowerer, member: string, loc: SrcLoc): IrExpr | null {
+  const staticValue = own(STATIC_MATH_PROPS, member);
+  if (staticValue !== undefined) {
+    return { kind: "numLit", value: staticValue, type: F64, loc };
+  }
+  const native = own(STATIC_MATH_FNS, member);
+  if (!native) return null;
+  if (member === "min" || member === "max" || member === "hypot")
+    return lowerer.lowerNativeCallableValue(
+      {
+        fn: member === "min" ? "math.minArr" : member === "max" ? "math.maxArr" : "math.hypotArr",
+        params: [arrayOf(F64)],
+        result: F64,
+        valueParams: [{ mode: "rest", type: F64 }],
+        valueLength: 2,
+      },
+      `Math.${member}`,
+      loc,
+    );
+  const params = Array.from({ length: native.arity }, () => F64);
+  return lowerer.lowerNativeCallableValue(
+    {
+      fn: native.fn,
+      params,
+      result: F64,
+      valueParams: params.map((type) => ({ mode: "required", type })),
+    },
+    `Math.${member}`,
+    loc,
+  );
 }
 
 export function npmPackageOf(lowerer: Lowerer, type: ts.Type): string | null {

@@ -110,10 +110,9 @@ describe("LLVM runtime RC symbols", () => {
     expect(releaseSym(host, { kind: "union", unionId: "u0" } as never)).toBe(
       "@sc_rc_release_union",
     );
-    // Array retains inline; array releases stay calls.
     const array = { kind: "array", elem: { kind: "string" } } as never;
     expect(retainSym(host, array)).toBe("@sc_rc_retain_arr");
-    expect(releaseSym(host, array)).toBe("@scr_arr_release");
+    expect(releaseSym(host, array)).toBe("@sc_rc_release_arr");
     expect(retainSym(host, { kind: "dyn" })).toBe("@sc_rc_retain_dyn");
     expect(releaseSym(host, { kind: "dyn" })).toBe("@sc_rc_release_dyn");
     // Unmirrored families and caught snapshots keep their runtime entry points.
@@ -125,6 +124,7 @@ describe("LLVM runtime RC symbols", () => {
     expect(declarations).toContain("declare void @scr_str_release(ptr)");
     expect(declarations).toContain("declare void @scr_cyc_on_release(ptr)");
     expect(inlineRcDecls(host).sort()).toEqual([
+      "declare void @scr_arr_release(ptr)",
       "declare void @scr_cyc_on_release(ptr)",
       "declare void @scr_dyn_release(ptr)",
       "declare void @scr_dyn_release_survivor(ptr)",
@@ -278,6 +278,22 @@ describe("inline release budgets", () => {
     expect(out.split("call void @scr_dyn_release(ptr %v)").length - 1).toBe(
       INLINE_DYN_RELEASES_PER_FUNCTION + 1,
     );
+  });
+
+  test("each family's budget applies to its own sites in a function that has both", () => {
+    const strings = body("mixed", INLINE_STR_RELEASES_PER_FUNCTION + 1, "str");
+    // One function: string sites over their budget, dyn sites within theirs.
+    const mixed = strings.replace(
+      "  ret void",
+      `  call void @sc_rc_release_dyn(ptr %v)\n  call void @sc_rc_release_other(ptr %v)\n  ret void`,
+    );
+    const other = body("other", 2, "str");
+    const limited = limitInlineReleases([mixed, other], "release").join("\n");
+    const out = limited.slice(0, limited.indexOf("@other("));
+    expect(out).not.toContain("@sc_rc_release_str(");
+    expect(out).toContain("call void @sc_rc_release_dyn(ptr %v)");
+    expect(out).toContain("call void @sc_rc_release_other(ptr %v)");
+    expect(limited).toContain(other);
   });
 
   test("a function over the string budget calls the runtime string release at every site", () => {

@@ -395,8 +395,10 @@ export function dynamicTierSymbols(names) {
  * bench/channel-messages and bench/worker-messages, added later, link them
  * through worker messages:
  * node:worker_threads values are dyn objects. bench/json-unions, added
- * later too, decodes JSON.parse trees. bench/dynamic-methods is
- * untyped JavaScript. Every other bench workload is fully typed and must link none. The gate and
+ * later too, decodes JSON.parse trees. bench/throw-chains, also added
+ * later, tests caught values with `instanceof`, as bench/validate-errors
+ * does. bench/dynamic-methods and
+ * bench/dynamic-properties are untyped JavaScript. Every other bench workload is fully typed and must link none. The gate and
  * tests/harness/bench-dynamic-tier.test.ts enforce that, and the test also
  * fails when a listed workload stops linking them, so remove a workload here
  * when a leak fix makes its binary clean. */
@@ -411,11 +413,14 @@ export const DYNAMIC_WORKLOADS = new Set([
   "bench/thread-slots",
   "bench/channel-messages",
   "bench/dynamic-methods",
+  "bench/dynamic-properties",
   "bench/worker-messages",
   "bench/typed-array-scan-workers",
   "bench/log-summary",
   "bench/inventory-report",
+  "bench/line-reader",
   "bench/json-unions",
+  "bench/throw-chains",
 ]);
 
 /** Names of the functions (text and weak symbols) in `nm` output. Mach-O

@@ -28,6 +28,7 @@ import { checkedIterableSpread } from "./checked-iterable-spread.js";
 import { type ParamShape } from "./call-signatures.js";
 import { arrayValueRead, arrayValueType } from "./array-values.js";
 import { buildArrayConversion } from "./coercions/builders.js";
+import { lowerArraySpreadItems, lowerArrayValueItems } from "./containers/array-construction.js";
 import { restTupleElementTypes, typeKey } from "../type-mapper.js";
 
 function fixedTupleSpreadInfo(
@@ -403,6 +404,51 @@ export function completeArgs(
       }
     }
     if (restType.kind !== "array") lowerer.unsupported("SC1090", blame, "this call form");
+    // A `(T | undefined)[]` rest (stored as T elements) packs undefined
+    // arguments as present undefined elements.
+    const restNodes = sources.slice(restAt);
+    // Plain arguments and spreads, also together with spread tuple fields
+    // (pre-lowered): each item, in argument order.
+    if (
+      restType.optionalElements === true &&
+      (!restNodes.some(isIr) || restNodes.some((a) => !isIr(a) && ts.isSpreadElement(a)))
+    ) {
+      const items: (ts.Expression | IrExpr)[] = [];
+      for (const a of restNodes) {
+        if (isIr(a)) items.push(a.ir);
+        else items.push(a);
+      }
+      out.push(lowerArraySpreadItems(lowerer, items, restType.elem, restType, loc));
+      return out;
+    }
+    // Tuple-spread values (pre-lowered) and plain arguments pack the same
+    // way. Each value evaluates once, in argument order.
+    if (
+      restType.optionalElements === true &&
+      !restNodes.some((a) => !isIr(a) && ts.isSpreadElement(a))
+    ) {
+      const stmts: IrStmt[] = [];
+      const values = restNodes.map((a): IrExpr => {
+        // A tuple field is read where its spread appears: a later
+        // argument may write the tuple.
+        let value: IrExpr;
+        if (isIr(a)) {
+          value = a.ir;
+          if (value.kind === "seqExpr") {
+            stmts.push(...value.stmts);
+            value = value.result;
+          }
+        } else value = lowerer.lowerExpr(a as ts.Expression);
+        const saved = lowerer.declareHiddenLocal("%callArg", value.type);
+        stmts.push({ kind: "varDecl", localId: saved.id, init: value, loc: value.loc });
+        return { kind: "varRef", localId: saved.id, type: value.type, loc: value.loc };
+      });
+      const items = lowerArrayValueItems(lowerer, values, restType.elem, restType, loc);
+      out.push(
+        stmts.length === 0 ? items : { kind: "seqExpr", stmts, result: items, type: restType, loc },
+      );
+      return out;
+    }
     // The rest pack is a fresh array per call; surplus SPREADS copy
     // their elements in (JS-exact — `f(a, ...xs, b, ...ys)` packs in
     // order, sources untouched).

@@ -122,6 +122,9 @@ export interface Ts7ApiOptions {
   cwd: string;
   fs: Ts7FileSystem;
   collectTiming: boolean;
+  /** False for a connection that should not use the shared checker server
+   * (`SCRIPTC_CHECKER_SERVER`), such as the syntax-only source parser's. */
+  shared?: boolean;
 }
 
 export type Ts7ApiFactory = (options: Ts7ApiOptions) => Ts7Api;
@@ -149,33 +152,37 @@ export class Ts7Host {
   private readonly virtualChanges = new Map<string, "created" | "changed">();
   private readonly closingProjects = new Set<string>();
   private readonly api: Ts7Api;
+  /** The text the server reads for a file (its readFile hook). */
+  private readonly readSource: (fileName: string) => string | null;
   private closed = false;
 
   constructor(createApi: Ts7ApiFactory, options?: Ts7HostOptions) {
     const virtualFiles = this.virtualFiles;
     const shadow = options?.fsShadow ?? null;
+    // A virtual file, a shadow's replacement, a package shim's declaration
+    // entry or the file on disk; null when shadowed out of existence or
+    // missing.
+    this.readSource = (fileName) => {
+      const virtual = virtualFiles.get(tsgoPath(fileName));
+      if (virtual !== undefined) return stripSourceBom(virtual);
+      if (shadow !== null) {
+        if (shadow.hideFile(fileName)) return null;
+        const replacement = shadow.readFile(fileName);
+        if (replacement !== undefined) return stripSourceBom(replacement);
+      }
+      // A package scriptc implements itself (package-shims.ts): its
+      // installed declaration entry re-exports the shim module, in every
+      // program the host creates.
+      const shim = packageShimDeclarationText(fileName);
+      if (shim !== undefined) return shim;
+      const source = trackedReadFile(fileName);
+      return source === null ? null : stripSourceBom(source);
+    };
     this.api = createApi({
       cwd: options?.cwd ?? process.cwd(),
       collectTiming: options?.collectTiming ?? false,
       fs: {
-        // string => virtual (or shadowed) hit; null => shadowed out of
-        // existence; undefined => real-FS fallthrough.
-        readFile: (fileName) => {
-          const virtual = virtualFiles.get(tsgoPath(fileName));
-          if (virtual !== undefined) return stripSourceBom(virtual);
-          if (shadow !== null) {
-            if (shadow.hideFile(fileName)) return null;
-            const replacement = shadow.readFile(fileName);
-            if (replacement !== undefined) return stripSourceBom(replacement);
-          }
-          // A package scriptc implements itself (package-shims.ts): its
-          // installed declaration entry re-exports the shim module, in every
-          // program the host creates.
-          const shim = packageShimDeclarationText(fileName);
-          if (shim !== undefined) return shim;
-          const source = trackedReadFile(fileName);
-          return source === null ? null : stripSourceBom(source);
-        },
+        readFile: this.readSource,
         fileExists: (fileName) => {
           if (virtualFiles.has(tsgoPath(fileName))) return true;
           if (shadow !== null && shadow.hideFile(fileName)) return false;
@@ -188,6 +195,12 @@ export class Ts7Host {
           trackedAccessibleEntries(path) ?? { files: [], directories: [] },
       },
     });
+  }
+
+  /** The text this host serves for a file (null when it serves none),
+   * without asking the server for its syntax tree. */
+  sourceText(fileName: string): string | null {
+    return this.readSource(fileName);
   }
 
   /** Registers an in-memory file served to tsgo by the virtual-FS hooks. */
@@ -310,6 +323,12 @@ export class Ts7Program {
 
   getSourceFile(fileName: string): SourceFile | undefined {
     return this.project.program.getSourceFile(resolve(fileName));
+  }
+
+  /** A file's text as the host serves it, without fetching its syntax
+   * tree (Ts7Host.sourceText). */
+  getSourceText(fileName: string): string | null {
+    return this.host.sourceText(fileName);
   }
 
   getSourceFileNames(): readonly string[] {

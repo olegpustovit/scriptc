@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test } from "vitest";
-import { NODE24_FETCH_COMPAT_PROFILE } from "../src/compat/fetch-profile.js";
+import { node24FetchCompatProfile } from "../src/compat/fetch-profile.js";
 import { NODE_COMPAT_VERSION } from "../src/frontend/lowering/builtins/process.js";
 import { CRYPTO_CONSTANTS } from "../src/frontend/lowering/crypto-tables.js";
 import { ZLIB_CONSTANTS } from "../src/frontend/lowering/zlib-constants.js";
@@ -23,7 +23,7 @@ test("the Node pins agree", () => {
   expect(compat.tag).toBe(`v${pinned}`);
   expect(read("Dockerfile.sandbox")).toMatch(new RegExp(`^ARG NODE_VERSION=${pinned}$`, "m"));
   expect(NODE_COMPAT_VERSION).toBe(pinned);
-  expect(NODE24_FETCH_COMPAT_PROFILE.target.node).toBe(pinned);
+  expect(node24FetchCompatProfile().target.node).toBe(pinned);
   expect(read("packages/runtime/src/scr_lib.c")).toContain(
     `#define SCR_NODE_COMPAT_VERSION "${pinned}"`,
   );

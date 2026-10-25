@@ -118,6 +118,9 @@ export class NullableUnions {
   readonly retainWrappers = new Map<string, string>();
   /** Some nullable union encodes `null` with NULLABLE_NULL. */
   readonly usesNullSentinel: boolean = false;
+  /** The shape union whose release and trace helpers each shape union
+   * uses: the first one over the same record arms. */
+  private readonly helperOwners = new Map<string, string>();
 
   /** `shapes`: allow shape unions (debug builds keep boxes, whose
    * debug-info layouts describe every arm). */
@@ -151,6 +154,24 @@ export class NullableUnions {
           if (!this.shapeNumbers.has(arm.shapeId))
             this.shapeNumbers.set(arm.shapeId, this.shapeNumbers.size + 2);
     }
+    // Release and trace dispatch on the shape word, which names a record
+    // shape module-wide, so unions over the same records share them.
+    const owners = new Map<string, string>();
+    for (const nullable of this.byId.values()) {
+      if (nullable.repr !== "shapes") continue;
+      const key = nullable.arms
+        .map((arm) => arm.shapeId)
+        .sort()
+        .join(" ");
+      const owner = owners.get(key) ?? nullable.unionId;
+      owners.set(key, owner);
+      this.helperOwners.set(nullable.unionId, owner);
+    }
+  }
+
+  /** The shape union whose release and trace helpers this one uses. */
+  helperOwner(unionId: string): string {
+    return this.helperOwners.get(unionId) ?? unionId;
   }
 
   get(unionId: string): PointerUnion | null {
@@ -277,13 +298,19 @@ function shapeUnion(
 
 /** Unions the runtime itself inspects as tagged boxes keep that
  * representation: Map keys and Set elements hash and compare union keys by
- * tag and payload inside the C map. */
+ * tag and payload inside the C map. A union of records alone is the
+ * exception: its keys compare by record identity, which a shape union's
+ * record pointer carries as well (the map keys it by reference). */
 function boxedUnionIds(mod: IrModule, nodes?: IrNodeIndex): Set<string> {
   const boxed = new Set<string>();
   // Only the module's union definitions consult the result.
   if (!mod.unions?.length) return boxed;
+  const recordsOnly = new Set<string>();
+  for (const def of mod.unions)
+    if (def.arms.length >= 2 && def.arms.every((arm) => arm.kind === "record"))
+      recordsOnly.add(def.id);
   const mark = (t: IrType): void => {
-    if (t.kind === "union") boxed.add(t.unionId);
+    if (t.kind === "union" && !recordsOnly.has(t.unionId)) boxed.add(t.unionId);
   };
   if (nodes !== undefined) {
     for (const t of nodes.types) {

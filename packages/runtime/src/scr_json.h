@@ -13,11 +13,14 @@ ScrDyn *scr_json_parse(ScrStr *text);
 /* Compiler-emitted description of a statically known JSON.parse target
  * (`JSON.parse(text) as T`). Constant data in the program image; the LLVM
  * backend mirrors this layout ({size, size, ptr, ptr, ptr, ptr, ptr, ptr, size},
- * {ptr, size, size, ptr} and {size, [7 x size], [7 x ptr], ptr, ptr, ptr}).
- * Records list their declared fields (at most 64), each with its byte
- * offset in the record struct; bool fields are one byte, f64 fields
- * doubles, inline union fields a {uint32 tag, uint64 bits} pair, every
- * other kind a +1 pointer. Unions appear only as record field types. A
+ * {ptr, size, size, ptr}, {size, [7 x size], [7 x ptr], ptr, ptr, ptr, ptr},
+ * and for discriminated unions {ptr, size, size, ptr} with {ptr, size, size,
+ * ptr} cases). Records list their declared fields (at most 64), each with
+ * its byte offset in the record struct; bool fields are one byte, f64
+ * fields doubles, inline union fields a {uint32 tag, uint64 bits} pair,
+ * every other kind a +1 pointer. Unions appear as record field types;
+ * discriminated unions also as array elements and whole documents, whose
+ * values are the union's box (or its pointer, for a pointer union). A
  * record with an index signature names its index value type in `elem` and
  * its overflow map's offset in `ovf_offset`. */
 enum {
@@ -57,6 +60,22 @@ typedef struct {
   size_t offset;
   const ScrJsonSchema *type;
 } ScrJsonSchemaField;
+/* One string literal of a discriminated union's discriminant member and
+ * the record arm (canonical tag and schema) that holds it. */
+typedef struct {
+  const char *value;
+  size_t value_len;
+  size_t tag;
+  const ScrJsonSchema *record;
+} ScrJsonCase;
+/* A discriminated union's object arms by discriminant literal: every
+ * literal names one arm. */
+typedef struct {
+  const char *field;
+  size_t field_len;
+  size_t ncases;
+  const ScrJsonCase *cases;
+} ScrJsonDiscriminant;
 typedef struct {
   size_t repr;
   size_t tags[SCR_JARM_COUNT];               /* canonical arm tag, or SCR_JSCHEMA_NO_ARM */
@@ -66,6 +85,9 @@ typedef struct {
   /* boxed: a +1 box of the value arm `tag`; bits hold its double, its
    * bool, or its +1 payload pointer (moved in). */
   void *(*box)(uint32_t tag, uint64_t bits);
+  /* discriminated unions: the object arms; NULL for other unions, whose
+   * object arm is arms[SCR_JARM_OBJ] */
+  const ScrJsonDiscriminant *disc;
 } ScrJsonUnion;
 struct ScrJsonSchema {
   size_t kind;

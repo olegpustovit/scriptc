@@ -195,10 +195,13 @@ bool scr_js_truthy(ScrJsVal value);
  * index and which keys an object lacks.
  *
  * Each property site of compiled dynamic-tier code owns one zeroed,
- * thread-local ScrJsIc. The code at the site is fixed: it tests entry 0
- * inline and calls a probe for everything else. Probes never run user
- * code: they answer from plain data properties or return a miss (NULL /
- * false) with nothing done, and the site then runs its generic path.
+ * thread-local ScrJsIc with static storage: the reset that frees a
+ * thread's shapes (at thread exit, and when a library session ends) clears
+ * every record that holds entries. The code at the site is fixed: it tests
+ * entry 0 inline and calls a probe for everything else. Probes never run
+ * user code: they answer from plain data properties or return a miss
+ * (NULL / false) with nothing done, and the site then runs its generic
+ * path.
  *
  *   load  entry: shape = receiver shape; target = NULL for an own property
  *         (slot indexes the receiver's entries), else the shape of
@@ -228,6 +231,10 @@ typedef struct ScrJsIc {
 
 /* `receiver.key` for a plain data property: +1 value, or NULL. */
 ScrDyn *scr_js_load_probe(ScrDyn *receiver, const ScrStr *key, ScrJsIc *ic);
+/* The same for a property read site, which also answers (+1) undefined for
+ * a key that the receiver and its plain prototype chain lack, and caches
+ * that answer. A method read uses scr_js_load_probe. */
+ScrDyn *scr_js_get_probe(ScrDyn *receiver, const ScrStr *key, ScrJsIc *ic);
 /* `receiver.key = value` (value borrowed) when it replaces a writable own
  * data property or adds one the prototype chain lacks: true when done. */
 bool scr_js_store_probe(ScrDyn *receiver, const ScrStr *key, ScrDyn *value, ScrJsIc *ic);

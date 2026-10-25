@@ -35,6 +35,7 @@ import { isExecExceptionType, refuseExecExceptionCode } from "../builtins/errors
 import { InternalCompilerError } from "../../../errors.js";
 import { TEMPORAL_GLOBAL } from "../../builtin-modules.js";
 import { isTemporalGlobalRoot } from "../lower-namespaces.js";
+import { isF64HandleTyped } from "../f64-handles.js";
 
 export function lowerTypeofExpr(lowerer: Lowerer, expr: ts.TypeOfExpression, loc: SrcLoc): IrExpr {
   const webAssembly = lowerWebAssemblyTypeof(lowerer, expr.expression);
@@ -281,13 +282,18 @@ export function lowerTypeofExpr(lowerer: Lowerer, expr: ts.TypeOfExpression, loc
     promise: "object",
     bytes: "object",
     regex: "object",
+    date: "object",
     generator: "object",
     classval: "function",
     moduleNs: "object",
     undefinedT: "undefined",
     nullT: "object",
   };
-  const folded = FOLD[operand.type.kind];
+  // An f64 handle (a readline Interface, a Timeout) is an object.
+  const folded =
+    operand.type.kind === "f64" && isF64HandleTyped(lowerer, expr.expression)
+      ? "object"
+      : FOLD[operand.type.kind];
   if (folded) {
     const result: IrExpr = { kind: "strLit", value: folded, type: STRING, loc };
     return isSafeToDiscard(operand)

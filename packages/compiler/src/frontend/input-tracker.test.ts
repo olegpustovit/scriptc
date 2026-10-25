@@ -270,3 +270,49 @@ test("synchronous tracking restores parents after throws and propagates unstable
   trackedFileExists(join(dir, "outside.ts"));
   expect(parent.snapshot()).toEqual(before);
 });
+
+test("a settled file is checked by its identity, and any write invalidates it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "scriptc-inputs-"));
+  scratch.push(dir);
+  const source = join(dir, "entry.ts");
+  await writeFile(source, "export const answer = 1;\n");
+  const written = fs.statSync(source);
+  // The file was last changed long enough before the read.
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(Date.now() + 5000);
+  const tracker = new FrontendInputTracker();
+  try {
+    tracker.run(() => trackedReadFile(source));
+  } finally {
+    vi.useRealTimers();
+  }
+  const snapshot = tracker.snapshot();
+  const probe = snapshot.probes.find((entry) => entry.op === "file");
+  expect(probe?.op === "file" && probe.identity !== undefined).toBe(true);
+  expect(validFrontendInputSnapshot(snapshot)).toBe(true);
+  const reads = vi.mocked(fs.readFileSync);
+  reads.mockClear();
+  expect(frontendInputsStillMatch(snapshot)).toBe(true);
+  expect(reads.mock.calls.filter(([path]) => path === source)).toHaveLength(0);
+  // A same-size rewrite that restores the modification time still changes
+  // the change time.
+  await writeFile(source, "export const answer = 2;\n");
+  fs.utimesSync(source, written.atime, written.mtime);
+  expect(frontendInputsStillMatch(snapshot)).toBe(false);
+});
+
+test("a file changed shortly before the read is hashed on every check", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "scriptc-inputs-"));
+  scratch.push(dir);
+  const source = join(dir, "entry.ts");
+  await writeFile(source, "export const answer = 1;\n");
+  const tracker = new FrontendInputTracker();
+  tracker.run(() => trackedReadFile(source));
+  const snapshot = tracker.snapshot();
+  const probe = snapshot.probes.find((entry) => entry.op === "file");
+  expect(probe?.op === "file" && probe.identity).toBeUndefined();
+  const reads = vi.mocked(fs.readFileSync);
+  reads.mockClear();
+  expect(frontendInputsStillMatch(snapshot)).toBe(true);
+  expect(reads.mock.calls.filter(([path]) => path === source)).toHaveLength(1);
+});

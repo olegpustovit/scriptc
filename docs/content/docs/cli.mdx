@@ -210,6 +210,9 @@ With `--sparse`, the profile leaves out the functions the runs never reached. Th
 
   <dt><code>SCRIPTC_CHECKER</code></dt>
   <dd>The TypeScript 7 API server that checks the program: <code>tsc-ts</code> (the default), which scriptc includes, or <code>tsgo</code>, from the <code>typescript</code> package scriptc also includes. Both give the same diagnostics and generated code.</dd>
+
+  <dt><code>SCRIPTC_CHECKER_SERVER</code></dt>
+  <dd>Set to <code>1</code> on Linux and macOS to check with a tsc-ts server that later builds share. It takes effect with a tsc-ts release that serves <code>tsc-ts --api --listen</code>. The tsc-ts 0.0.9 that this version of scriptc includes does not, so each build checks with its own tsc-ts process, as without the variable. A build connects to the server for its working directory, starting it when none answers, and the server keeps the files it parsed, so the next build of the same program loads it faster. A build that finds the server in use by another build, or cannot start or reach it, checks with its own tsc-ts process. The server exits after 5 minutes without a build, or after a build when its resident memory is above 2048 MB (<code>TSC_TS_LISTEN_MEMORY</code> sets another limit in megabytes). Diagnostics and generated code are the same with and without it. It applies to the default checker, tsc-ts.</dd>
 </dl>
 
 ```console

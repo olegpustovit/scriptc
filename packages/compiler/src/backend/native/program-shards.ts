@@ -7,7 +7,7 @@ import { rememberFingerprintDependencies } from "./dependency-files.js";
 
 export function updateProgramShardCacheIdentity(
   hash: ReturnType<typeof createHash>,
-  shards: readonly { name: string; source: string }[] | undefined,
+  shards: readonly { name: string; source: () => string }[] | undefined,
   publicSymbols: readonly string[] | undefined,
   mergeIdentity: string | undefined,
 ): void {
@@ -17,7 +17,7 @@ export function updateProgramShardCacheIdentity(
   } else {
     hash.update("<present>\0");
     for (const shard of shards) {
-      hash.update(shard.name).update("\0").update(shard.source).update("\0");
+      hash.update(shard.name).update("\0").update(shard.source()).update("\0");
     }
   }
   hash.update("\0program-public-symbols\0");
@@ -78,7 +78,7 @@ export async function resolveProgramShardMergeIdentity(driver: CcDriver): Promis
 }
 
 /** Library builds admit shards in both optimization modes; executable builds
- * only admit unsanitized dev LLVM. Both use the same validated names, required
+ * admit dev LLVM, sanitized or not. Both use the same validated names, required
  * public-symbol projection, target support, and canonical-TU fallback. */
 export async function selectProgramShards(
   driver: CcDriver,

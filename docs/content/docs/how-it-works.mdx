@@ -58,7 +58,7 @@ The LLVM helper divides an executable's LLVM IR into partitions by its size. Up 
   </tbody>
 </table>
 
-The count depends only on the size of the LLVM text, so a program has the same partitions, and builds the same executable, on every host. A function's partition follows from its name, and a small internal function goes with the one function that calls it, so an edit leaves the other functions in their partitions.
+The count depends only on the size of the LLVM text, so a program has the same partitions, and builds the same executable, on every host. In programs with 32 partitions or more, functions from the same source file are placed in the same partition, so that their calls to each other stay inside it; a file larger than 1 MiB of LLVM text or than an average partition is divided into parts by function name. Other functions, and the functions of smaller programs, are placed by their name, and a small internal function goes with the one function that calls it. An edit leaves almost every other function in its partition.
 
 These builds are not divided into partitions and compile on one thread: `--emit=asm`, `--emit=obj`, and `--print=native-link-info` output, library builds (`--lib`; `dev` library builds are compiled in pieces, one after another), and `--sanitize` builds, which compile the LLVM IR with the C compiler.
 

@@ -10,7 +10,7 @@ import { FN_ATTRS, arrNewCall, traceArg, vAdapters } from "./shapes.js";
 import { InternalCompilerError } from "../../errors.js";
 
 import { MAY_THROW_LIB_FNS } from "../../ir/builtin-effects.js";
-import { F64, type IrExpr, type IrType } from "../../ir/ir.js";
+import { BYTES_ELEMENT_SIZE, F64, type IrExpr, type IrType } from "../../ir/ir.js";
 import { LlvmUnsupportedError } from "./unsupported.js";
 import { emitJsLibCall } from "./jsval.js";
 import type { LlvmEmitterContext, LibCallExpr, LibCallPrefix, LlValue } from "./expr-context.js";
@@ -22,9 +22,10 @@ import {
 } from "./lib-shared.js";
 import { isDynUndefined } from "../../ir/runtime-features.js";
 import { DYN_KIND } from "./dyn.js";
-import { rawBytes } from "./lib-abi.js";
+import { caBytes } from "./lib-abi.js";
 import { emitInlineAtomicsOp } from "./expr-bytes.js";
 import { regexLiteralCaptures } from "./regex-matchers.js";
+import { registerReplay } from "./emit-journal.js";
 
 /** ScrDyn.v.typed_ref.type_key_len: the low 27 bits of its bit-field word. */
 const TYPE_KEY_LEN_MASK = (1 << 27) - 1;
@@ -595,7 +596,8 @@ export function emitGenericLibCall(host: LlvmEmitterContext, e: LibCallExpr): Ll
     // The https URL row is the http one with the TLS entry point — same
     // three arguments, same response-callback adapter. The https options
     // row is wider: rejectUnauthorized stays an i1, while its ScrStr or
-    // ScrBytes CA value expands to the runtime's raw pointer + length.
+    // ScrBytes CA value expands to the runtime's raw pointer + length
+    // (caBytes: a null pointer for none).
     const isTls = e.fn.startsWith("https.");
     const isUrl = e.fn.includes("requestUrl");
     const isTlsOptions = isTls && !isUrl;
@@ -629,7 +631,7 @@ export function emitGenericLibCall(host: LlvmEmitterContext, e: LibCallExpr): Ll
     if (isTlsOptions) {
       callArgs = [
         ...callArgs.slice(0, 8),
-        ...rawBytes(host, args[8]!).map((arg) => `${arg.type} ${arg.name}`),
+        ...caBytes(host, args[8]!).map((arg) => `${arg.type} ${arg.name}`),
       ];
       host.declare(
         `declare ptr @scr_https_request(ptr, double, ptr, ptr, double, ptr, i1 zeroext, i1 zeroext, ptr, ${host.sizeType}, ptr, ptr)`,
@@ -648,6 +650,15 @@ export function emitGenericLibCall(host: LlvmEmitterContext, e: LibCallExpr): Ll
   }
   if (MAY_THROW_LIB_FNS.has(e.fn) && LIB_FN_SYMS[e.fn] === undefined) {
     throw new LlvmUnsupportedError(`libCall:${e.fn}`, e.loc);
+  }
+  // A setter's write: the time value into the Date object (ScrDate.ms).
+  if (e.fn === "date.store") {
+    const date = emitBorrowedInput(host, e.args[0]!).name;
+    const ms = host.emitExpr(e.args[1]!).name;
+    const field = B.tmp();
+    B.line(`${field} = getelementptr inbounds i8, ptr ${date}, i64 8 ; ->ms`);
+    B.line(`store double ${ms}, ptr ${field}`);
+    return { name: ms, type: e.type };
   }
   // queueMicrotask's checked-dynamic form carries the AsyncLocalStorage
   // context like the static one (lib-process.ts).
@@ -927,6 +938,57 @@ export function emitLibCall(host: LlvmEmitterContext, e: LibCallExpr): LlValue {
     return { name: t, type: e.type };
   }
   if (e.fn === "bytes.absent") return host.own({ name: "null", type: e.type });
+  if (e.fn === "bytes.disjoint") {
+    // [data, data + len * size) of each view, compared as addresses. A view
+    // that is not there (a binding the nest never assigned, NULL) answers
+    // false without reading its header, so the caller keeps its loop.
+    const B = host.B;
+    const values = e.args.map((arg) => ({ arg, value: host.emitReadReceiver(arg) }));
+    const present = values.map(({ value }) => {
+      const t = B.tmp();
+      B.line(`${t} = icmp ne ptr ${value.name}, null`);
+      return t;
+    });
+    const both = B.tmp();
+    B.line(`${both} = and i1 ${present[0]}, ${present[1]}`);
+    const compare = B.newLabel("disjoint.compare"),
+      done = B.newLabel("disjoint.done");
+    const from = B.currentLabel();
+    B.condBr(both, compare, done);
+    B.startBlock(compare);
+    const range = (arg: IrExpr, pointer: string): { start: string; end: string } => {
+      const size = arg.type.kind === "bytes" ? BYTES_ELEMENT_SIZE[arg.type.elem] : 1;
+      const dataSlot = B.tmp(),
+        data = B.tmp(),
+        lenSlot = B.tmp(),
+        len = B.tmp(),
+        bytes = B.tmp(),
+        start = B.tmp(),
+        end = B.tmp();
+      B.line(`${dataSlot} = getelementptr inbounds %ScrBytes, ptr ${pointer}, i64 0, i32 3`);
+      B.line(`${data} = load ptr, ptr ${dataSlot}`);
+      B.line(`${lenSlot} = getelementptr inbounds %ScrBytes, ptr ${pointer}, i64 0, i32 1`);
+      B.line(`${len} = load ${host.sizeType}, ptr ${lenSlot}`);
+      B.line(`${bytes} = mul ${host.sizeType} ${len}, ${size}`);
+      B.line(`${start} = ptrtoint ptr ${data} to ${host.sizeType}`);
+      B.line(`${end} = add ${host.sizeType} ${start}, ${bytes}`);
+      return { start, end };
+    };
+    const left = range(values[0]!.arg, values[0]!.value.name),
+      right = range(values[1]!.arg, values[1]!.value.name);
+    const before = B.tmp(),
+      after = B.tmp(),
+      apart = B.tmp(),
+      t = B.tmp();
+    B.line(`${before} = icmp ule ${host.sizeType} ${left.end}, ${right.start}`);
+    B.line(`${after} = icmp ule ${host.sizeType} ${right.end}, ${left.start}`);
+    B.line(`${apart} = or i1 ${before}, ${after}`);
+    const compared = B.currentLabel();
+    B.br(done);
+    B.startBlock(done);
+    B.line(`${t} = phi i1 [ false, %${from} ], [ ${apart}, %${compared} ]`);
+    return { name: t, type: e.type };
+  }
   if (e.fn === "record.isFrozen") {
     // The frozen bit of the record's rc word (scr_rc.h SCR_RC_FROZEN) is
     // its second-highest bit; an immortal word sets the highest one too.
@@ -1069,6 +1131,36 @@ export function emitLibCall(host: LlvmEmitterContext, e: LibCallExpr): LlValue {
   }
 }
 
+/** The settlement adapter of Promise.all's tuple form for the builder
+ * `fnName`, which fulfills the result with the builder's tuple. */
+function allTupleAdapterFor(host: LlvmEmitterContext, fnName: string, tuple: IrType): string {
+  const key = `allTuple:${fnName}`;
+  let adapter = host.resolveThunks.get(key);
+  if (adapter !== undefined) return adapter;
+  adapter = `sc_all_tuple_${host.resolveThunks.size}`;
+  host.resolveThunks.set(key, adapter);
+  host.journal?.allocated(adapter, "allTupleAdapterFor", [fnName, tuple]);
+  const rc = vAdapters(host.shapeHost, tuple);
+  host.declare(`declare ptr @scr_promise_payload_ref(ptr)`);
+  host.declare(`declare void @scr_promise_fulfill_ref(ptr, ptr, ptr, ptr, ptr)`);
+  host.resolveThunkDefs.push(
+    `define internal void @${adapter}(ptr %dst, ptr %src) ${FN_ATTRS} { ; Promise.all tuple`,
+    `entry:`,
+    `  %entries = call ptr @scr_promise_payload_ref(ptr %src) ; +1, moves into the builder`,
+    `  %tuple = call ptr @${host.callTarget(fnName)}(ptr %entries)`,
+    `  call void @scr_promise_fulfill_ref(ptr %dst, ptr %tuple, ptr ${rc.retain}, ptr ${rc.release}, ptr ${traceArg(host.shapeHost, tuple)})`,
+    `  ret void`,
+    `}`,
+    ``,
+  );
+  host.journal?.built();
+  return adapter;
+}
+
+registerReplay("allTupleAdapterFor", (host, args) =>
+  allTupleAdapterFor(host, args[0] as string, args[1] as IrType),
+);
+
 /** Promise.all's tuple form (promise.allTuple): the combinator over the
  * entries stores each fulfilled entry promise, and a settlement adapter on
  * the combinator calls the builder with them and fulfills the result with
@@ -1081,26 +1173,7 @@ function emitPromiseAllTuple(host: LlvmEmitterContext, e: LibCallExpr): LlValue 
     throw new InternalCompilerError("llvm emitter bug: promise.allTuple shape");
   const entriesT = e.args[0]!.type;
   const entries = host.emitExpr(e.args[0]!);
-  const tuple = e.type.inner;
-  const key = `allTuple:${build.fnName}`;
-  let adapter = host.resolveThunks.get(key);
-  if (adapter === undefined) {
-    adapter = `sc_all_tuple_${host.resolveThunks.size}`;
-    host.resolveThunks.set(key, adapter);
-    const rc = vAdapters(host.shapeHost, tuple);
-    host.declare(`declare ptr @scr_promise_payload_ref(ptr)`);
-    host.declare(`declare void @scr_promise_fulfill_ref(ptr, ptr, ptr, ptr, ptr)`);
-    host.resolveThunkDefs.push(
-      `define internal void @${adapter}(ptr %dst, ptr %src) ${FN_ATTRS} { ; Promise.all tuple`,
-      `entry:`,
-      `  %entries = call ptr @scr_promise_payload_ref(ptr %src) ; +1, moves into the builder`,
-      `  %tuple = call ptr @${host.callTarget(build.fnName)}(ptr %entries)`,
-      `  call void @scr_promise_fulfill_ref(ptr %dst, ptr %tuple, ptr ${rc.retain}, ptr ${rc.release}, ptr ${traceArg(host.shapeHost, tuple)})`,
-      `  ret void`,
-      `}`,
-      ``,
-    );
-  }
+  const adapter = allTupleAdapterFor(host, build.fnName, e.type.inner);
   host.declare(`declare ptr @scr_promise_all(ptr, ptr, ptr)`);
   host.declare(`declare void @scr_promise_all_store_promise(ptr, double, ptr)`);
   host.declare(`declare ptr @scr_promise_new()`);

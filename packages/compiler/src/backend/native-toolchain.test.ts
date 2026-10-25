@@ -3983,12 +3983,12 @@ test.skipIf(
       programShards: [
         {
           name: "program-f000.ll",
-          source:
+          source: () =>
             "define i32 @main() {\nentry:\n  ret i32 7\n}\ndeclare hidden i64 @other_value()\n",
         },
         {
           name: "program-f001.ll",
-          source:
+          source: () =>
             "declare i32 @main()\ndefine hidden i64 @other_value() {\nentry:\n  ret i64 9\n}\n",
         },
       ],
@@ -4038,11 +4038,11 @@ test.skipIf(!nativeShardMergeAvailable)(
     const programShards = [
       {
         name: "program-f000.ll",
-        source: "define i64 @foo() {\nentry:\n  ret i64 1\n}\ndeclare i64 @bar()\n",
+        source: () => "define i64 @foo() {\nentry:\n  ret i64 1\n}\ndeclare i64 @bar()\n",
       },
       {
         name: "program-f001.ll",
-        source: "declare i64 @foo()\ndefine i64 @bar() {\nentry:\n  ret i64 2\n}\n",
+        source: () => "declare i64 @foo()\ndefine i64 @bar() {\nentry:\n  ret i64 2\n}\n",
       },
     ];
     try {
@@ -4082,7 +4082,7 @@ test.skipIf(!nativeShardMergeAvailable)(
       // The canonical TU and ABI stay fixed, but the exact shard projection
       // changes. The merged-object tier must not reuse the previous layout.
       await build("bar", join(dir, "bar-commented.lib.a"), [
-        { ...programShards[0]!, source: `; projection edit\n${programShards[0]!.source}` },
+        { ...programShards[0]!, source: () => `; projection edit\n${programShards[0]!.source()}` },
         programShards[1]!,
       ]);
       expect(await completeArtifacts(cacheRoot, "lib")).toHaveLength(3);
@@ -4131,11 +4131,11 @@ test.skipIf(
   const programShards = [
     {
       name: "program-f000.ll",
-      source: "define i64 @foo() {\nentry:\n  ret i64 1\n}\ndeclare i64 @bar()\n",
+      source: () => "define i64 @foo() {\nentry:\n  ret i64 1\n}\ndeclare i64 @bar()\n",
     },
     {
       name: "program-f001.ll",
-      source: "declare i64 @foo()\ndefine i64 @bar() {\nentry:\n  ret i64 2\n}\n",
+      source: () => "declare i64 @foo()\ndefine i64 @bar() {\nentry:\n  ret i64 2\n}\n",
     },
   ];
   const ldWrapper = (generation: string): string => `#!/bin/sh
@@ -4227,8 +4227,8 @@ test.skipIf(
       // If compilation reaches either shard, this build fails. Missing ld
       // (and objcopy on Linux) must select the valid canonical TU instead.
       programShards: [
-        { name: "program-f000.ll", source: "not valid LLVM IR\n" },
-        { name: "program-f001.ll", source: "also not valid LLVM IR\n" },
+        { name: "program-f000.ll", source: () => "not valid LLVM IR\n" },
+        { name: "program-f001.ll", source: () => "also not valid LLVM IR\n" },
       ],
       programPublicSymbols: ["public_value"],
       outPath,
@@ -4293,12 +4293,12 @@ test.skipIf(
       programShards: [
         {
           name: "program-f000.ll",
-          source:
+          source: () =>
             "define i64 @public_value() {\nentry:\n  ret i64 7\n}\ndeclare i64 @other_value()\n",
         },
         {
           name: "program-f001.ll",
-          source:
+          source: () =>
             "declare i64 @public_value()\ndefine i64 @other_value() {\nentry:\n  ret i64 9\n}\n",
         },
       ],

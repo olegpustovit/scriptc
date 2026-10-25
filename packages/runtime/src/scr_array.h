@@ -231,6 +231,10 @@ bool scr_arr_is_frozen(const ScrArr *a);
  * end), 9 copyWithin (x = target, y = start, z = end), 10 splice (x =
  * start, y = delete count, z = item count). */
 bool scr_array_frozen_error(int op, size_t len, double x, double y, double z);
+/* Node's TypeErrors for a write that a non-extensible or sealed array
+ * refuses: adding the element at `index`, or deleting it. */
+void scr_array_not_extensible_error(double index);
+void scr_array_undeletable_error(double index);
 
 /* The start of the dense slots' allocation: `data` less any head room. */
 static inline uint64_t *scr_arr_block(const ScrArr *a) {

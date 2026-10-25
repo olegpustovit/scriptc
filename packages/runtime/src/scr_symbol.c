@@ -22,6 +22,10 @@ struct ScrSym {
   ScrStr *desc;    /* owned; NULL = no description (Symbol()) */
   ScrStr *reg_key; /* owned; non-NULL exactly for Symbol.for symbols */
   struct ScrSym *reg_next; /* the registry's intrusive chain */
+  /* The symbol's checked-dynamic box while one is alive (not retained: the
+   * box retains the symbol and clears this when it is freed), shared by
+   * every conversion of the symbol to a checked value. */
+  ScrDyn *box;
 };
 
 ScrSym *scr_sym_retain(ScrSym *s) {
@@ -50,6 +54,7 @@ ScrSym *scr_sym_new(ScrStr *desc) {
   s->desc = desc ? scr_str_retain(desc) : NULL;
   s->reg_key = NULL;
   s->reg_next = NULL;
+  s->box = NULL;
   return s;
 }
 
@@ -80,6 +85,11 @@ ScrSym *scr_sym_well_known(ScrStr *name) {
   scr_str_release(description);
   symbol->reg_next = g_sym_well_known;
   g_sym_well_known = scr_sym_retain(symbol);
+  {
+    ScrDyn *key = scr_dyn_new_symbol(symbol);
+    scr_dyn_install_well_known_symbol(key);
+    scr_dyn_release(key);
+  }
   if (name->len == 8 && !memcmp(name->data, "iterator", 8)) {
     ScrDyn *key = scr_dyn_new_symbol(symbol);
     scr_dyn_install_iterator_symbol(key);
@@ -88,6 +98,11 @@ ScrSym *scr_sym_well_known(ScrStr *name) {
   if (name->len == 11 && !memcmp(name->data, "hasInstance", 11)) {
     ScrDyn *key = scr_dyn_new_symbol(symbol);
     scr_dyn_install_has_instance_symbol(key);
+    scr_dyn_release(key);
+  }
+  if (name->len == 7 && !memcmp(name->data, "species", 7)) {
+    ScrDyn *key = scr_dyn_new_symbol(symbol);
+    scr_dyn_install_species_symbol(key);
     scr_dyn_release(key);
   }
   if (name->len == 11 && !memcmp(name->data, "toStringTag", 11)) {
@@ -142,8 +157,17 @@ ScrStr *scr_sym_desc(ScrSym *s) { return s->desc ? scr_str_retain(s->desc) : NUL
 
 ScrStr *scr_sym_key_for(ScrSym *s) { return s->reg_key ? scr_str_retain(s->reg_key) : NULL; }
 
+/* The release of a symbol's shared box: the box is going away. */
+static void scr_sym_release_box(ScrSym *s) {
+  s->box = NULL;
+  scr_sym_release(s);
+}
+
 ScrDyn *scr_dyn_new_symbol(ScrSym *value) {
-  return scr_dyn_symbol_ref(scr_sym_retain(value), scr_sym_release, scr_sym_to_string, scr_sym_desc);
+  if (value->box) return scr_dyn_retain(value->box);
+  ScrDyn *box = scr_dyn_symbol_ref(scr_sym_retain(value), scr_sym_release_box, scr_sym_to_string, scr_sym_desc);
+  value->box = box;
+  return box;
 }
 
 ScrStr *scr_sym_to_string(ScrSym *s) {

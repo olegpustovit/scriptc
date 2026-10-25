@@ -23,6 +23,7 @@ import {
   isUnitType,
   typeEquals,
   typeKey,
+  VOID,
 } from "../../ir/ir.js";
 import { BYTES_ELEM_NUM, closureIdentityEqual } from "./common.js";
 import { DYN_KIND } from "./dyn.js";
@@ -57,6 +58,7 @@ export function emitDynamicExpr(
     | "caughtNarrow"
     | "caughtToDyn"
   >,
+  discarded = false,
 ): LlValue {
   const B = host.B;
   switch (e.kind) {
@@ -87,7 +89,7 @@ export function emitDynamicExpr(
       // Bytes already box their shared mutable storage directly. A second
       // capsule would split identity between checked and native views.
       const errorRef = v.type.kind === "object" && host.shapeHost.isErrorClass(v.type.className);
-      // A TextEncoder or TextDecoder record boxes as its own handle, which
+      // A TextEncoder, TextDecoder or StringDecoder record boxes as its own handle, which
       // keeps the record's identity (toDynHelper).
       const codecRef = textCodecRecordClass(v.type, (id) => host.recordsById.get(id)) !== null;
       if (!errorRef && !codecRef && ((e.liveRef && v.type.kind !== "bytes") || identityRef)) {
@@ -119,6 +121,10 @@ export function emitDynamicExpr(
         const box = host.dyn.dynFuncBoxHelper(v.type);
         const t = B.tmp();
         B.line(`${t} = call ptr @${box}(ptr ${v.name}, ptr ${name})`);
+        if (e.fnLength !== undefined) {
+          host.declare(`declare void @scr_dyn_function_set_length(ptr, i32)`);
+          B.line(`call void @scr_dyn_function_set_length(ptr ${t}, i32 ${e.fnLength})`);
+        }
         return host.own({ name: t, type: e.type });
       }
       const conv = host.dyn.toDynHelper(v.type);
@@ -257,6 +263,18 @@ export function emitDynamicExpr(
       // Each call passes its method name's id slot, so only the first call
       // looks the name up.
       const invoke = DYN_BUFFER_METHODS.get(e.method) ?? "scr_dyn_invoke_prepared_id";
+      // A statement-position push drops the new length, so its entry
+      // need not box it.
+      if (discarded && e.method === "push" && invoke === "scr_dyn_invoke_prepared_id") {
+        host.declare(
+          `declare void @scr_dyn_invoke_discard_id(ptr, ptr, ptr, ptr, ptr, ${host.sizeType}, ptr)`,
+        );
+        B.line(
+          `call void @scr_dyn_invoke_discard_id(ptr ${recv.name}, ptr ${prepared}, ptr ${host.cstr(e.method)}, ptr ${host.methodIdSlot(e.method)}, ptr ${argsPtr}, ${host.sizeType} ${args.length}, ptr ${host.cstr(e.calleeName)})`,
+        );
+        host.emitPendingCheck();
+        return { name: "", type: VOID };
+      }
       host.declare(`declare ptr @${invoke}(ptr, ptr, ptr, ptr, ptr, ${host.sizeType}, ptr)`);
       let name = host.cstr(e.calleeName);
       if (e.calleeNameValue !== undefined) {

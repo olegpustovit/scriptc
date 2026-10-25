@@ -54,6 +54,7 @@ import {
 import {
   classPrototypeData,
   hasClassPrototypeData,
+  prototypeReflectedFlag,
   observedPrototypeMethod,
   reflectClassPrototype,
 } from "./class-prototypes.js";
@@ -262,6 +263,7 @@ const KEY_CALLS = new Map<string, "object" | "any" | "value">([
   ["dyn.propertyIsEnumerableComputed", "any"],
   ["dyn.hasOwnComputed", "value"],
   ["dyn.keyDeleteComputed", "value"],
+  ["dyn.reflectDeleteProperty", "object"],
   ["dyn.keySetComputed", "value"],
 ]);
 
@@ -2928,15 +2930,19 @@ export class ClassDynamicDispatch {
           }
           const iterator =
             expr.kind === "libCall" &&
-            (expr.fn === "dyn.iterator" || expr.fn === "dyn.arrayFromIterator")
+            (expr.fn === "dyn.iterator" ||
+              expr.fn === "dyn.arrayFromIterator" ||
+              expr.fn === "dyn.asyncIteratorOpen")
               ? expr
               : null;
+          // `for await` opens a class instance's [Symbol.asyncIterator]().
+          const asyncOpen = iterator?.fn === "dyn.asyncIteratorOpen";
           const invoke: Invoke | null = iterator
             ? {
                 kind: "dynInvoke",
                 recv: iterator.args[0]!,
-                method: "sym:iterator",
-                calleeName: "value[Symbol.iterator]",
+                method: asyncOpen ? "sym:asyncIterator" : "sym:iterator",
+                calleeName: asyncOpen ? "value[Symbol.asyncIterator]" : "value[Symbol.iterator]",
                 args: [],
                 type: DYN,
                 loc: iterator.loc,
@@ -4177,6 +4183,103 @@ export class ClassDynamicDispatch {
     }
     this.generated.add(helper);
     return { kind: "call", callee: name, args: [bag, key], type: BOOL, loc };
+  }
+
+  /** `%dyn.class.bagHasOwn`: whether an instance's property bag holds `key`
+   * as its own property. False before the instance has a bag. */
+  private readBagHasOwn(lowerer: Lowerer, bag: IrExpr, key: IrExpr, loc: SrcLoc): IrExpr {
+    const name = "%dyn.class.bagHasOwn";
+    let helper = lowerer.liftedFnNamed(name);
+    if (!helper) {
+      const value = varRef("p.0", DYN, loc);
+      helper = {
+        name,
+        params: [
+          { localId: "p.0", name: "bag", type: DYN },
+          { localId: "p.1", name: "key", type: STRING },
+        ],
+        returnType: BOOL,
+        locals: [
+          { id: "p.0", name: "bag", type: DYN, mutable: false },
+          { id: "p.1", name: "key", type: STRING, mutable: false },
+        ],
+        body: [
+          {
+            kind: "if",
+            cond: { kind: "dynTest", test: "undefined", value, type: BOOL, loc },
+            then: [
+              { kind: "return", value: { kind: "boolLit", value: false, type: BOOL, loc }, loc },
+            ],
+            else_: null,
+            loc,
+          },
+          {
+            kind: "return",
+            value: {
+              kind: "libCall",
+              fn: "dyn.hasOwn",
+              args: [value, varRef("p.1", STRING, loc)],
+              type: BOOL,
+              loc,
+            },
+            loc,
+          },
+        ],
+        loc,
+      };
+      lowerer.liftedFns.push(helper);
+    }
+    this.generated.add(helper);
+    return { kind: "call", callee: name, args: [bag, key], type: BOOL, loc };
+  }
+
+  /** The `constructor` an instance of `info` inherits when it has no own
+   * one. The class's prototype view answers its own `constructor` (a
+   * replacement, or the class once reflection installed it). A view
+   * without one answers the class itself unless reflection had populated it
+   * (prototypeReflectedFlag, set when the view initializes): then the
+   * program deleted the property, and the read continues to the base
+   * class's prototype and past the last one to Object.prototype, as in
+   * Node. A prototype's own `constructor` is read with the instance
+   * `receiver` as `this`, so an accessor's getter runs on the instance. */
+  private inheritedConstructor(
+    lowerer: Lowerer,
+    info: ClassInfo,
+    key: IrExpr,
+    receiver: IrExpr,
+    loc: SrcLoc,
+  ): IrExpr {
+    const cls = lowerer.coerceToExpected(classValueRef(lowerer, info, info.decl!), DYN);
+    const prototype = hasClassPrototypeData(info) ? classPrototypeData(lowerer, info, loc) : null;
+    if (!prototype) return cls;
+    const base = info.base;
+    const read = (): IrExpr => ({
+      kind: "libCall",
+      fn: "dyn.reflectGet",
+      args: [prototype, lowerer.coerceToExpected(key, DYN), receiver],
+      type: DYN,
+      loc,
+    });
+    // Past the last class prototype, the read continues to Object.prototype's data property.
+    const next: IrExpr =
+      base && !base.builtinError && base.decl && !base.generic && !base.localClass
+        ? this.inheritedConstructor(lowerer, base, key, receiver, loc)
+        : { kind: "dynKeyGet", value: prototype, key, type: DYN, loc };
+    return {
+      kind: "ternary",
+      cond: { kind: "libCall", fn: "dyn.hasOwn", args: [prototype, key], type: BOOL, loc },
+      then: read(),
+      else_: {
+        kind: "ternary",
+        cond: varRef(prototypeReflectedFlag(lowerer, info), BOOL, loc),
+        then: next,
+        else_: cls,
+        type: DYN,
+        loc,
+      },
+      type: DYN,
+      loc,
+    };
   }
 
   /** The hints for which some boxed class declares a conversion method. A
@@ -5937,15 +6040,19 @@ export class ClassDynamicDispatch {
         !info.classDecorators
       ) {
         this.constructors.set(info.def.name, info);
-        const cls = lowerer.coerceToExpected(classValueRef(lowerer, info, info.decl), DYN);
         const bag = this.branchPropertyBag(lowerer, info, receiver, false, loc);
         const key: IrExpr = { kind: "strLit", value: name, type: STRING, loc };
+        // `constructor` is an own property of every class prototype, so an
+        // ancestor's prototype answers for an instance of this class only
+        // after the program deletes the class's own: the instance's own
+        // property answers, then the class's prototype (inheritedConstructor).
+        const answered = this.readBagHasOwn(lowerer, bag, key, loc);
         return [
           {
             kind: "return",
             value: {
               kind: "ternary",
-              cond: this.readBagHas(lowerer, "dyn.hasKey", bag, key, loc),
+              cond: answered,
               then: {
                 kind: "libCall",
                 fn: "dyn.bagGet",
@@ -5953,7 +6060,13 @@ export class ClassDynamicDispatch {
                 type: DYN,
                 loc,
               },
-              else_: cls,
+              else_: this.inheritedConstructor(
+                lowerer,
+                info,
+                key,
+                lowerer.coerceToExpected(receiver, DYN),
+                loc,
+              ),
               type: DYN,
               loc,
             },

@@ -110,6 +110,65 @@ function expectedExit(argc: number, edit = 0): number {
   return Number(total % 251n);
 }
 
+const INLINED = 6;
+
+/** A program whose helpers are too large for the inliner that runs before the
+ * profile annotation and each called twice, so they reach the annotation,
+ * and which the profile-guided inliner then inlines into their hot call
+ * sites in `main` and deletes. */
+function inlinedProgram(): string {
+  const lines = ["; profiled program, helpers inlined after annotation"];
+  for (let index = 0; index < INLINED; index++) {
+    lines.push(
+      `define internal i64 @g${index}(i64 %n) {`,
+      "entry:",
+      "  %x0 = add i64 %n, " + index,
+    );
+    for (let step = 1; step <= 40; step++)
+      lines.push(`  %x${step} = ${step % 2 === 0 ? "xor" : "mul"} i64 %x${step - 1}, ${step + 3}`);
+    lines.push("  ret i64 %x40", "}");
+  }
+  lines.push(
+    "define i32 @main(i32 %argc, ptr %argv) {",
+    "entry:",
+    "  %wide = sext i32 %argc to i64",
+    "  %limit = mul i64 %wide, 1000",
+    "  br label %loop",
+    "loop:",
+    "  %i = phi i64 [ 0, %entry ], [ %next, %loop ]",
+    "  %total = phi i64 [ 0, %entry ], [ %grown, %loop ]",
+    ...Array.from({ length: INLINED }, (_, index) => [
+      `  %a${index} = call i64 @g${index}(i64 %i)`,
+      `  %b${index} = call i64 @g${index}(i64 %a${index})`,
+      `  %t${index} = add i64 ${index === 0 ? "%total" : `%t${index - 1}`}, %b${index}`,
+    ]).flat(),
+    `  %grown = add i64 %t${INLINED - 1}, 0`,
+    "  %next = add i64 %i, 1",
+    "  %again = icmp ult i64 %next, %limit",
+    "  br i1 %again, label %loop, label %exit",
+    "exit:",
+    "  %low = urem i64 %grown, 251",
+    "  %code = trunc i64 %low to i32",
+    "  ret i32 %code",
+    "}",
+  );
+  return lines.join("\n") + "\n";
+}
+
+function inlinedExit(argc: number): number {
+  const mask = (1n << 64n) - 1n;
+  const g = (index: number, n: bigint) => {
+    let x = (n + BigInt(index)) & mask;
+    for (let step = 1; step <= 40; step++)
+      x = step % 2 === 0 ? x ^ BigInt(step + 3) : (x * BigInt(step + 3)) & mask;
+    return x;
+  };
+  let total = 0n;
+  for (let i = 0n; i < BigInt(argc * 1000); i++)
+    for (let index = 0; index < INLINED; index++) total = (total + g(index, g(index, i))) & mask;
+  return Number(total % 251n);
+}
+
 type EmitOptions = {
   outputs: number;
   name: string;
@@ -119,12 +178,17 @@ type EmitOptions = {
 };
 
 async function emit(dir: string, source: string, options: EmitOptions): Promise<string[]> {
+  return (await emitReporting(dir, source, options)).outputs;
+}
+
+/** `emit`, also returning the helper's stdout (its profile match report). */
+async function emitReporting(dir: string, source: string, options: EmitOptions) {
   const input = join(dir, `${options.name}.ll`);
   await writeFile(input, source);
   const outputs = Array.from({ length: options.outputs }, (_, index) =>
     join(dir, `${options.name}.${index}.o`),
   );
-  await execFileAsync(helper!, [
+  const { stdout } = await execFileAsync(helper!, [
     "emit",
     "--input",
     input,
@@ -145,7 +209,7 @@ async function emit(dir: string, source: string, options: EmitOptions): Promise<
     ...(options.use === undefined ? [] : ["--profile-use", options.use]),
     ...(options.cache === undefined ? [] : ["--cache-dir", options.cache]),
   ]);
-  return outputs;
+  return { outputs, stdout };
 }
 
 async function link(dir: string, objects: string[], name: string, instrumented = false) {
@@ -181,12 +245,18 @@ async function merge(output: string, inputs: string[]) {
 
 /** An instrumented build of `source` run with 1 and 3 arguments, its raw
  * profiles merged into one indexed profile. */
-async function collect(dir: string, source: string, outputs: number, name: string) {
+async function collect(
+  dir: string,
+  source: string,
+  outputs: number,
+  name: string,
+  expected: (argc: number) => number = expectedExit,
+) {
   const raw = join(dir, `${name}-raw`);
   const objects = await emit(dir, source, { outputs, name, generate: join(raw, "%p.profraw") });
   const executable = await link(dir, objects, name, true);
-  expect(await run(executable, 1)).toBe(expectedExit(1));
-  expect(await run(executable, 3)).toBe(expectedExit(3));
+  expect(await run(executable, 1)).toBe(expected(1));
+  expect(await run(executable, 3)).toBe(expected(3));
   const profiles = (await readdir(raw)).map((file) => join(raw, file));
   expect(profiles).toHaveLength(2);
   const profile = join(dir, `${name}.profdata`);
@@ -284,6 +354,26 @@ describe.runIf(helper !== null)("LLVM profile-guided optimization", () => {
       // f4's constant changed since the profile was collected.
       const objects = await emit(dir, program(7), { outputs: 4, name: "edited", use: profile });
       expect(await run(await link(dir, objects, "edited"), 2)).toBe(expectedExit(2, 7));
+    });
+
+    test("the match report counts annotated functions that inlining removes", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "scriptc-profile-match-"));
+      dirs.push(dir);
+      const { profile } = await collect(dir, inlinedProgram(), 1, "train", inlinedExit);
+      const { outputs, stdout } = await emitReporting(dir, inlinedProgram(), {
+        outputs: 1,
+        name: "guided",
+        use: profile,
+      });
+      expect(await run(await link(dir, outputs, "guided"), 2)).toBe(inlinedExit(2));
+      // Every g<index> and main received counts, though optimization then
+      // inlined the helpers into main and deleted them.
+      expect(JSON.parse(stdout.trim().split("\n").at(-1)!)).toEqual({
+        ok: true,
+        profile: { annotated: INLINED + 1, mismatched: 0, missing: 0, unknown_partitions: 0 },
+      });
+      const symbols = await execFileAsync("nm", [outputs[0]!]);
+      expect(symbols.stdout).not.toMatch(/\bg\d\b/);
     });
 
     test("the profile keys the partition cache", async () => {

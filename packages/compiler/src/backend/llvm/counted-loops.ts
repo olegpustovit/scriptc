@@ -7,6 +7,7 @@ import { FOLLOWER_GUARD_LIMIT } from "../../ir/integer-loops.js";
 import type { IrExpr } from "../../ir/ir.js";
 import type { LlvmEmitterContext } from "./expr-context.js";
 import { f64Lit } from "./common.js";
+import { exactInteger, widenInteger } from "./integer-values.js";
 
 /** The caller has proved or guarded the direction's finite endpoint. Clamp
  * the opposite infinity before integer conversion. Fractional limits become
@@ -50,8 +51,8 @@ export function emitCountedLoopLimit(
 }
 
 /** The run-time test of a guarded counted loop: an unproven limit is within
- * the integer form's finite range and an unproven start is an exact safe
- * integer. Returns `true` when nothing needs testing. */
+ * the integer form's finite range and an unproven start is an exact integer
+ * within the loop's start bound. Returns `true` when nothing needs testing. */
 export function emitCountedLoopSafety(
   host: LlvmEmitterContext,
   loop: IntegerCountedForLoop,
@@ -65,7 +66,11 @@ export function emitCountedLoopSafety(
       `${safe} = fcmp ${loop.step > 0 ? "ole" : "oge"} double ${bound.name}, ${f64Lit(loop.guardLimit)}`,
     );
   }
-  if (loop.startGuarded) safe = andSafe(host, safe, emitExactStart(host, loop.start));
+  if (loop.startGuarded) {
+    const start = host.emitExpr(loop.start);
+    const bound = loop.startBound;
+    safe = andSafe(host, safe, emitExactIntegerTest(host, start.name, -bound, bound).ok);
+  }
   for (const follower of loop.followers) {
     if (follower.startGuarded) safe = andSafe(host, safe, emitExactStart(host, follower.start));
     if (follower.tripGuarded) safe = andSafe(host, safe, emitFollowerReach(host, loop, follower));
@@ -117,6 +122,7 @@ export function emitPairedLoopSafety(host: LlvmEmitterContext, loop: IntegerPair
 }
 
 function andSafe(host: LlvmEmitterContext, safe: string, ok: string): string {
+  if (ok === "true") return safe;
   if (safe === "true") return ok;
   const both = host.B.tmp();
   host.B.line(`${both} = and i1 ${safe}, ${ok}`);
@@ -125,10 +131,25 @@ function andSafe(host: LlvmEmitterContext, safe: string, ok: string): string {
 
 /** An exact integer of at most 2^53 - 1 in magnitude, and not -0 (the bit
  * patterns of the value and its round trip agree). NaN and infinities fail
- * the ordered range tests. */
+ * the ordered range tests. A start with an integer form (an int32 local,
+ * `p0 - 1` of one) is an exact integer already: its range answers the test,
+ * or two integer compares do. */
 function emitExactStart(host: LlvmEmitterContext, expr: IrExpr): string {
   const B = host.B;
   const start = host.emitExpr(expr);
+  const integer = exactInteger(host, start, expr);
+  if (integer) {
+    const limit = Number.MAX_SAFE_INTEGER;
+    if (integer.range.min >= -limit && integer.range.max <= limit) return "true";
+    const wide = widenInteger(host, integer),
+      low = B.tmp(),
+      high = B.tmp(),
+      ok = B.tmp();
+    B.line(`${low} = icmp sge i64 ${wide}, ${-limit}`);
+    B.line(`${high} = icmp sle i64 ${wide}, ${limit}`);
+    B.line(`${ok} = and i1 ${low}, ${high}`);
+    return ok;
+  }
   const low = B.tmp(),
     high = B.tmp(),
     raw = B.tmp(),
@@ -183,4 +204,40 @@ export function emitExactIntegerTest(
   B.line(`${exact} = icmp eq i64 ${bits}, ${backBits}`);
   B.line(`${ok} = and i1 ${inRange}, ${exact}`);
   return { ok, integer };
+}
+
+/** The i64 start of an integer counter: the integer form the start value
+ * carries (an int32 local, `p0 - 1` of one), or the double's conversion,
+ * which the loop's guard or proof makes exact. */
+export function emitCountedStart(host: LlvmEmitterContext, expr: IrExpr): string {
+  const value = host.emitExpr(expr);
+  const integer = exactInteger(host, value, expr);
+  if (integer) return widenInteger(host, integer);
+  const start = host.B.tmp();
+  host.B.line(`${start} = fptosi double ${value.name} to i64`);
+  return start;
+}
+
+/** emitExactIntegerTest of a start expression: when the value carries an
+ * integer form (an exact integer, never -0), its range answers the test or
+ * two integer compares do, and the integer is the form's. */
+export function emitStartIntegerTest(
+  host: LlvmEmitterContext,
+  expr: IrExpr,
+  min: number,
+  max: number,
+): { ok: string; integer: string } {
+  const value = host.emitExpr(expr);
+  const integer = exactInteger(host, value, expr);
+  if (!integer) return emitExactIntegerTest(host, value.name, min, max);
+  const wide = widenInteger(host, integer);
+  if (integer.range.min >= min && integer.range.max <= max) return { ok: "true", integer: wide };
+  const B = host.B;
+  const low = B.tmp(),
+    high = B.tmp(),
+    ok = B.tmp();
+  B.line(`${low} = icmp sge i64 ${wide}, ${min}`);
+  B.line(`${high} = icmp sle i64 ${wide}, ${max}`);
+  B.line(`${ok} = and i1 ${low}, ${high}`);
+  return { ok, integer: wide };
 }

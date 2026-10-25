@@ -21,6 +21,7 @@ import {
   checkerExecutableIdentity,
   setLibDiagnosticsStore,
 } from "../frontend/ts7/lib-diagnostics.js";
+import { setCheckerFeatureStore } from "../frontend/ts7/checker-features.js";
 import { loadNativeToolchain } from "./toolchain.js";
 import { buildSanitizedRuntime } from "./sanitizer.js";
 import { runCompilerTask } from "./task.js";
@@ -67,6 +68,11 @@ async function main(): Promise<number> {
         },
         checkerExecutableIdentity(toolchain.ts7Executable),
       );
+      setCheckerFeatureStore({
+        read: (key) =>
+          store.read("checker-features", key, NATIVE_STRING_BYTES)?.toString("utf8") ?? null,
+        write: (key, text) => store.write("checker-features", key, text),
+      });
     }
     compiler = new NativeCompiler(toolchain, cache);
     return compiler;
@@ -147,6 +153,7 @@ async function main(): Promise<number> {
               dh: false,
               pki: false,
               ed25519: false,
+              x509: false,
               webcrypto: false,
               perfLoop: false,
               tlsCa: false,

@@ -30,9 +30,10 @@ import { lowerCollectionSpread } from "../containers/collection-methods.js";
 import { strCharsCall } from "../containers/array-construction.js";
 import { generatorDrain } from "../iterator-adapters.js";
 import { isSearchParamsIterable } from "../builtins/url.js";
-import { varRef } from "../../../ir/build.js";
-import { arrayValueStore } from "../array-values.js";
+import { dynUndefinedExpr, varRef } from "../../../ir/build.js";
+import { arrayValueStore, primitiveElement } from "../array-values.js";
 import { classGeneratorIterable } from "../class-iterables.js";
+import { iteratorCanStep } from "../iterator-consumption.js";
 
 /** JavaScript: whether `expr` is or holds an existing checked-dynamic
  * object — a binding stored as a dyn value whose checker type is an
@@ -102,6 +103,13 @@ function emptyNeverLiteral(lowerer: Lowerer, expr: ts.ArrayLiteralExpression): b
  * tsc's API doesn't surface it (ternary arms under an array context —
  * tsc accepts the arm covariantly, but a tagged element representation
  * must be BUILT as the slot's element type). */
+/** The checker type of `node` admits undefined. */
+function mayHoldUndefined(lowerer: Lowerer, node: ts.Expression): boolean {
+  const type = lowerer.typeOf(node);
+  const parts = type.isUnionType() ? ts.constituentTypes(type) : [type];
+  return parts.some((part) => (part.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Void)) !== 0);
+}
+
 export function lowerArrayLiteral(
   lowerer: Lowerer,
   expr: ts.ArrayLiteralExpression,
@@ -482,6 +490,14 @@ export function lowerArrayLiteral(
       if (src.type.kind === "object") {
         const drained = lowerer.classIteratorDrainCall(src, locOf(el), type.elem);
         if (drained) src = drained;
+        // In JavaScript an iterable class whose inferred iterator shape has
+        // no static protocol spreads through the runtime's iterator walk.
+        else if (
+          isJsSourceFile(ts.getSourceFileOfNode(el)) &&
+          lowerer.classes.get(src.type.className) &&
+          lowerer.findMethodOn(lowerer.classes.get(src.type.className)!, "sym:iterator")
+        )
+          src = lowerer.coerceInto(el.expression, src, DYN);
       }
       // `[...s]` on a STRING spreads its code-point characters (the
       // string iterator's walk — astral chars whole) through the same
@@ -515,7 +531,13 @@ export function lowerArrayLiteral(
       // `[...it]` over a generator (or an iterator adapted into one):
       // drain it once, in order, into a fresh element array.
       if (src.type.kind === "generator") {
-        const drained = generatorDrain(lowerer, src, type.elem, locOf(el));
+        const drained = generatorDrain(
+          lowerer,
+          src,
+          type.elem,
+          locOf(el),
+          type.optionalElements === true,
+        );
         if (drained) src = drained;
       }
       // `[...sp]` and `[...sp.entries()]` over a URLSearchParams: its
@@ -606,6 +628,9 @@ export function lowerArrayLiteral(
     let lowered: IrExpr;
     const directOptionalCandidate =
       runtimeOptionalElements.has(i) ||
+      // An element that can be undefined in a `(T | undefined)[]`
+      // (primitiveElement) is stored as a present undefined.
+      (primitiveElement(type.elem) && mayHoldUndefined(lowerer, el)) ||
       ts.isElementAccessExpression(el) ||
       (ts.isCallExpression(el) &&
         ts.isPropertyAccessExpression(el.expression) &&
@@ -683,7 +708,8 @@ export function lowerArrayLiteral(
       continue;
     }
     let value = el;
-    if (!typeEquals(value.type, type.elem)) {
+    // An undefined element is stored directly (arrayValueStore).
+    if (!typeEquals(value.type, type.elem) && value.type.kind !== "undefinedT") {
       const temp = lowerer.declareHiddenLocal("%arrayValue", value.type);
       body.push({ kind: "varDecl", localId: temp.id, init: value, loc });
       value = varRef(temp.id, temp.type, loc);
@@ -770,13 +796,17 @@ function lowerTupleSpreadLiteral(
   return { kind: "seqExpr", stmts, result: { kind: "recordLit", fields, type, loc }, type, loc };
 }
 
-/** Drain using checked dispatch so native class and generator iterators keep their methods.
- * `spell` is the TypeError message for a source that is not iterable
- * (notIterableSpelling). */
+/** Drain a checked-dynamic iterable: `next` is read once when the iterator
+ * opens, as JS keeps it in the iterator record, so a `next` the iterator
+ * assigns while it runs is not called. Runtime iterators step natively, and
+ * other iterators call the `next` read (class methods keep their emitted
+ * dispatch). `spell` is the TypeError message for a source that is not
+ * iterable (notIterableSpelling). */
 function checkedIteratorPack(lowerer: Lowerer, source: IrExpr, spell: string, loc: SrcLoc): IrExpr {
   const name = "%iterator.pack.checked";
   if (!lowerer.liftedFns.some((fn) => fn.name === name)) {
     const ref = (id: string): IrExpr => ({ kind: "varRef", localId: id, type: DYN, loc });
+    const flag = (id: string): IrExpr => ({ kind: "varRef", localId: id, type: BOOL, loc });
     const property = (key: string): IrExpr => ({
       kind: "dynKeyGet",
       value: ref("step"),
@@ -784,6 +814,7 @@ function checkedIteratorPack(lowerer: Lowerer, source: IrExpr, spell: string, lo
       type: DYN,
       loc,
     });
+    const finished: IrStmt = { kind: "return", value: ref("result"), loc };
     lowerer.liftedFns.push({
       name,
       params: [
@@ -792,12 +823,13 @@ function checkedIteratorPack(lowerer: Lowerer, source: IrExpr, spell: string, lo
       ],
       returnType: DYN,
       locals: [
-        ...["source", "iterator", "step", "result"].map((id) => ({
+        ...["source", "iterator", "next", "step", "value", "result"].map((id) => ({
           id,
           name: id,
           type: DYN,
           mutable: id !== "source",
         })),
+        { id: "fast", name: "fast", type: BOOL, mutable: false },
         { id: "spell", name: "spell", type: STRING, mutable: false },
       ],
       body: [
@@ -815,6 +847,24 @@ function checkedIteratorPack(lowerer: Lowerer, source: IrExpr, spell: string, lo
         },
         {
           kind: "varDecl",
+          localId: "next",
+          init: {
+            kind: "dynKeyGet",
+            value: ref("iterator"),
+            key: { kind: "strLit", value: "next", type: STRING, loc },
+            type: DYN,
+            loc,
+          },
+          loc,
+        },
+        {
+          kind: "varDecl",
+          localId: "fast",
+          init: iteratorCanStep(ref("iterator"), ref("next"), loc),
+          loc,
+        },
+        {
+          kind: "varDecl",
           localId: "result",
           init: { kind: "dynArrLit", elems: [], type: DYN, loc },
           loc,
@@ -823,25 +873,77 @@ function checkedIteratorPack(lowerer: Lowerer, source: IrExpr, spell: string, lo
           kind: "while",
           cond: { kind: "boolLit", value: true, type: BOOL, loc },
           body: [
-            {
-              kind: "varDecl",
-              localId: "step",
-              init: {
-                kind: "dynInvoke",
-                recv: ref("iterator"),
-                method: "next",
-                calleeName: "iterator.next",
-                args: [],
-                type: DYN,
-                loc,
-              },
-              loc,
-            },
+            // Declared before the branches, which each assign it: a local
+            // declared in a branch is released when the branch ends.
+            { kind: "varDecl", localId: "value", init: dynUndefinedExpr(loc), loc },
             {
               kind: "if",
-              cond: { kind: "dynTest", test: "truthy", value: property("done"), type: BOOL, loc },
-              then: [{ kind: "return", value: ref("result"), loc }],
-              else_: null,
+              cond: flag("fast"),
+              then: [
+                {
+                  kind: "assign",
+                  localId: "value",
+                  value: {
+                    kind: "libCall",
+                    fn: "dyn.iteratorStep",
+                    args: [ref("iterator")],
+                    type: DYN,
+                    loc,
+                  },
+                  loc,
+                },
+                {
+                  kind: "if",
+                  cond: {
+                    kind: "libCall",
+                    fn: "dyn.iteratorStepDone",
+                    args: [ref("iterator")],
+                    type: BOOL,
+                    loc,
+                  },
+                  then: [finished],
+                  else_: null,
+                  loc,
+                },
+              ],
+              else_: [
+                {
+                  kind: "varDecl",
+                  localId: "step",
+                  init: {
+                    kind: "libCall",
+                    fn: "dyn.iteratorResult",
+                    args: [
+                      {
+                        kind: "dynCall",
+                        callee: ref("next"),
+                        receiver: ref("iterator"),
+                        calleeName: "iterator.next",
+                        args: [],
+                        type: DYN,
+                        loc,
+                      },
+                    ],
+                    type: DYN,
+                    loc,
+                  },
+                  loc,
+                },
+                {
+                  kind: "if",
+                  cond: {
+                    kind: "dynTest",
+                    test: "truthy",
+                    value: property("done"),
+                    type: BOOL,
+                    loc,
+                  },
+                  then: [finished],
+                  else_: null,
+                  loc,
+                },
+                { kind: "assign", localId: "value", value: property("value"), loc },
+              ],
               loc,
             },
             {
@@ -849,7 +951,7 @@ function checkedIteratorPack(lowerer: Lowerer, source: IrExpr, spell: string, lo
               expr: {
                 kind: "libCall",
                 fn: "dyn.packPush",
-                args: [ref("result"), property("value")],
+                args: [ref("result"), ref("value")],
                 type: VOID,
                 loc,
               },

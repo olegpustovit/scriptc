@@ -637,14 +637,25 @@ static SCR_TL bool scr_cyc_idle_points = false;
 static SCR_TL size_t scr_cyc_death_due_live = 0;
 #endif
 
+/* The nursery trigger a program sets for itself
+ * (scr_cyc_set_nursery_threshold), 0 for the default; SCR_CYCLE_THRESHOLD
+ * takes precedence over it. */
+static long scr_cyc_nursery_threshold_set = 0;
+static SCR_TL size_t scr_cyc_nursery_threshold_cached = 0;
+
 static size_t scr_cyc_nursery_threshold(void) {
-  static SCR_TL size_t cached = 0;
-  if (cached == 0) {
+  if (scr_cyc_nursery_threshold_cached == 0) {
     const char *env = scr_getenv("SCR_CYCLE_THRESHOLD");
     long v = env ? strtol(env, NULL, 10) : 0;
-    cached = v > 0 ? (size_t)v : SCR_CYC_NURSERY_CANDIDATES;
+    if (v <= 0) v = scr_cyc_nursery_threshold_set;
+    scr_cyc_nursery_threshold_cached = v > 0 ? (size_t)v : SCR_CYC_NURSERY_CANDIDATES;
   }
-  return cached;
+  return scr_cyc_nursery_threshold_cached;
+}
+
+void scr_cyc_set_nursery_threshold(long threshold) {
+  scr_cyc_nursery_threshold_set = threshold;
+  scr_cyc_nursery_threshold_cached = 0;
 }
 
 /* The number of buffered candidates (across every generation) at which the

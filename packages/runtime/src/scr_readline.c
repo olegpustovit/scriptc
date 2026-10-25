@@ -283,7 +283,23 @@ static void scr_rl_buf_append(ScrRl *rl, const char *p, size_t n) {
   rl->line_len += n;
 }
 
-/* kNormalWrite over decoded UTF-8 text. */
+/* The end of the line starting at `i` in text without a CR: the next LF,
+ * or n when the text ends first. */
+static size_t scr_rl_next_lf(const char *p, size_t i, size_t n) {
+  const char *lf = memchr(p + i, '\n', n - i);
+  return lf ? (size_t)(lf - p) : n;
+}
+
+/* The end of the line starting at `i`: the next LF or CR, or n. */
+static size_t scr_rl_next_break(const char *p, size_t i, size_t n) {
+  while (i < n && p[i] != '\n' && p[i] != '\r') i++;
+  return i;
+}
+
+/* kNormalWrite over decoded UTF-8 text. The text is scanned once: LF-only
+ * text (no CR anywhere in it) moves from LF to LF with memchr, other text
+ * splits at LF, CR and CRLF. The unfinished line before the text only
+ * joins the first line, so the rest of the text is never copied whole. */
 static void scr_rl_feed_text(ScrRl *rl, const char *p, size_t n) {
   if (rl->tty) {
     scr_rl_tty_ops->feed(rl, p, n);
@@ -296,43 +312,31 @@ static void scr_rl_feed_text(ScrRl *rl, const char *p, size_t n) {
     }
     rl->saw_return_at = 0;
   }
-  bool ending = false;
-  for (size_t i = 0; i < n && !ending; i++) ending = p[i] == '\n' || p[i] == '\r';
-  if (!ending) {
+  bool cr = n > 0 && memchr(p, '\r', n) != NULL;
+  size_t end = n == 0 ? 0 : cr ? scr_rl_next_break(p, 0, n) : scr_rl_next_lf(p, 0, n);
+  if (end == n) {
     if (n > 0) scr_rl_buf_append(rl, p, n);
     return;
   }
-  /* The unfinished line joins the new text; the scan runs over both. */
-  char *text = p ? (char *)p : (char *)"";
-  size_t len = n;
-  char *joined = NULL;
-  if (rl->line_len > 0) {
-    joined = malloc(rl->line_len + n);
-    if (!joined) scr_rl_oom();
-    memcpy(joined, rl->line_buf, rl->line_len);
-    memcpy(joined + rl->line_len, p, n);
-    text = joined;
-    len = rl->line_len + n;
-  }
-  rl->line_len = 0;
-  rl->saw_return_at = len > 0 && text[len - 1] == '\r' ? scr_now_ms() : 0;
+  rl->saw_return_at = p[n - 1] == '\r' ? scr_now_ms() : 0;
   /* Split first (the remainder becomes the new unfinished line before any
    * line is delivered, as in Node), then deliver in order. */
   size_t n_lines = 0, cap_lines = 0;
   ScrStr **lines = NULL;
   size_t start = 0;
-  for (size_t i = 0; i < len; i++) {
-    size_t adv;
-    if (text[i] == '\n') adv = 1;
-    else if (text[i] == '\r') adv = i + 1 < len && text[i + 1] == '\n' ? 2 : 1;
-    else continue;
+  while (end < n) {
     lines = scr_rl_grow(lines, &cap_lines, n_lines + 1, sizeof *lines);
-    lines[n_lines++] = scr_str_new(text + start, i - start);
-    i += adv - 1;
-    start = i + 1;
+    if (n_lines == 0 && rl->line_len > 0) {
+      scr_rl_buf_append(rl, p, end);
+      lines[n_lines++] = scr_str_new(rl->line_buf, rl->line_len);
+    } else {
+      lines[n_lines++] = scr_str_new(p + start, end - start);
+    }
+    start = end + (p[end] == '\r' && end + 1 < n && p[end + 1] == '\n' ? 2 : 1);
+    end = start >= n ? n : cr ? scr_rl_next_break(p, start, n) : scr_rl_next_lf(p, start, n);
   }
-  if (start < len) scr_rl_buf_append(rl, text + start, len - start);
-  free(joined);
+  rl->line_len = 0;
+  if (start < n) scr_rl_buf_append(rl, p + start, n - start);
   for (size_t i = 0; i < n_lines; i++) {
     if (rl->closed || scr_exc_pending()) {
       scr_str_release(lines[i]);
@@ -364,6 +368,11 @@ static void scr_rl_feed_bytes(ScrRl *rl, const char *p, size_t n) {
     rl->parked = scr_rl_grow(rl->parked, &rl->parked_cap, rl->parked_len + n, 1);
     memcpy(rl->parked + rl->parked_len, p, n);
     rl->parked_len += n;
+    return;
+  }
+  /* ASCII with no held bytes decodes to itself: split it in place. */
+  if (rl->n_held == 0 && scr_bytes_ascii_span(p, n) == n) {
+    scr_rl_feed_text(rl, p, n);
     return;
   }
   size_t total = rl->n_held + n;
@@ -401,6 +410,12 @@ static void scr_rl_feed_end(ScrRl *rl) {
 void scr_rl_input_bytes(double id, ScrBytes *chunk) {
   ScrRl *rl = scr_rl_find(id);
   if (!rl || rl->closed) return;
+  /* The splitter copies every line it keeps before it delivers one, so it
+   * can read a chunk's own storage; shared memory is copied out first. */
+  if (!chunk->shared) {
+    scr_rl_feed_bytes(rl, (const char *)chunk->data, chunk->len);
+    return;
+  }
   char *p = malloc(chunk->len ? chunk->len : 1);
   if (!p) scr_rl_oom();
   scr_bytes_read(chunk, 0, p, chunk->len);

@@ -1724,6 +1724,14 @@ static void scr_frozen_undeletable(double index) {
   scr_frozen_throw("Cannot delete property '", index, "' of [object Array]");
 }
 
+void scr_array_not_extensible_error(double index) {
+  scr_frozen_not_extensible(index);
+}
+
+void scr_array_undeletable_error(double index) {
+  scr_frozen_undeletable(index);
+}
+
 /* Each case finds the operation's first write in the order the spec makes
  * its writes. */
 bool scr_array_frozen_error(int op, size_t len, double x, double y, double z) {

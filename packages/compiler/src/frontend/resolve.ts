@@ -562,6 +562,12 @@ export function nearestPkgJsonPath(fromFile: string): string | null {
   return dir === null ? null : join(dir, "package.json");
 }
 
+/** The nearest package scope's "imports" field (undefined without one). */
+export function nearestPackageImports(fromFile: string): unknown {
+  const dir = nearestPkgDir(dirname(resolve(fromFile)));
+  return dir === null ? undefined : pkgJsonOf(dir)?.imports;
+}
+
 /** The target the nearest package scope's "imports" field maps a '#'
  * specifier to under Node's ESM runtime conditions: a './' path inside the
  * package or another package's specifier. Null when no entry maps it. */

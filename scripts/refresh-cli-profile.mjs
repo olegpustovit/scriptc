@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-/* Refreshes packages/compiler/native/cli.profdata.gz, the profile that release
- * builds of the native compiler optimize with (scripts/build-native-cli.mts).
+/* Refreshes packages/compiler/native/cli.profdata.gz, the profile that builds
+ * of the native compiler optimize with (scripts/build-native-cli.mts). The
+ * release workflow's cli-profile job runs it with --output on the release
+ * commit, and release builds use that profile instead of the committed one.
  *
  * Builds an instrumented native compiler for this Linux host, runs it on the
  * training builds below, and merges the raw profiles it writes into one
@@ -26,7 +28,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { cpus, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { constants, gzipSync } from "node:zlib";
@@ -55,6 +57,9 @@ const tscTsPackage = join(tscTs, "packages/tsc-ts");
 if (!existsSync(join(tscTsPackage, "src/main.ts")))
   throw new Error(`${tscTs} is not a tsc-ts checkout with installed dependencies`);
 const jobs = Number(values.jobs);
+// The output's directory is created up front, before the instrumented build.
+const profileOutput = resolve(values.output);
+mkdirSync(dirname(profileOutput), { recursive: true });
 const work = resolve(values.work ?? mkdtempSync(join(tmpdir(), "scriptc-cli-profile-")));
 const raw = join(work, "raw");
 const builds = join(work, "builds");
@@ -196,10 +201,12 @@ const merged = spawnSync(scriptc, ["merge-profiles", "--sparse", "-o", indexed, 
 });
 if (merged.status !== 0) throw new Error("merge-profiles failed");
 // The indexed profile compresses to about an eighth of its size.
-const output = resolve(values.output);
-writeFileSync(output, gzipSync(readFileSync(indexed), { level: constants.Z_BEST_COMPRESSION }));
+writeFileSync(
+  profileOutput,
+  gzipSync(readFileSync(indexed), { level: constants.Z_BEST_COMPRESSION }),
+);
 console.log(
-  `wrote ${output} (${statSync(output).size} bytes; ${statSync(indexed).size} uncompressed)`,
+  `wrote ${profileOutput} (${statSync(profileOutput).size} bytes; ${statSync(indexed).size} uncompressed)`,
 );
 // A work directory the caller named stays for inspection.
 if (values.work === undefined) rmSync(work, { recursive: true, force: true });

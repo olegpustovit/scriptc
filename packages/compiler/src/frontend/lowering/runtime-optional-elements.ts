@@ -16,6 +16,9 @@ export interface ElementStateHost {
   elementAdmitsUndefined(key: string): boolean;
   /** The value stored by `node` can be `undefined` at runtime. */
   mayBeUndefined(node: ts.Expression): boolean;
+  /** Iterating `node`, an iterable other than an array (a Set, a Map's
+   * values, a generator), can yield `undefined`. */
+  iterationMayYieldUndefined?(node: ts.Expression): boolean;
   /** A callback argument can return `undefined` at runtime. */
   callbackReturnsUndefined(node: ts.Expression): boolean;
   /** The value may be a plain array-like object, whose missing indices
@@ -28,6 +31,9 @@ export interface ElementStateHost {
   /** Element keys of the rest parameter that the spread arguments of
    * `call` fill: `[]` when the callee has none, null when it is unknown. */
   restKeys(call: ts.CallExpression | ts.NewExpression): readonly string[] | null;
+  /** The argument index where the callee's rest parameter starts, or null
+   * when the callee has none or is unknown. */
+  restStart?(call: ts.CallExpression | ts.NewExpression): number | null;
   /** Record that iterating `node`'s binding can observe `undefined`;
    * `known` when the iterated array's own facts (not only those shared by
    * its element ABI) say so. Returns true when the binding's record grew. */
@@ -353,7 +359,11 @@ export class ArrayElementStates {
 
   /** One stored value, or the elements a spread copies. */
   private valueMayBeUndefined(value: ts.Expression): boolean {
-    if (ts.isSpreadElement(value)) return this.mayYieldUndefined(value.expression);
+    if (ts.isSpreadElement(value))
+      return (
+        this.mayYieldUndefined(value.expression) ||
+        (this.host.iterationMayYieldUndefined?.(value.expression) ?? false)
+      );
     return this.host.mayBeUndefined(value);
   }
 
@@ -511,14 +521,26 @@ export class ArrayElementStates {
   private scanCall(node: ts.CallExpression | ts.NewExpression): boolean {
     let changed = false;
     const args = node.arguments?.nodes ?? [];
-    // Spreading a sparse array into a rest parameter fills the holes.
+    // Spreading a sparse array, or a tuple with undefined elements, into a
+    // rest parameter fills the holes.
     if (args.some((arg) => ts.isSpreadElement(arg))) {
       for (const arg of args) {
-        if (!ts.isSpreadElement(arg) || !this.mayYieldUndefined(arg.expression)) continue;
+        if (!ts.isSpreadElement(arg) || !this.valueMayBeUndefined(arg)) continue;
         const rest = this.host.restKeys(node) ?? this.host.arrayKeys(arg.expression);
         if (this.addUndefined(rest)) changed = true;
       }
     }
+    // An argument in a rest position that may be undefined is a present
+    // undefined element of the rest array.
+    const restStart = this.host.restStart?.(node) ?? null;
+    if (restStart !== null)
+      for (const arg of args.slice(restStart))
+        if (
+          !ts.isSpreadElement(arg) &&
+          this.host.mayBeUndefined(arg) &&
+          this.addUndefined(this.host.restKeys(node))
+        )
+          changed = true;
     if (this.record(node)) changed = true;
     const callee = peel(node.expression);
     if (!ts.isPropertyAccessExpression(callee)) return changed;

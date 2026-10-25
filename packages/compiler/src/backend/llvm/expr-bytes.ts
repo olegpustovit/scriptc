@@ -235,6 +235,26 @@ export function emitBytesGet(
   inBounds = false,
   invalidNaN = false,
   owned = false,
+  scope = "",
+): LlValue {
+  const outer = host.bytesAccessScope;
+  host.bytesAccessScope = scope;
+  try {
+    return emitScopedBytesGet(host, elem, receiver, index, expr, inBounds, invalidNaN, owned);
+  } finally {
+    host.bytesAccessScope = outer;
+  }
+}
+
+function emitScopedBytesGet(
+  host: LlvmEmitterContext,
+  elem: IrBytesElem,
+  receiver: string,
+  index: LlValue,
+  expr: IrExpr | undefined,
+  inBounds: boolean,
+  invalidNaN: boolean,
+  owned: boolean,
 ): LlValue {
   const B = host.B;
   // Any invalid index traps (the array runtime's discipline).
@@ -547,6 +567,27 @@ export function emitBytesSet(
   expr?: IrExpr,
   inBounds = false,
   owned = false,
+  scope = "",
+): void {
+  const outer = host.bytesAccessScope;
+  host.bytesAccessScope = scope;
+  try {
+    emitScopedBytesSet(host, elem, receiver, index, value, indexExpr, expr, inBounds, owned);
+  } finally {
+    host.bytesAccessScope = outer;
+  }
+}
+
+function emitScopedBytesSet(
+  host: LlvmEmitterContext,
+  elem: IrBytesElem,
+  receiver: string,
+  index: LlValue,
+  value: LlValue,
+  indexExpr: IrExpr | undefined,
+  expr: IrExpr | undefined,
+  inBounds: boolean,
+  owned: boolean,
 ): void {
   const B = host.B;
   // Invalid integer-indexed writes are ignored after evaluating the RHS.
@@ -768,6 +809,7 @@ export function emitBytesIntrinsic(
         host.bytesBounds.has(e),
         e.invalidNaN === true,
         host.bytesOwned.has(e),
+        host.bytesAliasScopes.get(e),
       );
     case "slice":
       return call(

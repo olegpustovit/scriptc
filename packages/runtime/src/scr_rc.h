@@ -700,6 +700,12 @@ void scr_collect_cycles_phase(void);
  * that knows its own memory profile; the environment variable takes
  * precedence. Call it before the program allocates much. */
 void scr_cyc_set_growth_cap(long cap);
+/* Sets the nursery trigger SCR_CYCLE_THRESHOLD sets (scr_cycle.c): the
+ * number of new candidates at which the release path runs a pass, for a
+ * program that knows its own collection profile. The environment variable
+ * takes precedence; 0 restores the default. The trigger re-arms with it at
+ * the end of the next pass. Call it before the program allocates much. */
+void scr_cyc_set_nursery_threshold(long threshold);
 void scr_cyc_context_cleanup(void);
 
 /* One pass on the normal generational schedule, for callers that reach a

@@ -989,6 +989,18 @@ function assertionDestinationHoldsNullish(
   return constituentTypes(contextual).some((type) => (type.flags & nullish) !== 0);
 }
 
+/** Whether `declaration` is TextDecoder's `decode` method. */
+function isTextDecoderDecode(declaration: ts.Node): boolean {
+  if (!ts.isMethodSignatureDeclaration(declaration) && !ts.isMethodDeclaration(declaration))
+    return false;
+  if (!ts.isIdentifier(declaration.name) || declaration.name.text !== "decode") return false;
+  const owner = declaration.parent;
+  return (
+    (ts.isInterfaceDeclaration(owner) || ts.isClassDeclaration(owner)) &&
+    owner.name?.text === "TextDecoder"
+  );
+}
+
 /** Whether `argument` of `call` binds an optional parameter of a standard
  * library declaration (`decoder.decode(input?)`). The undefined such a
  * parameter's type holds comes from its optionality, and the builtin
@@ -1003,6 +1015,9 @@ function optionalStdlibParameter(
   const declaration = lowerer.checker.getResolvedSignature(call)?.declaration;
   if (declaration === undefined || !lowerer.isStdlibFile(ts.getSourceFileOfNode(declaration)))
     return false;
+  // TextDecoder.decode reads an undefined input as no bytes, as Node does
+  // (builtins/text-codecs.ts lowerDecodeInput).
+  if (isTextDecoderDecode(declaration)) return false;
   const index = call.arguments?.nodes.indexOf(argument) ?? -1;
   const parameter = declaration.parameters?.nodes[index];
   return (
@@ -2353,6 +2368,7 @@ export function typeofAnswer(arm: IrType): string | null {
     case "set":
     case "generator":
     case "regex":
+    case "date":
     case "bytes":
     case "url":
     case "searchParams":

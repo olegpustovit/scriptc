@@ -27,7 +27,7 @@ import {
   int32ArraySlot,
   int32ArrayStores,
 } from "./int32-arrays.js";
-import { everyExprChild, everyStmtChild, everyTypeChild } from "./traverse.js";
+import { everyExprChild, everyStmtChild, everyStmtList, everyTypeChild } from "./traverse.js";
 
 /** The storage slot an array-valued expression reads, as an
  * IrContracts.int32Elements key: a local or parameter
@@ -352,6 +352,123 @@ export class Int32Slots {
     for (const params of this.paramFacts.values()) count += params.size;
     return count;
   }
+
+  /** The analysis as JSON, for a process that shares this module and its
+   * node index (a forked one). Proven writes are numbered by their position
+   * in `nodes`. Null when a proven write is not in the index. */
+  encode(nodes: IrNodeIndex): string | null {
+    const proven = nodes.expressionPositions(this.provenWrites);
+    if (proven === null) return null;
+    const data: Int32SlotsData = {
+      fields: [...this.fields],
+      familyOf: [...this.familyOf],
+      paramFacts: [...this.paramFacts].map(([fn, params]) => [fn, [...params]]),
+      returns: [...this.returns],
+      returnRanges: [...this.returnRanges],
+      boxes: [...this.boxes],
+      boxGroupOf: [...this.boxGroupOf],
+      provenWrites: proven,
+      called: [...this.called],
+      reasons: [...this.reasons],
+      pinned: [...this.pinned],
+      int32Locals: [...this.int32Locals],
+      int32Elements: [...this.int32Elements],
+      pinViolations: this.pinViolations,
+      nonNegative: [...this.nonNegative],
+      narrowedReads: this.narrowedReads,
+      int32Arrays: [...this.int32Arrays],
+      checkedInt32Arrays: [...this.checkedInt32Arrays],
+    };
+    return JSON.stringify(data);
+  }
+
+  /** The analysis `encode` wrote for `mod`, whose node index is `nodes`. */
+  static decode(text: string, mod: IrModule, nodes: IrNodeIndex): Int32Slots {
+    const data = JSON.parse(text) as Int32SlotsData;
+    const slots = new Int32Slots(new Map((mod.classes ?? []).map((c) => [c.name, c])));
+    for (const family of data.fields) slots.fields.add(family);
+    for (const [key, family] of data.familyOf) slots.familyOf.set(key, family);
+    for (const [fn, params] of data.paramFacts) slots.paramFacts.set(fn, new Map(params));
+    for (const fn of data.returns) slots.returns.add(fn);
+    for (const [fn, range] of data.returnRanges) slots.returnRanges.set(fn, range);
+    for (const group of data.boxes) slots.boxes.add(group);
+    for (const [member, group] of data.boxGroupOf) slots.boxGroupOf.set(member, group);
+    for (const node of nodes.expressionsAt(data.provenWrites)) slots.provenWrites.add(node);
+    for (const fn of data.called) slots.called.add(fn);
+    for (const [key, why] of data.reasons) slots.reasons.set(key, why);
+    for (const key of data.pinned) slots.pinned.add(key);
+    for (const key of data.int32Locals) slots.int32Locals.add(key);
+    for (const key of data.int32Elements) slots.int32Elements.add(key);
+    slots.pinViolations.push(...data.pinViolations);
+    for (const key of data.nonNegative) slots.nonNegative.add(key);
+    slots.narrowedReads = data.narrowedReads;
+    for (const key of data.int32Arrays) slots.int32Arrays.add(key);
+    for (const key of data.checkedInt32Arrays) slots.checkedInt32Arrays.add(key);
+    return slots;
+  }
+
+  /** Every fact, in a canonical order, with each proven write as its
+   * position in `mod` (function index, then walk order): two analyses of
+   * equal modules hold the same facts when their summaries are equal. */
+  summary(mod: IrModule): string {
+    const sorted = (values: Iterable<string>): string => [...values].sort().join(",");
+    const lines = [
+      `fields ${sorted(this.fields)}`,
+      `params ${sorted([...this.paramFacts].flatMap(([fn, params]) => [...params].map(([id, r]) => `${fn}\0${id}=${r.min}:${r.max}`)))}`,
+      `returns ${sorted(this.returns)}`,
+      `returnRanges ${sorted([...this.returnRanges].map(([fn, r]) => `${fn}=${r.min}:${r.max}`))}`,
+      `boxes ${sorted(this.boxes)}`,
+      `boxGroups ${sorted([...this.boxGroupOf].map(([member, group]) => `${member}=${group}`))}`,
+      `called ${sorted(this.called)}`,
+      `pinned ${sorted(this.pinned)}`,
+      `int32Locals ${sorted(this.int32Locals)}`,
+      `int32Elements ${sorted(this.int32Elements)}`,
+      `nonNegative ${sorted(this.nonNegative)}`,
+      `pinViolations ${sorted(this.pinViolations)}`,
+      `narrowedReads ${this.narrowedReads}`,
+      `int32Arrays ${sorted(this.int32Arrays)}`,
+      `checkedInt32Arrays ${sorted(this.checkedInt32Arrays)}`,
+    ];
+    const positions: string[] = [];
+    mod.functions.forEach((fn, f) => {
+      let at = 0;
+      everyStmtList(fn.body, {
+        expr: (e) => {
+          if (this.provenWrites.has(e)) positions.push(`${f}:${at}`);
+          at++;
+          return true;
+        },
+        stmt: () => {
+          at++;
+          return true;
+        },
+      });
+    });
+    lines.push(`provenWrites ${this.provenWrites.size} ${positions.join(",")}`);
+    return lines.join("\n");
+  }
+}
+
+/** Int32Slots as plain data (Int32Slots.encode). */
+interface Int32SlotsData {
+  fields: string[];
+  familyOf: [string, string | null][];
+  paramFacts: [string, [string, IntegerRange][]][];
+  returns: string[];
+  returnRanges: [string, IntegerRange][];
+  boxes: string[];
+  boxGroupOf: [string, string][];
+  provenWrites: number[];
+  called: string[];
+  reasons: [string, string][];
+  pinned: string[];
+  int32Locals: string[];
+  int32Elements: string[];
+  pinViolations: string[];
+  nonNegative: string[];
+  narrowedReads: boolean;
+  int32Arrays: string[];
+  checkedInt32Arrays: string[];
 }
 
 const DYN_KINDS = new Set<IrType["kind"]>(["dyn", "jsval", "caught"]);
@@ -833,6 +950,95 @@ export interface Int32SlotInputs {
   initializerBindings?: ReadonlyMap<string, IrGlobal[]>;
   /** The module's node index, read instead of walking the bodies. */
   nodes?: IrNodeIndex;
+  /** Revises a function of a module marked for int32 array candidates when
+   * candidates drop (int32-arrays.ts Int32ArrayRevision): the function
+   * marked without the `dropped` candidates. With it, a candidate that drops
+   * (and keeps no checked stores) takes its sites back to the element-reader
+   * calls the marking inlined, and the fixpoint goes on over the revised
+   * functions, so its result is the analysis of the module marked for the
+   * candidates it keeps. A revision that changes more of a function than
+   * those sites throws Int32RevisionConflict. */
+  revise?: (fnName: string, dropped: ReadonlySet<string>) => IrFunction;
+}
+
+/** A revision (Int32SlotInputs.revise) changed a function in a way the
+ * fixpoint cannot follow: a call of a function no other call reaches, or
+ * any change besides element-reader calls taking the place of their
+ * inlined reads. The module needs an analysis of its own. */
+export class Int32RevisionConflict extends Error {}
+
+/** What the analysis's setup reads from a function body, besides direct
+ * calls: a revision must leave all of it unchanged. */
+function revisionStructure(fn: IrFunction): {
+  calls: { callee: string; args: number }[];
+  rest: string;
+} {
+  const calls: { callee: string; args: number }[] = [];
+  const rest: string[] = [];
+  const boxed = new Set(fn.locals.filter((local) => local.boxed).map((local) => local.id));
+  const expr = (e: IrExpr): boolean => {
+    const referenced = exprFunctionReference(e);
+    if (referenced !== undefined) rest.push(`ref:${referenced}`);
+    switch (e.kind) {
+      case "call":
+        calls.push({ callee: e.callee, args: e.args.length });
+        break;
+      case "new":
+        rest.push(`new:${e.className}:${e.args.length}`);
+        break;
+      case "varRef":
+        if (boxed.has(e.localId)) rest.push(`read:${e.localId}`);
+        break;
+      case "assignExpr":
+      case "incDec":
+        rest.push(`${e.kind}:${e.localId}`);
+        break;
+      case "fieldGet":
+      case "fieldIncDec":
+        rest.push(`${e.kind}:${e.className}\0${e.field}`);
+        break;
+      case "closure":
+        rest.push(`closure:${e.fnName}:${e.captures.join(",")}`);
+        break;
+      case "classRef":
+        rest.push(`classRef:${e.className}:${(e.captures ?? []).join(",")}`);
+        break;
+      case "virtualCall":
+        rest.push(`virtualCall:${e.className}.${e.method}`);
+        break;
+      case "instanceOfValue":
+        rest.push(`instanceOf:${e.classValue.kind}`);
+        break;
+    }
+    if (BOUNDARY_KINDS.has(e.kind)) rest.push(`boundary:${e.kind}`);
+    return everyExprChild(e, expr, stmt);
+  };
+  const stmt = (s: IrStmt): boolean => {
+    switch (s.kind) {
+      case "forOf":
+        rest.push(`forOf:${s.localId}`);
+        break;
+      case "tryCatch":
+        if (s.catchLocalId) rest.push(`catch:${s.catchLocalId}`);
+        break;
+      case "assign":
+      case "varDecl":
+        if (boxed.has(s.localId)) rest.push(`${s.kind}:${s.localId}`);
+        break;
+      case "throw":
+        rest.push("throw");
+        break;
+    }
+    return everyStmtChild(s, expr, stmt);
+  };
+  for (const s of fn.body) stmt(s);
+  rest.sort();
+  for (const local of fn.locals)
+    if (local.boxed || local.tdz)
+      rest.push(`local:${local.id}:${local.boxed === true}:${local.tdz === true}`);
+  for (const capture of fn.captures ?? []) rest.push(`capture:${capture.localId}`);
+  for (const capture of fn.classCaptures ?? []) rest.push(`classCapture:${capture.localId}`);
+  return { calls, rest: rest.join("\n") };
 }
 
 export function analyzeInt32Slots(mod: IrModule, inputs: Int32SlotInputs = {}): Int32Slots {
@@ -1204,12 +1410,45 @@ export function analyzeInt32Slots(mod: IrModule, inputs: Int32SlotInputs = {}): 
     });
     return found;
   };
+  // Candidates dropped without checked stores, and the revision of the
+  // functions that hold them (Int32SlotInputs.revise).
+  const dropped = new Set<string>();
+  const revise = (names: ReadonlySet<string>): void => {
+    for (const name of names) {
+      const previous = functions.get(name)!;
+      const next = inputs.revise!(name, dropped);
+      if (next === previous) continue;
+      const before = revisionStructure(previous);
+      const after = revisionStructure(next);
+      if (before.rest !== after.rest) throw new Int32RevisionConflict(name);
+      // The revision adds the element-reader calls back: each must be of a
+      // function other calls already reach, with its arity.
+      const counts = new Map<string, number>();
+      for (const { callee } of before.calls) counts.set(callee, (counts.get(callee) ?? 0) + 1);
+      for (const { callee, args } of after.calls) {
+        const left = counts.get(callee) ?? 0;
+        if (left > 0) {
+          counts.set(callee, left - 1);
+          continue;
+        }
+        const target = functions.get(callee);
+        if (!called.has(callee) || target === undefined || target.params.length !== args)
+          throw new Int32RevisionConflict(name);
+        reads(`ret:${callee}`, name);
+      }
+      for (const left of counts.values()) if (left > 0) throw new Int32RevisionConflict(name);
+      functions.set(name, next);
+    }
+  };
   const provenByFunction = new Map<string, IrExpr[]>();
   // Each function's parameter and result writes under its latest analysis:
   // at the fixpoint, the ranges of every write under the final facts.
   const lastWrites = new Map<string, Map<string, IntegerRange | null>>();
-  while (queue.length) {
-    const fn = functions.get(queue.pop()!)!;
+  // First in, first out: a function whose slots change while others wait
+  // goes after them, so a caller of many callees is analyzed again once
+  // for all of their changes, not once for each.
+  for (let head = 0; head < queue.length; head++) {
+    const fn = functions.get(queue[head]!)!;
     queued.delete(fn.name);
     const params = slots.facts(fn.name).params;
     if (params) for (const id of params.keys()) reads(`param:${fn.name}\0${id}`, fn.name);
@@ -1245,6 +1484,8 @@ export function analyzeInt32Slots(mod: IrModule, inputs: Int32SlotInputs = {}): 
       for (const id of globalArrays) both.add(id);
       arrays = both;
     }
+    // Functions whose candidates this visit drops, revised after it.
+    const revised = new Set<string>();
     if (arrays && arrayGroups) {
       const requeue = (name: string): void => {
         if (queued.has(name)) return;
@@ -1279,8 +1520,38 @@ export function analyzeInt32Slots(mod: IrModule, inputs: Int32SlotInputs = {}): 
           checkableInt32Allocations(fn, id)
         )
           slots.checkedInt32Arrays.add(key);
-        else for (const member of group) reason(`array:${member}`, "an element store is not int32");
+        else {
+          for (const member of group) reason(`array:${member}`, "an element store is not int32");
+          if (inputs.revise !== undefined) {
+            // The revised module no longer marks the group: its functions
+            // leave the candidate sets the visits below consult.
+            for (const member of group) {
+              dropped.add(member);
+              if (member.startsWith("\0")) {
+                globalArrays.delete(member.slice(1));
+                const names = arrayGroups.globalReaders.get(member);
+                if (names) for (const name of names) revised.add(name);
+              } else {
+                const cut = member.indexOf("\0");
+                const owner = member.slice(0, cut);
+                const ids = arrayCandidates.get(owner);
+                ids?.delete(member.slice(cut + 1));
+                if (ids?.size === 0) arrayCandidates.delete(owner);
+                revised.add(owner);
+              }
+            }
+            globalArrayFunctions.clear();
+            for (const [member, names] of arrayGroups.globalReaders)
+              if (!dropped.has(member)) for (const name of names) globalArrayFunctions.add(name);
+          }
+        }
       }
+    }
+    if (revised.size > 0) {
+      revise(revised);
+      // A revised body is analyzed again (it was queued with its readers);
+      // the writes of the body it replaces no longer count.
+      if (functions.get(fn.name) !== fn) continue;
     }
     // An int32 written into a slot still assumed non-negative: widen the
     // assumption when the value may be negative, and reanalyze its readers.
@@ -1663,8 +1934,14 @@ function narrowSlotRanges(
   // The ranges every function was last analyzed under.
   let analyzed: Map<string, IntegerRange> = new Map(proven);
   let verified: Map<string, IntegerRange> = new Map(proven);
-  // Functions whose recorded writes predate their current facts.
+  // Functions whose recorded writes predate their current facts: those
+  // whose parameters rangedParameters proved, and their callers, which
+  // wrote nothing into those parameters while they had no fact.
   const dirty = new Set(changed);
+  for (const name of changed) {
+    const callers = readersOf(`ret:${name}`);
+    if (callers) for (const caller of callers) dirty.add(caller);
+  }
   // The narrowing operator: a bound moves at most once from its proven
   // value (a revived result's from int32), so recursion that shifts its
   // argument (`f(d - 1)`) cannot walk a bound down one step per round.

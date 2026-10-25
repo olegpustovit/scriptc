@@ -180,6 +180,16 @@ function generateInput(kind) {
         ["sku-" + i, "category-" + (i % 17), "product " + i, i % 40, 199 + (i % 5000)].join("\t"),
       ).join("\n") + "\n",
     );
+  } else if (kind === "line-reader") {
+    // About 67 MB of access-log lines; every 50th path is not ASCII.
+    writeFileSync(
+      path,
+      Array.from(
+        { length: 600_000 },
+        (_, i) =>
+          `10.${i % 251}.${i % 7}.${i % 13} - - [24/Oct/2026:${String(i % 24).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}:00 +0000] "${i % 9 === 0 ? "POST" : "GET"} /${i % 50 === 0 ? "caf\u00e9" : "api"}/items/${i % 997}?page=${i % 31} HTTP/1.1" ${i % 23 === 0 ? 404 : 200} ${(i * 7919) % 50000} "scriptc-bench/1.0"`,
+      ).join("\n") + "\n",
+    );
   } else if (kind === "cli-config") {
     writeFileSync(path, JSON.stringify(deployManifest(), null, 2) + "\n");
   } else throw new Error(`unknown input kind ${kind}`);

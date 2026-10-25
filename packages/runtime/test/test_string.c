@@ -522,6 +522,30 @@ static void short_string_asserts(void) {
   scr_str_release(source);
 }
 
+/* A loop's publish converts a non-ASCII receiver before any read, while a
+ * lone read still walks bytes. ASCII receivers publish nothing. */
+static void scan_units_asserts(void) {
+  ScrStr *s = scr_str_new("a\xC3\xA9\xF0\x9F\x98\x80" "b", 8); /* a é 😀 b */
+  static const double codes[] = {97, 233, 0xD83D, 0xDE00, 98};
+  if (scr_str_char_code_at(s, 0) != 97 || scr_str_scan.s == s) failed++;
+  scr_str_scan_units(s);
+  if (scr_str_scan.s != s || scr_str_scan.n != 5) failed++;
+  for (size_t i = 0; i < 5; i++)
+    if (scr_str_scan.n == 5 && (scr_str_scan.units[i] != codes[i] ||
+                                scr_str_char_code_at(s, (double)i) != codes[i])) failed++;
+  if (!isnan(scr_str_char_code_at(s, 5))) failed++;
+  scr_str_scan_units(s); /* republishing keeps the same units */
+  const uint16_t *units = scr_str_scan.units;
+  scr_str_scan_units(s);
+  if (scr_str_scan.s != s || scr_str_scan.units != units) failed++;
+  ScrStr *ascii = scr_str_new("plain", 5);
+  scr_str_scan_units(ascii);
+  if (scr_str_scan.s != s) failed++;
+  scr_str_release(ascii);
+  scr_str_release(s);
+  if (scr_str_scan.s != NULL) failed++;
+  total++;
+}
 #ifdef SCR_SIDX_TEST
 static void sidx_fail(const char *what) {
   failed++;
@@ -1153,6 +1177,7 @@ int main(int argc, char **argv) {
   split_scratch_asserts();
   accumulation_asserts();
   short_string_asserts();
+  scan_units_asserts();
 #ifdef SCR_SIDX_TEST
   sparse_index_asserts();
   sparse_ascii_prefix_asserts();

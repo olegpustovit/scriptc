@@ -423,6 +423,44 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
     },
   );
 
+  test.each(["llvm"] as const)(
+    "a package probing for optional addons through createRequire compiles with deferred refusals (%s)",
+    async (backend) => {
+      const entry = join(pilotRoot, "addon-probe-cli.ts");
+      const { coverage } = analyze(entry, { npmStatic: "auto" });
+      expect(coverage.npmStatic).toEqual([{ package: "addon-probe", status: "static" }]);
+      expect(coverage.diagnostics).toHaveLength(0);
+      expect(
+        (coverage.runtimeFences ?? []).filter((f) => f.code === "SC2020").map((f) => f.message),
+      ).toEqual([
+        expect.stringContaining("'createRequire's require with a computed specifier"),
+        expect.stringContaining("'createRequire's require.resolve as a value'"),
+        expect.stringContaining("'createRequire's require.resolve with a computed request'"),
+        expect.stringContaining("'createRequire's require.resolve with a computed request'"),
+      ]);
+      const outDir = join(cacheDir, "addon-probe", sanitize ? "san" : "plain", backend);
+      const result = await compile(entry, {
+        backend,
+        npmStatic: "auto",
+        sanitize,
+        outDir,
+        outPath: join(outDir, "program"),
+      });
+      if (!result.ok)
+        throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+      const [nodeRes, nativeRes] = await Promise.all([
+        runBinary(process.execPath, [entry]),
+        runBinary(result.binaryPath, []),
+      ]);
+      expect(nativeRes.stdout.toString()).toBe(
+        "a/b absent,absent,unresolved\ncustom:other\nmissing after 1,missing after 2\n",
+      );
+      expect(nativeRes.stdout).toEqual(nodeRes.stdout);
+      expect(comparableStderr(nativeRes.stderr)).toEqual(nodeRes.stderr);
+      expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+    },
+  );
+
   test.each([
     [
       "computed specifier",
@@ -430,6 +468,31 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
       "computed specifier",
     ],
     ["escaped require", 'const alias = load; const path = alias("node:path");', "escapes"],
+    [
+      "computed specifier in a catch clause",
+      'try { load("node:path"); } catch { load(String(1)); } const path = load("node:path");',
+      "outside a try block",
+    ],
+    [
+      "computed specifier in a function inside a try block",
+      'try { [1].map((n) => load(String(n))); } catch {} const path = load("node:path");',
+      "outside a try block",
+    ],
+    [
+      "computed specifier in a class field inside a try block",
+      'try { new (class { addon = load(String(1)); })(); } catch {} const path = load("node:path");',
+      "outside a try block",
+    ],
+    [
+      "resolve value outside a try block",
+      'const find = load.resolve; const path = load("node:path");',
+      "outside a try block",
+    ],
+    [
+      "escaped require in a try block",
+      'try { const alias = load; alias("node:path"); } catch {} const path = load("node:path");',
+      "escapes",
+    ],
     [
       "reassigned require",
       'let load = createLoader(import.meta.url); load = () => ({}); const path = load("node:path");',
@@ -521,6 +584,28 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test("a word segmenter in a package constructs, and its segment() throws SC2020", async () => {
+    const entry = join(pilotRoot, "word-segments-cli.ts");
+    const { coverage } = analyze(entry, { npmStatic: "auto" });
+    expect(coverage.npmStatic).toEqual([{ package: "word-segments", status: "static" }]);
+    expect(coverage.diagnostics).toHaveLength(0);
+    const outDir = join(cacheDir, "word-segments", sanitize ? "san" : "plain");
+    const result = await compile(entry, {
+      backend: "llvm",
+      npmStatic: "auto",
+      sanitize,
+      outDir,
+      outPath: join(outDir, "program"),
+    });
+    if (!result.ok)
+      throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+    const nativeRes = await runBinary(result.binaryPath, []);
+    expect(nativeRes.stdout.toString()).toMatch(
+      /^SC2020: Intl\.Segmenter segmentation with granularity 'word' is not supported yet \[SC2020 at .*index\.js:1\]\n$/,
+    );
+    expect(nativeRes.exitCode).toBe(0);
   });
 
   test.each([

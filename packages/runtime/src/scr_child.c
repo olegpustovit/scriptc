@@ -6669,6 +6669,9 @@ double scr_process_fork_target(double target_count) {
   return target;
 }
 
+/* The child was created with an IPC channel; it keeps it until it is freed. */
+bool scr_child_ipc_present(ScrChild *c) { return c->ipc != NULL; }
+
 bool scr_child_ipc_connected(ScrChild *c) {
   return c->ipc != NULL && c->ipc->connected;
 }

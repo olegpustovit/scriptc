@@ -4,6 +4,7 @@ import { generatorDrain } from "../iterator-adapters.js";
 import { identityPreservingWidening } from "../coercions/identity.js";
 import { liftedFreshSpread } from "../coercions/fresh-spread.js";
 import { checkedIterableSpread } from "../checked-iterable-spread.js";
+import { AstNode } from "../../ts7/ast-node.js";
 import { InternalCompilerError } from "../../../errors.js";
 import {
   dynUndefinedExpr,
@@ -27,7 +28,9 @@ import {
   type IrType,
   STRING,
   type SrcLoc,
+  UNDEFINED_T,
   arrayOf,
+  isUnitType,
   canConvertToDyn,
   funcOf,
   isRefCounted,
@@ -35,7 +38,13 @@ import {
   typeEquals,
 } from "../../../ir/ir.js";
 import { isJsSourceFile, locOf } from "../../program.js";
-import { arrayValueRead, arrayValueStore, arrayValueType } from "../array-values.js";
+import {
+  arrayValueRead,
+  arrayValueStore,
+  arrayValueType,
+  optionalElementValue,
+  primitiveElement,
+} from "../array-values.js";
 import { typeKey } from "../../type-mapper.js";
 import { newFnCtx } from "../lowerer.js";
 import { iteratorCanStep, iteratorValue } from "../iterator-consumption.js";
@@ -50,6 +59,34 @@ import {
   callbackArrayElement,
 } from "./callback-arguments.js";
 import { classGeneratorIterable } from "../class-iterables.js";
+
+/** A value whose type admits only null and undefined, stored into an array
+ * that keeps undefined elements: the checker admits it there only when its
+ * type is `undefined` (a tuple element typed `undefined` maps to such a
+ * union), so it is evaluated and stored as undefined. */
+function undefinedForNullish(
+  lowerer: Lowerer,
+  value: IrExpr,
+  arrType: IrType & { kind: "array" },
+): IrExpr {
+  if (arrType.optionalElements !== true || value.type.kind !== "union") return value;
+  const arms = lowerer.unions.get(value.type.unionId)?.arms ?? [];
+  if (arms.length === 0 || !arms.every(isUnitType)) return value;
+  const loc = value.loc;
+  const optional: IrType = {
+    kind: "union",
+    unionId: lowerer.unions.intern([arrType.elem, UNDEFINED_T]),
+  };
+  const missing = lowerer.wrappedUndefined(optional, loc);
+  if (!missing) return value;
+  return {
+    kind: "seqExpr",
+    stmts: [{ kind: "exprStmt", expr: value, loc }],
+    result: missing,
+    type: optional,
+    loc,
+  };
+}
 
 /** Build the argument array for a mutating/copying operation while keeping
  * the receiver's scalar payload ABI. A missing read is represented as the
@@ -86,9 +123,11 @@ export function lowerArrayValueItems(
       loc,
     },
   ];
-  for (const value of values) {
+  for (const item of values) {
+    const value = undefinedForNullish(lowerer, item, arrType);
     const stored =
-      lowerer.runtimeOptionalWidening(value.type, elem) !== null
+      lowerer.runtimeOptionalWidening(value.type, elem) !== null ||
+      optionalElementValue(lowerer, value, elem)
         ? value
         : lowerer.coerceToExpected(value, elem);
     body.push(arrayValueStore(lowerer, outRef, length(), stored, elem, loc));
@@ -96,16 +135,21 @@ export function lowerArrayValueItems(
   return { kind: "seqExpr", stmts: body, result: outRef, type: arrType, loc };
 }
 
+/** The items of an array built from argument nodes (a spread copies its
+ * elements in) and values already lowered (a spread tuple's fields), in
+ * order. Each value is stored when its turn comes. */
 export function lowerArraySpreadItems(
   lowerer: Lowerer,
-  nodes: readonly ts.Expression[],
+  nodes: readonly (ts.Expression | IrExpr)[],
   elem: IrType,
   arrType: IrType & { kind: "array" },
   loc: SrcLoc,
 ): IrExpr {
   const out = lowerer.declareHiddenLocal("%arrayItems", arrType);
   const outRef = varRef(out.id, arrType, loc);
-  const plainItems = nodes.filter((node) => !ts.isSpreadElement(node)).length;
+  const plainItems = nodes.filter(
+    (node) => !(node instanceof AstNode) || !ts.isSpreadElement(node),
+  ).length;
   const length = (): IrExpr => ({
     kind: "arrIntrinsic",
     method: "length",
@@ -129,7 +173,23 @@ export function lowerArraySpreadItems(
     },
   ];
   for (const node of nodes) {
-    if (ts.isSpreadElement(node)) {
+    if (!(node instanceof AstNode)) {
+      // A spread tuple's first field declares the tuple's storage, which
+      // the later fields read: its statements join this sequence, whose
+      // frame lasts until every item is stored.
+      let item = node;
+      if (item.kind === "seqExpr") {
+        body.push(...item.stmts);
+        item = item.result;
+      }
+      const value = undefinedForNullish(lowerer, item, arrType);
+      const stored =
+        lowerer.runtimeOptionalWidening(value.type, elem) !== null ||
+        optionalElementValue(lowerer, value, elem)
+          ? value
+          : lowerer.coerceToExpected(value, elem);
+      body.push(arrayValueStore(lowerer, outRef, length(), stored, elem, loc));
+    } else if (ts.isSpreadElement(node)) {
       let source = lowerer.lowerExpr(node.expression);
       if (
         source.type.kind === "set" &&
@@ -212,7 +272,8 @@ export function lowerArraySpreadItems(
     } else {
       const value = lowerer.lowerExpr(node);
       const stored =
-        lowerer.runtimeOptionalWidening(value.type, elem) !== null
+        lowerer.runtimeOptionalWidening(value.type, elem) !== null ||
+        optionalElementValue(lowerer, value, elem)
           ? value
           : lowerer.coerceInto(node, value, elem);
       body.push(arrayValueStore(lowerer, outRef, length(), stored, elem, loc));
@@ -517,6 +578,20 @@ export function lowerArrayOfCall(
   }
   if (call.arguments.nodes.some(ts.isSpreadElement)) {
     return lowerArraySpreadItems(lowerer, call.arguments.nodes, result.elem, result, locOf(call));
+  }
+  // A `(T | undefined)[]` (primitiveElement) stores undefined arguments as
+  // present undefined elements.
+  if (result.optionalElements === true) {
+    const nodes = call.arguments.nodes;
+    const values = nodes.map((arg) => lowerer.lowerExpr(arg));
+    if (values.some((value) => optionalElementValue(lowerer, value, result.elem)))
+      return lowerArrayValueItems(lowerer, values, result.elem, result, locOf(call));
+    return {
+      kind: "arrayLit",
+      elems: values.map((value, i) => lowerer.coerceInto(nodes[i]!, value, result.elem)),
+      type: result,
+      loc: locOf(call),
+    };
   }
   return {
     kind: "arrayLit",
@@ -959,6 +1034,31 @@ export function lowerArrayFromCall(
       const arrT = lowerer.mapTypeOf(lowerer.typeOf(call));
       if (arrT?.kind !== "array") lowerer.badType(call, lowerer.typeOf(call));
       const elem = arrT.elem;
+      // A `(T | undefined)[]` (primitiveElement): n present undefined
+      // elements.
+      const elemTs = lowerer.checker.isArrayType(lowerer.typeOf(call))
+        ? lowerer.checker.getTypeArguments(lowerer.typeOf(call) as ts.TypeReference)[0]
+        : undefined;
+      if (
+        primitiveElement(elem) &&
+        elemTs !== undefined &&
+        (elemTs.isUnionType() ? ts.constituentTypes(elemTs) : [elemTs]).some(
+          (part) => (part.flags & ts.TypeFlags.Undefined) !== 0,
+        )
+      ) {
+        return {
+          kind: "arrIntrinsic",
+          method: "fillUndefined",
+          receiver: { kind: "arrayNewLen", length: n, type: arrT, loc },
+          // To the end: fill clamps an infinite end to the length.
+          args: [
+            numLit(0, loc),
+            { kind: "bin", op: "/", left: numLit(1, loc), right: numLit(0, loc), type: F64, loc },
+          ],
+          type: arrT,
+          loc,
+        };
+      }
       const absent =
         elem.kind === "union"
           ? lowerer.wrappedUndefined(elem, loc) !== null ||
@@ -1085,7 +1185,10 @@ export function lowerArrayFromCall(
     // A generator (or an iterator adapted into one) drains in order.
     if (src.type.kind === "generator" && args.length === 1) {
       const arrT = lowerer.mapTypeOf(lowerer.typeOf(call));
-      const drained = arrT?.kind === "array" ? generatorDrain(lowerer, src, arrT.elem, loc) : null;
+      const drained =
+        arrT?.kind === "array"
+          ? generatorDrain(lowerer, src, arrT.elem, loc, arrT.optionalElements === true)
+          : null;
       if (drained) return drained;
     }
     lowerer.noLowering(
@@ -1159,6 +1262,11 @@ function buildArrayFromArrayFn(
     type: fnRet,
     loc,
   };
+  // A result of another type than the element (`T | undefined` into a
+  // `(T | undefined)[]`, which stores T elements) is held in a local, so
+  // the store tests and converts one value.
+  const held = !typeEquals(fnRet, outElem);
+  const value: IrExpr = held ? varRef("v.0", fnRet, loc) : mapped;
   return {
     name,
     params: [
@@ -1171,6 +1279,7 @@ function buildArrayFromArrayFn(
       { id: "f.0", name: "f", type: fnT, mutable: true },
       { id: "out.0", name: "out", type: outT, mutable: false },
       { id: "i.0", name: "i", type: F64, mutable: true },
+      ...(held ? [{ id: "v.0", name: "v", type: fnRet, mutable: false }] : []),
     ],
     body: [
       {
@@ -1191,7 +1300,8 @@ function buildArrayFromArrayFn(
           loc,
         },
         body: [
-          arrayValueStore(lowerer, out, i, mapped, outElem, loc),
+          ...(held ? [{ kind: "varDecl", localId: "v.0", init: mapped, loc } as const] : []),
+          arrayValueStore(lowerer, out, i, value, outElem, loc),
           {
             kind: "assign",
             localId: "i.0",

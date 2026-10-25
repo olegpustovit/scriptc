@@ -32,6 +32,7 @@ import {
 } from "../cjs-inline-require.js";
 import { captureContextArguments } from "../function-context.js";
 import { argumentsOwner, typedArgumentsCandidate } from "../typed-arguments.js";
+import { argumentCountValue } from "../argument-counts.js";
 import {
   isCjsExportTableLiteral,
   isCjsJsFile,
@@ -58,6 +59,7 @@ import {
   contextualUndefReadType,
   fenceEarlyAliasUse,
   isTemporalGlobalRoot,
+  cjsNamespaceImportDep,
   lowerNsIdentifierValue,
   nsUndefRead,
 } from "../lower-namespaces.js";
@@ -453,7 +455,17 @@ export function lowerIdentifierExpr(lowerer: Lowerer, expr: ts.Identifier, loc: 
     // semantics); the rest marker carries the trailing dyn-array ABI.
     const funcType: IrType = funcTypeFromParamShapes(sig.params, sig.returnType);
     lowerer.requireExactArityValue(expr, expr, sig.params, funcType);
-    return { kind: "closure", fnName: sig.name, captures: [], type: funcType, loc };
+    const closure = {
+      kind: "closure" as const,
+      fnName: sig.name,
+      captures: [],
+      type: funcType,
+      loc,
+    };
+    const decl = lowerer.resolveValueSymbol(expr)?.valueDeclaration;
+    return decl && ts.isFunctionDeclaration(decl) && funcType.kind === "func"
+      ? argumentCountValue(lowerer, decl, expr, { ...closure, type: funcType })
+      : closure;
   }
   {
     // A generic function as a VALUE: monomorphized by flow — the
@@ -835,7 +847,17 @@ export function lowerIdentifierExpr(lowerer: Lowerer, expr: ts.Identifier, loc: 
           "deref()-after-collect exposes GC timing — genuinely dynamic; hold a strong reference instead",
         eval: "runtime code evaluation cannot be compiled ahead of time",
       };
-      lowerer.noLowering(expr.text, expr, globalHints[expr.text], sym ?? undefined);
+      lowerer.noLowering(
+        expr.text,
+        expr,
+        globalHints[expr.text],
+        sym ?? undefined,
+        expr.text === "WeakRef" || expr.text === "FinalizationRegistry"
+          ? "weak-ref"
+          : expr.text === "eval"
+            ? "code-from-string"
+            : undefined,
+      );
     }
   }
   // An ambient global nothing defines compiles to exactly what Node does
@@ -963,6 +985,37 @@ export function lowerIdentifierExpr(lowerer: Lowerer, expr: ts.Identifier, loc: 
   // representation (ambient namespaces compile to Node's
   // ReferenceError instead — the object never exists at runtime).
   {
+    // `ns.name` through a namespace import of a CommonJS module, where Node's
+    // namespace has no `name` property (its lexer does not detect it), or
+    // `ns.default` (module.exports itself).
+    const cjsNamespace = cjsNamespaceImportDep(lowerer, expr);
+    if (
+      cjsNamespace !== null &&
+      ts.isPropertyAccessExpression(expr.parent) &&
+      expr.parent.expression === expr &&
+      ts.isIdentifier(expr.parent.name)
+    ) {
+      const name = expr.parent.name.text;
+      const { names, assignedLater } = lowerer.cjsNamespaceOf(cjsNamespace);
+      if (name === "default")
+        lowerer.unsupported(
+          "SC1090",
+          expr.parent,
+          `reads of 'default' through namespace imports of CommonJS modules (module.exports itself: read it through a default import)`,
+        );
+      if (!names.has(name))
+        lowerer.unsupported(
+          "SC1090",
+          expr.parent,
+          `reads of '${name}' through namespace imports of CommonJS modules (Node's lexer does not detect '${name}' among the module's exports, so Node reads undefined)`,
+        );
+      if (assignedLater === "all" || assignedLater.has(name))
+        lowerer.unsupported(
+          "SC1090",
+          expr.parent,
+          `reads of '${name}' through namespace imports of CommonJS modules whose functions assign exports (Node's namespace keeps the values from the end of the module's evaluation)`,
+        );
+    }
     const moduleNs = lowerer.mapTypeOf(lowerer.typeOf(expr));
     if (moduleNs?.kind === "moduleNs") {
       return { kind: "moduleNsRef", moduleId: moduleNs.moduleId, type: moduleNs, loc };

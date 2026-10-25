@@ -394,9 +394,9 @@ function tablePropertyWritten(
     }
     return false;
   };
-  for (const sf of lowerer.program.getSourceFiles()) {
+  for (const sf of lowerer.program.getImplementationSourceFiles()) {
     if (written) break;
-    if (sf.isDeclarationFile || !sf.text.includes(name)) continue;
+    if (!sf.text.includes(name)) continue;
     ts.walkPreorder(sf, (node) => {
       if (written) return "stop";
       let target: ts.Node | undefined;

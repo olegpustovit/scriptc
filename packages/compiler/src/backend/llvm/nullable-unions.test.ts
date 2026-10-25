@@ -56,10 +56,11 @@ test("unions of two or more records become shape unions", () => {
 });
 
 test("records of runtime-inspected unions keep every union over them boxed", () => {
-  const set: IrType = { kind: "set", elem: { kind: "union", unionId: "ab" } };
+  const set: IrType = { kind: "set", elem: { kind: "union", unionId: "abf" } };
   const unions = new NullableUnions(
     module(
       [
+        { id: "abf", arms: [a, b, F64] },
         { id: "ab", arms: [a, b] },
         { id: "abu", arms: [a, b, UNDEFINED_T] },
         { id: "bc", arms: [b, c] },
@@ -68,11 +69,40 @@ test("records of runtime-inspected unions keep every union over them boxed", () 
       { globals: [{ id: "%g.s", name: "s", type: set, mutable: false }] },
     ),
   );
+  expect(unions.get("abf")).toBeNull();
   expect(unions.get("ab")).toBeNull();
   expect(unions.get("abu")).toBeNull();
   expect(unions.get("bc")).toBeNull();
   expect(unions.get("ac")).toBeNull();
   expect(unions.shapeNumber("c")).toBe(0);
+});
+
+test("unions of records alone stay shape unions as Map keys and Set elements", () => {
+  const set: IrType = { kind: "set", elem: { kind: "union", unionId: "ab" } };
+  const map: IrType = { kind: "map", key: { kind: "union", unionId: "abc" }, value: F64 };
+  const unions = new NullableUnions(
+    module(
+      [
+        { id: "ab", arms: [a, b] },
+        { id: "abc", arms: [a, b, c] },
+        { id: "ba", arms: [b, a] },
+        { id: "abu", arms: [a, b, UNDEFINED_T] },
+      ],
+      {
+        globals: [
+          { id: "%g.s", name: "s", type: set, mutable: false },
+          { id: "%g.m", name: "m", type: map, mutable: false },
+        ],
+      },
+    ),
+  );
+  expect(unions.shapes("ab")).not.toBeNull();
+  expect(unions.shapes("abc")).not.toBeNull();
+  expect(unions.shapes("abu")).not.toBeNull();
+  // Unions over the same records share one release and trace helper.
+  expect(unions.helperOwner("ba")).toBe("ab");
+  expect(unions.helperOwner("abu")).toBe("ab");
+  expect(unions.helperOwner("abc")).toBe("abc");
 });
 
 test("library, lifetime-region and debug builds keep record unions boxed", () => {

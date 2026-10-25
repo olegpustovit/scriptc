@@ -523,6 +523,12 @@ test("counting-down recursion proves its parameter from the call-site ranges", (
   );
   const rising = analyzeInt32Slots(mod([], [up, fn("user", [], [stmt(call("up", [num(-18)]))])]));
   expect(rising.facts("up").params?.get("d")).toEqual({ min: -18, max: 0 });
+  // The same with the caller first, so the fixpoint analyzes it after the
+  // parameter dropped: the narrowing still sees its argument.
+  const callerFirst = analyzeInt32Slots(
+    mod([], [fn("user", [], [stmt(call("up", [num(-18)]))]), up]),
+  );
+  expect(callerFirst.facts("up").params?.get("d")).toEqual({ min: -18, max: 0 });
 
   // A negative start counts down past the smallest int32.
   const negative = analyzeInt32Slots(mod([], [count, even, odd, user([18, -1])]));

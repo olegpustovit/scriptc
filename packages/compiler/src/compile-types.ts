@@ -2,9 +2,11 @@ import type { TargetCpu } from "./backend/target-cpu.js";
 import type { WindowsSubsystem } from "./backend/targets.js";
 import type { NativeLinkInfo } from "./backend/native-link-info.js";
 import type { NativeOptimization } from "./backend/optimization.js";
+import type { NativeProfileMatch } from "./backend/native-profile.js";
 import type { ScrDiagnostic } from "./diagnostics/diagnostic.js";
 import type { CoverageInput } from "./coverage/report.js";
 import type { TierMode } from "./frontend/tier-analysis.js";
+import type { NodeIslandOptions } from "./node-islands/policy.js";
 
 export type CompileOutputKind = "ir" | "llvm" | "asm" | "obj" | "exe";
 
@@ -100,6 +102,8 @@ export type CompileArtifact =
       path: string;
       translationUnitPath: string;
       backend: "llvm";
+      /** How a `profileUse` build's profile matched the program's functions. */
+      profileMatch?: NativeProfileMatch;
     };
 
 export type CompileFailure = {
@@ -190,6 +194,9 @@ export interface AnalyzeOptions {
   /** `--wasm <file>`: WebAssembly module files the program loads that its
    * sources do not name (absolute paths); reported with the discovered ones. */
   wasm?: readonly string[];
+  /** The Node island policy's command-line half (report-only: coverage
+   * reports which packages and modules would run in a Node island). */
+  nodeIslands?: NodeIslandOptions;
 }
 
 export interface AnalyzeResult {

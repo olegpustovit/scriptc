@@ -118,7 +118,12 @@ export function resolveSelfCaptures(mod: IrModule): IrModule {
   }
   if (resolved.size === 0) return mod;
 
+  // Only the resolved bodies and the functions that create their closures
+  // change.
+  const touched = new Set(resolved.keys());
+  for (const name of resolved.keys()) for (const site of sites.get(name)!) touched.add(site.owner);
   const rewritten = mod.functions.map((fn) => {
+    if (!touched.has(fn.name)) return fn;
     const own = resolved.get(fn.name);
     const self = own === undefined ? null : fn.captures![own]!;
     let changed = false;

@@ -28,6 +28,7 @@ import type { IndexMergeContributor } from "../containers/indexed-objects.js";
 import type { KeyOrderSegment } from "../key-order-witness.js";
 import {
   PERF_ENTRY_MARKER,
+  X509_PUBLIC_KEY_FIELD,
   isGenericCallableMemberType,
   jsOpenObjectType,
 } from "../../type-mapper.js";
@@ -38,6 +39,7 @@ import { planUnionRetag } from "../union-retag.js";
 import { jsHoldsDynObject, runtimeOptionalStorageOperand } from "../lower-exprs.js";
 import { builtinGlobalValue } from "./property-access.js";
 import { holdsEvolvingArray } from "../lower-stmts.js";
+import { builtinNamespaceValue } from "../builtin-namespaces.js";
 
 /** `{ a: 1, b: "x" }` → recordLit. The record type comes from the
  * contextual type when tsc has one (annotated declarations, arguments,
@@ -499,6 +501,13 @@ function fenceAccessorSpreadSource(
       "SC1090",
       prop,
       "object spread over performance entries (Node keeps their fields as prototype getters, so own-key walks see none; read the fields or call toJSON())",
+    );
+  }
+  if (srcShape && srcShape.fields.some((f) => f.name === X509_PUBLIC_KEY_FIELD)) {
+    lowerer.unsupported(
+      "SC1090",
+      prop,
+      "object spread over X509Certificate values (Node keeps their fields as prototype getters, so own-key walks see none; read the fields)",
     );
   }
   if (srcShape && shapeHasAccessorSlots(srcShape)) {
@@ -3262,7 +3271,11 @@ function shorthandBuiltinValue(
   const symbol = lowerer.checker.getShorthandAssignmentValueSymbol(prop);
   if (!symbol || !lowerer.isStdlibSymbol(symbol)) return null;
   const js = isJsSourceFile(ts.getSourceFileOfNode(prop));
-  return builtinGlobalValue(ts.symbolName(symbol), locOf(prop.name), js);
+  const name = ts.symbolName(symbol);
+  return (
+    (js ? builtinNamespaceValue(lowerer, name, locOf(prop.name)) : null) ??
+    builtinGlobalValue(name, locOf(prop.name), js)
+  );
 }
 
 export function lowerShorthandValue(

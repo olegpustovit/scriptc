@@ -42,6 +42,11 @@ extern SCR_TL ScrStrScan scr_str_scan;
  * [0, length) — note charCodeAt(1.5) is index 1, matching Node. */
 double scr_str_char_code_at(ScrStr *s, double i);
 
+/* Converts a non-ASCII s up to the units cap to UTF-16 at once and
+ * publishes it in scr_str_scan, for a loop about to read all of it. Leaves
+ * scr_str_scan unchanged for any other s. */
+void scr_str_scan_units(ScrStr *s);
+
 /* indexOf(needle, fromIndex): UTF-16 index of the first occurrence at or
  * after fromIndex (clamped to [0, length]), or -1. Empty needle returns the
  * clamped fromIndex per spec. */

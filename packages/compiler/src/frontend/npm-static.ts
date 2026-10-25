@@ -505,6 +505,10 @@ export function npmStaticFsShadow(services: FrontendServices): NpmStaticFsShadow
           // literals they build.
           const enums = original === null ? null : services.enumIifes(original, path);
           if (enums !== null) original = enums;
+          // Guarded namespace declarations (`var ns = ns || {}`) read the
+          // hoisted `undefined`: the declaration is its default.
+          const namespaces = original === null ? null : services.namespaceDefaults(original, path);
+          if (namespaces !== null) original = namespaces;
           // A module that names its export object through a variable reaches
           // its members through `exports`.
           const exportsVar = original === null ? null : services.cjsExportsVar(original, path);
@@ -517,6 +521,7 @@ export function npmStaticFsShadow(services: FrontendServices): NpmStaticFsShadow
             aliased !== null ||
             fnExports !== null ||
             enums !== null ||
+            namespaces !== null ||
             exportsVar !== null;
           if (original !== null) {
             const namepaths = services.jsDocNamepaths(path, original);

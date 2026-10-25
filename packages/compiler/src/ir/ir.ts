@@ -87,7 +87,16 @@ export type IrType =
   | { kind: "date" }
   | { kind: "string" } // heap, refcounted, UTF-8
   | { kind: "bool" }
-  | { kind: "array"; elem: IrType } // heap, refcounted, monomorphic elements
+  | {
+      kind: "array";
+      elem: IrType;
+      /** A `(T | undefined)[]` of a number, string or boolean T, stored as
+       * T elements (which hold a present undefined by their state). Not
+       * part of the type's identity (typeEquals, typeKey): it only lets a
+       * checked conversion from a dynamic value accept undefined
+       * elements. */
+      optionalElements?: true;
+    } // heap, refcounted, monomorphic elements
   /** ES `Map<K, V>` — heap, refcounted, insertion-ordered hash map with ONE
    * runtime representation (ScrMap) and type-directed key/value handling,
    * exactly the array pattern (never per-instantiation structs). Keys use
@@ -855,9 +864,8 @@ export function funcOf(params: IrType[], ret: IrType): IrType {
  * promises nullable-only; declared maybe-promise unions are admitted by
  * maybePromiseUnionArmsOk. */
 export function unionContainerArmsOk(arms: IrType[]): boolean {
-  return (
-    arms.every((a, i) => a.kind !== "promise" || arms.every((b, j) => j === i || isUnitType(b))) &&
-    dateUnionArmsOk(arms)
+  return arms.every(
+    (a, i) => a.kind !== "promise" || arms.every((b, j) => j === i || isUnitType(b)),
   );
 }
 
@@ -868,13 +876,7 @@ export function unionContainerArmsOk(arms: IrType[]): boolean {
  * non-thenable path). Data arms must not be thenable; the type mapper
  * checks that against the checker types before minting such a union. */
 export function maybePromiseUnionArmsOk(arms: IrType[]): boolean {
-  return arms.filter((a) => a.kind === "promise").length <= 1 && dateUnionArmsOk(arms);
-}
-
-/** A Date arm has a union home beside undefined and null arms only: no
- * narrowing contract tells it from other data arms yet. */
-function dateUnionArmsOk(arms: IrType[]): boolean {
-  return arms.every((a, i) => a.kind !== "date" || arms.every((b, j) => j === i || isUnitType(b)));
+  return arms.filter((a) => a.kind === "promise").length <= 1;
 }
 
 /** Canonical, injective text form of an IrType — the building block of
@@ -1073,6 +1075,11 @@ export interface IrModule {
    * (frontend frozen-records.ts): their writes test the array's frozen bit
    * (SCR_ARR_FROZEN) and throw Node's TypeError when it is set. */
   freezableArrays?: string[];
+  /** The program freezes, seals or prevents extensions of untyped values
+   * (frontend frozen-records.ts noteUntypedIntegrity). Class hierarchies
+   * that can be held there carry an integrity word, which the runtime sets
+   * through the commit of the instance's checked view. */
+  untypedIntegrity?: true;
   /** The entry module is CommonJS under Node's classification. Node runs a
    * CommonJS main synchronously and drains process.nextTick callbacks
    * before promise jobs at the first checkpoint; an ES-module main's
@@ -1630,6 +1637,28 @@ export function classValueConstructor(def: { name: string; runtime?: true }): {
     : { fn: `%${def.name}.constructor`, firstArg: 1 };
 }
 
+/** Whether construction through a class value typed as `sup` may call
+ * `sub`'s construct thunk: both class-value constructors exist and take the
+ * same argument types after the receiver. The classval upcast rule and the
+ * checked class-value boundary both rest on it. */
+export function classValueAbiEquals(
+  sub: { name: string; runtime?: true },
+  sup: { name: string; runtime?: true },
+  functions: ReadonlyMap<string, IrFunction>,
+): boolean {
+  const subValueCtor = classValueConstructor(sub);
+  const supValueCtor = classValueConstructor(sup);
+  const subCtor = functions.get(subValueCtor.fn);
+  const supCtor = functions.get(supValueCtor.fn);
+  if (!subCtor || !supCtor) return false;
+  const subArgs = subCtor.params.slice(subValueCtor.firstArg);
+  const supArgs = supCtor.params.slice(supValueCtor.firstArg);
+  return (
+    subArgs.length === supArgs.length &&
+    subArgs.every((p, i) => typeEquals(p.type, supArgs[i]!.type))
+  );
+}
+
 /** The JavaScript `.name` of a class: its jsName, or the runtime-provided
  * class's own name (`%TypeError` is TypeError). */
 export function classJsName(def: { name: string; runtime?: true; jsName?: string }): string {
@@ -1781,16 +1810,32 @@ export function recordTextCodecClass(shape: IrRecordShape): "TextEncoder" | "Tex
   return null;
 }
 
-/** The codec class of a TextEncoder or TextDecoder record type, else null.
- * Such a record crosses an `unknown` slot as a native handle that holds the
- * record itself (scr_text_codec_dyn.c), never as a copy or a field view. */
+/** The class of a record that crosses checked-dynamic slots as a native
+ * handle: the codecs, and a StringDecoder (type-mapper.ts: its canonical
+ * encoding and the packing of its pending bytes). */
+export function recordHandleCodecClass(
+  shape: IrRecordShape,
+): "TextEncoder" | "TextDecoder" | "StringDecoder" | null {
+  const codec = recordTextCodecClass(shape);
+  if (codec !== null) return codec;
+  return shape.fields.length === 2 &&
+    shape.fields[0]!.name === "%enc" &&
+    shape.fields[1]!.name === "%pending"
+    ? "StringDecoder"
+    : null;
+}
+
+/** The codec class of a TextEncoder, TextDecoder or StringDecoder record
+ * type, else null. Such a record crosses an `unknown` slot as a native
+ * handle that holds the record itself (scr_text_codec_dyn.c), never as a
+ * copy or a field view. */
 export function textCodecRecordClass(
   t: IrType,
   getRecord: (shapeId: string) => IrRecordShape | undefined,
-): "TextEncoder" | "TextDecoder" | null {
+): "TextEncoder" | "TextDecoder" | "StringDecoder" | null {
   if (t.kind !== "record") return null;
   const shape = getRecord(t.shapeId);
-  return shape ? recordTextCodecClass(shape) : null;
+  return shape ? recordHandleCodecClass(shape) : null;
 }
 
 /** Object-literal ACCESSOR properties (`{ get x() {...}, set x(v) {...} }`)
@@ -3381,7 +3426,17 @@ export type IrExpr =
    * from a union) whose Web API contract exposes the reference again, such
    * as stream chunks and abort reasons; ordinary JSON-shaped values retain
    * the documented deep-copy boundary. */
-  | { kind: "dynFrom"; value: IrExpr; fnName?: string; liveRef?: true; type: IrType; loc: SrcLoc }
+  | {
+      kind: "dynFrom";
+      value: IrExpr;
+      fnName?: string;
+      /** A boxed function's `length` when it differs from its parameter
+       * count (builtin function values). */
+      fnLength?: number;
+      liveRef?: true;
+      type: IrType;
+      loc: SrcLoc;
+    }
   /** CALLING a dyn value — `fn(a, b)` where fn is checked-dynamic (an
    * implicit-any JS binding, a dyn record member, a dynKeyGet result).
    * Arguments are ALREADY dyn-typed (typed values box through dynFrom at
@@ -3894,7 +3949,7 @@ export type IrExpr =
     }
   /** Standard-library call (`process` members, node:fs functions). `fn` is a
    * closed union; arg/result types are fixed per member (validated against
-   * LIB_FN_SIGS). Property READS (`process.argv`, `process.platform`) are
+   * libFnSignatures()). Property READS (`process.argv`, `process.platform`) are
    * zero-arg libCalls. Args are BORROWED by the operation (frame temps
    * release at statement end); refcounted results come back owned (+1) —
    * `process.argv` returns +1 on ONE interned array (JS identity:

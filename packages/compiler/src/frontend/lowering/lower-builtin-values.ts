@@ -16,7 +16,7 @@ import { strLit, varRef } from "../../ir/build.js";
 import type { Lowerer } from "./lowerer.js";
 import {
   BUILTIN_MODULE_CONSTS,
-  BUILTIN_MODULE_FNS,
+  builtinModuleFns,
   OBJECT_CALLABLE_VALUES,
   builtinConstLit,
   builtinModuleConstOf,
@@ -430,7 +430,7 @@ export function pathModuleValue(lowerer: Lowerer, module: string, loc: SrcLoc): 
   const add = (member: string, value: IrExpr): void => {
     fields.push({ key: strLit(member, loc), value: box(value) });
   };
-  for (const member of Object.keys(BUILTIN_MODULE_FNS[module] ?? {})) {
+  for (const member of Object.keys(builtinModuleFns()[module] ?? {})) {
     const value = lowerer.lowerBuiltinCallableValue({ module, member }, loc);
     if (value) add(member, value);
   }
@@ -512,7 +512,7 @@ function moduleValue(lowerer: Lowerer, module: string, loc: SrcLoc): IrExpr {
         loc,
       });
     };
-    for (const member of Object.keys(BUILTIN_MODULE_FNS[module] ?? {})) {
+    for (const member of Object.keys(builtinModuleFns()[module] ?? {})) {
       const callable = lowerer.lowerBuiltinCallableValue({ module, member }, loc);
       if (callable) add(member, callable);
     }

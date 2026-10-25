@@ -286,8 +286,9 @@ function bump(s: State): State { return { ...s, count: s.count + 1 }; }
 export function tokens(n: number, w: string): number {
   const t = { kind: "id", text: w, pos: n };
   const u = make("num", w, n);
-  const [q, r] = divmod(n, 7);
-  return t.pos + width(u) + width({ kind: w, text: w, pos: 0 }) + q + r;
+  // Read by index: a destructured literal result is inlined instead.
+  const qr = divmod(n, 7);
+  return t.pos + width(u) + width({ kind: w, text: w, pos: 0 }) + qr[0] + qr[1];
 }
 export function states(n: number, w: string): number {
   let s: State = { name: w, count: 0 };

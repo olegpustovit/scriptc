@@ -538,7 +538,7 @@ export class CaptureFlow {
             facts.callees.add(e.callee.localId);
           break;
       }
-      return everyExprChild(e, expr, (s) => stmt(s, false));
+      return everyExprChild(e, expr, nested);
     };
     // `split` mirrors rewrite(): only statement lists reached through
     // ordinary nesting from the body are expanded. Switch cases share one
@@ -599,8 +599,10 @@ export class CaptureFlow {
             list(s.body, split)
           );
       }
-      return everyStmtChild(s, expr, (child) => stmt(child, false));
+      return everyStmtChild(s, expr, nested);
     };
+    // Statements nested in expressions and in other statements' heads.
+    const nested = (s: IrStmt): boolean => stmt(s, false);
     list(fn.body, true);
     return facts;
   }

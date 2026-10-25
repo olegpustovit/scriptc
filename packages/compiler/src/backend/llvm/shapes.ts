@@ -233,7 +233,7 @@ export { computeTraced } from "../cycle-analysis.js";
  * `_v`-shaped. */
 export function vAdapters(host: ShapeHost, t: IrType): { retain: string; release: string } {
   const nullable = host.nullableUnions.of(t);
-  if (nullable?.repr === "shapes") return shapeUnionRc(nullable);
+  if (nullable?.repr === "shapes") return shapeUnionRc(host, nullable);
   if (nullable) {
     const arm = vAdapters(host, nullable.arm);
     return { retain: nullableRetainSym(host, nullable.arm), release: arm.release };
@@ -290,7 +290,7 @@ export function vAdapters(host: ShapeHost, t: IrType): { retain: string; release
 export function retainSym(host: ShapeHost, t: IrType): string {
   if (t.kind === "jsval") return jsvalRcSym(host, "retain");
   const nullable = host.nullableUnions.of(t);
-  if (nullable?.repr === "shapes") return shapeUnionRc(nullable).retain;
+  if (nullable?.repr === "shapes") return shapeUnionRc(host, nullable).retain;
   if (nullable) return nullableRetainSym(host, nullable.arm);
   const stem = runtimeRcStem(t);
   if (host.rcHelpers !== null && stem !== null && inlineRcFamily(host, stem, "retain") !== null) {
@@ -305,10 +305,10 @@ export function retainSym(host: ShapeHost, t: IrType): string {
 /** A shape union's RC entry points: every record retain is the same
  * NULL- and immortal-skipping increment (the null sentinel is immortal),
  * so the first arm's serves; release dispatches on the arm. */
-function shapeUnionRc(union: ShapeUnion): { retain: string; release: string } {
+function shapeUnionRc(host: ShapeHost, union: ShapeUnion): { retain: string; release: string } {
   return {
     retain: `@${mangleRecordRetain(union.arms[0]!.shapeId)}`,
-    release: shapeReleaseFn(union.unionId),
+    release: shapeReleaseFn(host.nullableUnions.helperOwner(union.unionId)),
   };
 }
 
@@ -352,38 +352,81 @@ export function emitShapeUnionHelpers(host: ShapeHost): string[] {
       `}`,
       ``,
     );
-    // release: unit encodings are NULL or immortal; each arm releases
-    // through its own (NULL- and immortal-tolerant) helper.
-    out.push(
-      `define internal void ${shapeReleaseFn(union.unionId)}(ptr %u) ${FN_ATTRS} { ; shape union release`,
-      `entry:`,
-      `  %t = call i32 ${tagFn}(ptr %u)`,
-      `  switch i32 %t, label %done [ ${union.arms.map((arm) => `i32 ${arm.tag}, label %a${arm.tag}`).join(" ")} ]`,
-      ...union.arms.flatMap((arm) => [
-        `a${arm.tag}:`,
-        `  call void @${mangleRecordRelease(arm.shapeId)}(ptr %u)`,
-        `  br label %done`,
-      ]),
+    // Release and trace: one definition for the unions over the same
+    // record arms (helperOwner). Unit encodings are NULL or the immortal
+    // null sentinel; the shape word picks the arm.
+    if (host.nullableUnions.helperOwner(union.unionId) !== union.unionId) continue;
+    const units = [
+      `  %isnull = icmp eq ptr %o, null`,
+      `  br i1 %isnull, label %done, label %${host.nullableUnions.usesNullSentinel ? "notnull" : "rec"}`,
+      ...(host.nullableUnions.usesNullSentinel
+        ? [
+            `notnull:`,
+            `  %isnullarm = icmp eq ptr %o, ${NULLABLE_NULL}`,
+            `  br i1 %isnullarm, label %done, label %rec`,
+          ]
+        : []),
+      `rec:`,
+    ];
+    const armSwitch = (call: (shapeId: string) => string): string[] => [
+      `  %wp = getelementptr inbounds ${header}, ptr %o, i32 0, i32 ${SHAPE_WORD_INDEX}`,
+      `  %w = load i32, ptr %wp`,
+      `  switch i32 %w, label %done [ ${union.arms.map((arm) => `i32 ${host.nullableUnions.shapeNumber(arm.shapeId)}, label %a${arm.tag}`).join(" ")} ]`,
+      ...union.arms.flatMap((arm) => [`a${arm.tag}:`, call(arm.shapeId), `  br label %done`]),
       `done:`,
       `  ret void`,
       `}`,
       ``,
-    );
+    ];
+    // Every record arm shares the release fast path (the count at the same
+    // offset, one collector header choice for the whole union), so only a
+    // release that may free dispatches on the arm. The release stays a call:
+    // inlined at every release site, it grows code more than it saves.
+    const traced = union.arms.map((arm) => host.tracedShapes.has(`record:${arm.shapeId}`));
+    // A freezable arm's count is the word without its frozen bit, as in
+    // releaseFastPath: a frozen record's last reference takes the slow path.
+    const frozen = union.arms.some((arm) => host.recordsById.get(arm.shapeId)?.freezable === true);
+    const notFrozen = ~recordFrozenBit(S);
+    const release = shapeReleaseFn(union.unionId);
+    if (traced.every((t) => t === traced[0]))
+      out.push(
+        `define internal void ${release}(ptr %o) noinline ${FN_ATTRS} { ; shape union release`,
+        `entry:`,
+        ...units,
+        `  %rc = load ${S}, ptr %o`,
+        ...(frozen
+          ? [
+              `  %refs = and ${S} %rc, ${sizeLiteral(S, notFrozen)}`,
+              `  %rcm2 = sub ${S} %refs, 2`,
+              `  %shared = icmp ult ${S} %rcm2, ${sizeLiteral(S, notFrozen - 2n)}`,
+            ]
+          : [`  %rcm2 = sub ${S} %rc, 2`, `  %shared = icmp ult ${S} %rcm2, -3`]),
+        `  br i1 %shared, label %dec, label %slow`,
+        `dec:`,
+        `  %n = sub ${S} %rc, 1`,
+        `  store ${S} %n, ptr %o`,
+        ...(traced[0] ? cycleRootLines(host, "done") : [`  br label %done`]),
+        `slow:`,
+        `  %imm = icmp eq ${S} %rc, -1`,
+        `  br i1 %imm, label %done, label %free`,
+        `free:`,
+        ...armSwitch((shapeId) => `  call void @${mangleRecordRelease(shapeId)}_slow(ptr %o)`),
+      );
+    else
+      out.push(
+        `define internal void ${release}(ptr %o) ${FN_ATTRS} { ; shape union release`,
+        `entry:`,
+        ...units,
+        ...armSwitch((shapeId) => `  call void @${mangleRecordRelease(shapeId)}(ptr %o)`),
+      );
     if (shapeUnionTraced(host, union))
       out.push(
-        `define internal void ${shapeTraceFn(union.unionId)}(ptr %u, ptr %visit, ptr %ctx) ${FN_ATTRS} { ; shape union trace`,
+        `define internal void ${shapeTraceFn(union.unionId)}(ptr %o, ptr %visit, ptr %ctx) ${FN_ATTRS} { ; shape union trace`,
         `entry:`,
-        `  %t = call i32 ${tagFn}(ptr %u)`,
-        `  switch i32 %t, label %done [ ${union.arms.map((arm) => `i32 ${arm.tag}, label %a${arm.tag}`).join(" ")} ]`,
-        ...union.arms.flatMap((arm) => [
-          `a${arm.tag}:`,
-          `  call void @${mangleRecordTrace(arm.shapeId)}(ptr %u, ptr %visit, ptr %ctx)`,
-          `  br label %done`,
-        ]),
-        `done:`,
-        `  ret void`,
-        `}`,
-        ``,
+        ...units,
+        ...armSwitch(
+          (shapeId) => `  call void @${mangleRecordTrace(shapeId)}(ptr %o, ptr %visit, ptr %ctx)`,
+        ),
       );
   }
   return out;
@@ -435,7 +478,7 @@ export function emitNullableRetainWrappers(host: ShapeHost): string[] {
 export function releaseSym(host: ShapeHost, t: IrType): string {
   if (t.kind === "jsval") return jsvalRcSym(host, "release");
   const nullable = host.nullableUnions.of(t);
-  if (nullable?.repr === "shapes") return shapeUnionRc(nullable).release;
+  if (nullable?.repr === "shapes") return shapeUnionRc(host, nullable).release;
   if (nullable) return releaseSym(host, nullable.arm);
   const stem = runtimeRcStem(t);
   if (host.rcHelpers !== null && stem !== null && inlineRcFamily(host, stem, "release") !== null) {
@@ -550,17 +593,16 @@ interface InlineRcFamily {
  * scr_dyn_release_survivor for kinds whose candidacy is per value,
  * including arrays and objects of intact documents (ScrDynRegion).
  *
- * Releases stay plain calls for:
- * - arr: array releases are the most numerous release sites and the
- *   least hot (at most 1% self time across the benchmark suite), and
- *   inlining them roughly doubled the code growth for no measured speedup.
- *   Array retains are inlined. */
+ * The array release inlines the decrement of an array that stays alive
+ * and is not headered (`a->cyc`): those are most array releases in
+ * type-checker workloads, where scr_arr_release's own prologue and checks
+ * took about half of its time. */
 export const INLINE_RC_FAMILIES: Readonly<Record<string, InlineRcFamily>> = {
   str: { cycle: "none", retainNull: false, release: "scr_str_release" },
   bytes: { cycle: "none", retainNull: false, release: "scr_bytes_release" },
   regex: { cycle: "none", retainNull: false, release: "scr_regex_release" },
   bigint: { cycle: "none", retainNull: true, release: "scr_bigint_release" },
-  arr: { cycle: "arr", retainNull: false, release: null },
+  arr: { cycle: "arr", retainNull: false, release: "scr_arr_release" },
   map: { cycle: "map", retainNull: false, release: "scr_map_release" },
   union: { cycle: "always", retainNull: false, release: "scr_union_release" },
   closure: { cycle: "always", retainNull: false, release: "scr_closure_release" },
@@ -692,34 +734,32 @@ export function limitInlineReleases(
   parts: readonly string[],
   mode: InlineRcMode | undefined,
 ): string[] {
-  const dyn = limitInlineReleaseFamily(parts, "dyn", INLINE_DYN_RELEASES_PER_FUNCTION);
-  return mode === "release"
-    ? limitInlineReleaseFamily(dyn, "str", INLINE_STR_RELEASES_PER_FUNCTION)
-    : dyn;
-}
-
-function limitInlineReleaseFamily(
-  parts: readonly string[],
-  family: "dyn" | "str",
-  max: number,
-): string[] {
-  const call = `call void @${inlineRcName(family, "release")}(`;
-  const runtime = `call void @${INLINE_RC_FAMILIES[family]!.release}(`;
+  const families: readonly ("dyn" | "str")[] = mode === "release" ? ["dyn", "str"] : ["dyn"];
+  const limits = families.map((family) =>
+    family === "dyn" ? INLINE_DYN_RELEASES_PER_FUNCTION : INLINE_STR_RELEASES_PER_FUNCTION,
+  );
+  const calls = families.map((family) => `${inlineRcName(family, "release")}(`);
+  const runtimes = families.map((family) => `call void @${INLINE_RC_FAMILIES[family]!.release}(`);
+  const head = "call void @";
+  const prefix = `${head}${inlineRcName("", "release")}`;
   // The function each release site belongs to: the last `define` line
-  // before it, counted over the joined text.
+  // before it, counted over the joined text. One walk over each part finds
+  // the sites of every family.
   const sites = (
     part: string,
-    each: (offset: number, fn: number) => void,
+    each: (offset: number, family: number, fn: number) => void,
     first: number,
   ): number => {
     let fn = first;
     let define = part.startsWith("define ") ? 0 : part.indexOf("\ndefine ");
-    for (let at = part.indexOf(call); at >= 0; at = part.indexOf(call, at + call.length)) {
+    for (let at = part.indexOf(prefix); at >= 0; at = part.indexOf(prefix, at + prefix.length)) {
+      const family = calls.findIndex((call) => part.startsWith(call, at + head.length));
+      if (family < 0) continue;
       while (define >= 0 && define < at) {
         fn++;
         define = part.indexOf("\ndefine ", define + 1);
       }
-      each(at, fn);
+      each(at, family, fn);
     }
     while (define >= 0) {
       fn++;
@@ -727,29 +767,47 @@ function limitInlineReleaseFamily(
     }
     return fn;
   };
-  const counts = new Map<number, number>();
+  const counts = families.map(() => new Map<number, number>());
+  // The functions each part's sites can belong to.
+  const spans: number[] = [];
   let fn = 0;
-  for (const part of parts) fn = sites(part, (_, f) => counts.set(f, (counts.get(f) ?? 0) + 1), fn);
-  const over = new Set([...counts].filter(([, n]) => n > max).map(([f]) => f));
-  if (over.size === 0) return [...parts];
-  fn = 0;
-  return parts.map((part) => {
-    const cuts: number[] = [];
+  for (const part of parts) {
+    spans.push(fn);
     fn = sites(
       part,
-      (at, f) => {
-        if (over.has(f)) cuts.push(at);
-      },
+      (_, family, f) => counts[family]!.set(f, (counts[family]!.get(f) ?? 0) + 1),
       fn,
+    );
+    spans.push(fn);
+  }
+  const over = counts.map(
+    (count, family) => new Set([...count].filter(([, n]) => n > limits[family]!).map(([f]) => f)),
+  );
+  if (over.every((set) => set.size === 0)) return [...parts];
+  const anyOver = new Set(over.flatMap((set) => [...set]));
+  const touches = (from: number, to: number): boolean => {
+    for (let f = from; f <= to; f++) if (anyOver.has(f)) return true;
+    return false;
+  };
+  return parts.map((part, index) => {
+    const from = spans[2 * index]!;
+    if (!touches(from, spans[2 * index + 1]!)) return part;
+    const cuts: { at: number; family: number }[] = [];
+    sites(
+      part,
+      (at, family, f) => {
+        if (over[family]!.has(f)) cuts.push({ at, family });
+      },
+      from,
     );
     if (cuts.length === 0) return part;
     let out = "";
-    let from = 0;
-    for (const at of cuts) {
-      out += part.slice(from, at) + runtime;
-      from = at + call.length;
+    let next = 0;
+    for (const cut of cuts) {
+      out += part.slice(next, cut.at) + runtimes[cut.family]!;
+      next = cut.at + head.length + calls[cut.family]!.length;
     }
-    return out + part.slice(from);
+    return out + part.slice(next);
   });
 }
 
@@ -970,7 +1028,9 @@ export function traceAdapter(host: ShapeHost, t: IrType): string | null {
     case "union": {
       const nullable = host.nullableUnions.get(t.unionId);
       if (nullable?.repr === "shapes")
-        return shapeUnionTraced(host, nullable) ? shapeTraceFn(nullable.unionId) : null;
+        return shapeUnionTraced(host, nullable)
+          ? shapeTraceFn(host.nullableUnions.helperOwner(nullable.unionId))
+          : null;
       if (nullable) return traceAdapter(host, nullable.arm);
       if (!host.tracedUnions.has(t.unionId)) return null;
       host.declare(`declare void @scr_union_trace_v(ptr, ptr, ptr)`);

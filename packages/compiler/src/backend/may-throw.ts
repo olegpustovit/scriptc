@@ -93,7 +93,7 @@ export function computeMayThrow(
   const classes = new Map((mod.classes ?? []).map((cls) => [cls.name, cls]));
   const constructorClasses = new Map<string, string>();
   const classValueCallers = new Map<string, Set<string>>();
-  const tdzGlobals = (mod.globals ?? []).filter((g) => g.tdz).map((g) => g.id);
+  const tdzGlobals = new Set((mod.globals ?? []).filter((g) => g.tdz).map((g) => g.id));
   for (const cls of mod.classes ?? []) {
     constructorClasses.set(`%${cls.name}.constructor`, cls.name);
     for (const m of cls.methods ?? []) {
@@ -113,11 +113,10 @@ export function computeMayThrow(
     if (explain) f.calleeLocs = new Map();
     // TDZ reads and non-initializing writes can throw ReferenceError.
     // Capture locals carry the same flag as the declaring binding.
-    const tdzIds = new Set([...tdzGlobals, ...fn.locals.filter((l) => l.tdz).map((l) => l.id)]);
-    const mutableTdzIds = new Set([
-      ...tdzGlobals,
-      ...fn.locals.filter((l) => l.tdz && l.mutable).map((l) => l.id),
-    ]);
+    // Every TDZ global counts for both reads and writes; the module's set is
+    // shared by every function.
+    const tdzLocals = new Set(fn.locals.filter((l) => l.tdz).map((l) => l.id));
+    const mutableTdzLocals = new Set(fn.locals.filter((l) => l.tdz && l.mutable).map((l) => l.id));
     // Traverse typed executable nodes without copying the IR into unknown.
     const visit = (rec: IrExpr | IrStmt): boolean => {
       const threw = f.throws;
@@ -133,13 +132,17 @@ export function computeMayThrow(
         case "varRef":
         case "incDec":
         case "assignExpr":
-          if (tdzIds.has(rec.localId)) f.throws = true;
+          if (tdzGlobals.has(rec.localId) || tdzLocals.has(rec.localId)) f.throws = true;
           break;
         case "assign":
           // A declaration is allowed to fill an empty box. Legacy const
           // TDZ stores also initialize; only mutable subsequent stores
           // introduce the new write-side exception edge.
-          if (rec.initializes !== true && mutableTdzIds.has(rec.localId)) f.throws = true;
+          if (
+            rec.initializes !== true &&
+            (tdzGlobals.has(rec.localId) || mutableTdzLocals.has(rec.localId))
+          )
+            f.throws = true;
           break;
         case "dynCheck":
         case "caughtCheck":

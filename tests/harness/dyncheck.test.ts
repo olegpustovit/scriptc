@@ -191,11 +191,11 @@ for (const text of inputs) {
     expect(r.stderr).toBe("");
     expect(r.stdout.split("\n")).toEqual([
       "SyntaxError: Unexpected end of JSON input (same)",
-      "SyntaxError: Expected ',' or '}' after property value in JSON at position 19 (same)",
-      "SyntaxError: Bad escaped character in JSON at position 11 (same)",
-      "SyntaxError: Unexpected non-whitespace character after JSON at position 22 (same)",
-      'SyntaxError: Unexpected token \']\', ...","x":[1,],"qty":"... is not valid JSON (same)',
-      "SyntaxError: Bad Unicode escape in JSON at position 21 (same)",
+      "SyntaxError: Unexpected number in JSON at position 19 (line 1 column 20) (same)",
+      "SyntaxError: Bad escaped character in JSON at position 11 (line 1 column 12) (same)",
+      "SyntaxError: Unexpected non-whitespace character after JSON at position 22 (line 1 column 23) (same)",
+      'SyntaxError: Unexpected token \']\', ..."a","x":[1,],"qty":1}"... is not valid JSON (same)',
+      "SyntaxError: Bad Unicode escape in JSON at position 21 (line 1 column 22) (same)",
       "RangeError: Maximum call stack size exceeded (same)",
       "TypeError: expected number at $[0].qty, got undefined (plain ok)",
       "TypeError: expected number at $[1].qty, got boolean (plain ok)",
@@ -268,7 +268,7 @@ try {
       "err TypeError: expected number at $.id, got undefined",
       "err TypeError: expected number at $.id, got null",
       "err TypeError: expected object at $, got array",
-      "err SyntaxError: Unexpected end of JSON input",
+      "err SyntaxError: Expected ',' or '}' after property value in JSON at position 39 (line 1 column 40)",
       "ok Infinity \uFFFD 0  ",
       "ok 7 reordered 0  ",
       "err expected number at $[1].qty, got string",
@@ -514,6 +514,216 @@ console.log("unreachable", t.label);
     expect(r.stderr).toContain(
       "Uncaught TypeError: expected string at $.children[0].children[0].label, got number",
     );
+  });
+
+  test("nested unions: a failure inside a matched arm names the union that holds it", async () => {
+    // A union's builder converts the arm that matched; the unions nested in
+    // it pick their arms by literal or by the kind of value only one arm
+    // takes. A value that fails anywhere below fails its outermost union,
+    // whose arms the message names.
+    const r = await compileAndRun(
+      "deep-discriminated",
+      `type Expr =
+  | { kind: "num"; value: number }
+  | { kind: "str"; text: string }
+  | { kind: "add"; left: Expr; right: Expr }
+  | { kind: "call"; callee: string; args: Expr[] }
+  | { kind: "neg"; operand: Expr }
+  | { kind: "opt"; inner: Expr | undefined; label?: string };
+type Stmt =
+  | { kind: "expr"; expr: Expr }
+  | { kind: "ret"; value: Expr | null }
+  | { kind: "block"; body: Stmt[] };
+type Fn = { name: string; body: Stmt[] };
+
+function attempt(label: string, text: string, as: "expr" | "stmt" | "fn" | "list"): void {
+  try {
+    if (as === "expr") {
+      const e = JSON.parse(text) as Expr;
+      console.log(label, "ok", e.kind);
+    } else if (as === "stmt") {
+      const s = JSON.parse(text) as Stmt;
+      console.log(label, "ok", s.kind);
+    } else if (as === "fn") {
+      const f = JSON.parse(text) as Fn;
+      console.log(label, "ok", f.name, f.body.length);
+    } else {
+      const l = JSON.parse(text) as Expr[];
+      console.log(label, "ok", l.length);
+    }
+  } catch (e) {
+    console.log(label, "error", (e as Error).message);
+  }
+}
+
+const deep = (leaf: string, depth: number): string => {
+  let s = leaf;
+  for (let i = 0; i < depth; i++) s = \`{"kind":"neg","operand":\${s}}\`;
+  return s;
+};
+attempt("valid", deep('{"kind":"num","value":1}', 20), "expr");
+attempt("deep wrong field", deep('{"kind":"num","value":"x"}', 5), "expr");
+attempt("deep unknown kind", deep('{"kind":"nope","value":1}', 5), "expr");
+attempt("deep string node", deep('"text"', 5), "expr");
+attempt("deep missing field", deep('{"kind":"add","left":{"kind":"num","value":1}}', 4), "expr");
+attempt("deep array arg", deep('{"kind":"call","callee":"f","args":[{"kind":"num","value":1},{"kind":"str","text":2}]}', 3), "expr");
+attempt("optional inner", deep('{"kind":"opt","inner":{"kind":"num","value":true}}', 3), "expr");
+attempt("optional label", deep('{"kind":"opt","inner":{"kind":"num","value":1},"label":3}', 3), "expr");
+attempt("stmt deep", '{"kind":"block","body":[{"kind":"expr","expr":' + deep('{"kind":"num","value":null}', 3) + '}]}', "stmt");
+attempt("ret null", '{"kind":"ret","value":null}', "stmt");
+attempt("fn deep", '{"name":"f","body":[{"kind":"ret","value":' + deep('{"kind":"str","text":5}', 4) + '}]}', "fn");
+attempt("list element", '[{"kind":"num","value":1},' + deep('{"kind":"num"}', 2) + "]", "list");
+attempt("kind not string", deep('{"kind":3,"value":1}', 2), "expr");
+attempt("valid list", '[' + deep('{"kind":"num","value":1}', 3) + ',{"kind":"str","text":"t"}]', "list");
+
+type Box = { value: number; child?: Box; rest: Box[] | null };
+function box(label: string, text: string): void {
+  try {
+    const b = JSON.parse(text) as Box;
+    console.log(label, "ok", b.value);
+  } catch (e) {
+    console.log(label, "error", (e as Error).message);
+  }
+}
+box("box valid", '{"value":1,"rest":null,"child":{"value":2,"rest":[{"value":3,"rest":null}]}}');
+box("box deep child", '{"value":1,"rest":null,"child":{"value":2,"rest":null,"child":{"value":"x","rest":null}}}');
+box("box deep rest", '{"value":1,"rest":[{"value":2,"rest":[{"value":3,"rest":[1]}]}]}');
+box("box child array", '{"value":1,"rest":null,"child":[]}');
+`,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.trimEnd().split("\n")).toEqual([
+      "valid ok neg",
+      "deep wrong field error expected object | object | object | object | object | object at $, got object",
+      "deep unknown kind error expected object | object | object | object | object | object at $, got object",
+      "deep string node error expected object | object | object | object | object | object at $, got object",
+      "deep missing field error expected object | object | object | object | object | object at $, got object",
+      "deep array arg error expected object | object | object | object | object | object at $, got object",
+      "optional inner error expected object | object | object | object | object | object at $, got object",
+      "optional label error expected object | object | object | object | object | object at $, got object",
+      "stmt deep error expected object | object | object at $, got object",
+      "ret null ok ret",
+      "fn deep error expected object | object | object at $.body[0], got object",
+      "list element error expected object | object | object | object | object | object at $[1], got object",
+      "kind not string error expected object | object | object | object | object | object at $, got object",
+      "valid list ok 2",
+      "box valid ok 1",
+      "box deep child error expected number at $.child.child.value, got string",
+      "box deep rest error expected object at $.rest[0].rest[0].rest[0], got number",
+      "box child array error expected object | undefined at $.child, got array",
+    ]);
+  });
+
+  test("nested unions: a value a getter returns while building is matched in full", async () => {
+    // The getter answers a valid node while the arm matches and a wrong one
+    // while it builds. The builder matches the second answer in full, so the
+    // failure names the union that holds it, as without the arm's match.
+    const r = await compileAndRun(
+      "deep-discriminated-getter",
+      `type Expr =
+  | { kind: "num"; value: number }
+  | { kind: "str"; text: string }
+  | { kind: "neg"; operand: Expr }
+  | { kind: "add"; left: Expr; right: Expr };
+const v = JSON.parse('{"kind":"neg"}') as unknown;
+let calls = 0;
+Object.defineProperty(v, "operand", {
+  enumerable: true,
+  get() {
+    calls++;
+    return calls === 1 ? JSON.parse('{"kind":"num","value":1}') : JSON.parse('{"kind":"num","value":"x"}');
+  },
+});
+try {
+  const e = v as Expr;
+  console.log("ok", JSON.stringify(e));
+} catch (err) {
+  console.log((err as Error).message);
+}
+console.log("getter calls", calls);
+`,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.trimEnd().split("\n")).toEqual([
+      "expected object | object | object | object at $.operand, got object",
+      "getter calls 2",
+    ]);
+  });
+
+  test("nested unions: a getter's value in a non-recursive union's build is matched in full", async () => {
+    // A union without recursion builds without a visit session. The getter
+    // still runs user code during the trusted build, so the nested union
+    // matches its second answer in full, and the failure names that union.
+    const r = await compileAndRun(
+      "flat-discriminated-getter",
+      `type Inner = { tag: "x"; n: number } | { tag: "y"; s: string };
+type Outer = { kind: "a"; inner: Inner } | { kind: "b"; other: number };
+const v = JSON.parse('{"kind":"a"}') as unknown;
+let calls = 0;
+Object.defineProperty(v, "inner", {
+  enumerable: true,
+  get() {
+    calls++;
+    return calls === 1 ? JSON.parse('{"tag":"x","n":1}') : JSON.parse('{"tag":"x","n":"bad"}');
+  },
+});
+try {
+  const o = v as Outer;
+  console.log("ok", JSON.stringify(o));
+} catch (err) {
+  console.log((err as Error).message);
+}
+console.log("getter calls", calls);
+const plain = JSON.parse('{"kind":"a","inner":{"tag":"y","s":"z"}}') as Outer;
+console.log(JSON.stringify(plain));
+`,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.trimEnd().split("\n")).toEqual([
+      "expected object | object at $.inner, got object",
+      "getter calls 2",
+      '{"kind":"a","inner":{"tag":"y","s":"z"}}',
+    ]);
+  });
+
+  test("nested unions: a getter that converts a recursive union keeps a non-recursive build untrusted", async () => {
+    // The getter converts a recursive union, which opens and ends a visit
+    // session of its own, before it answers. The outer build still matches
+    // the getter's second answer in full, and the failure names that union.
+    const r = await compileAndRun(
+      "flat-discriminated-getter-session",
+      `type Tree = { kind: "leaf"; n: number } | { kind: "node"; left: Tree; right: Tree };
+type Inner = { tag: "x"; n: number } | { tag: "y"; s: string };
+type Outer = { kind: "a"; inner: Inner } | { kind: "b"; other: number };
+const v = JSON.parse('{"kind":"a"}') as unknown;
+let calls = 0;
+let leaves = 0;
+Object.defineProperty(v, "inner", {
+  enumerable: true,
+  get() {
+    calls++;
+    const t = JSON.parse('{"kind":"node","left":{"kind":"leaf","n":1},"right":{"kind":"leaf","n":2}}') as Tree;
+    if (t.kind === "node") leaves += 2;
+    return calls === 1 ? JSON.parse('{"tag":"x","n":1}') : JSON.parse('{"tag":"x","n":"bad"}');
+  },
+});
+try {
+  const o = v as Outer;
+  console.log("ok", JSON.stringify(o));
+} catch (err) {
+  console.log((err as Error).message);
+}
+console.log("getter calls", calls, "leaves", leaves);
+const plain = JSON.parse('{"kind":"a","inner":{"tag":"y","s":"z"}}') as Outer;
+console.log(JSON.stringify(plain));
+`,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.trimEnd().split("\n")).toEqual([
+      "expected object | object at $.inner, got object",
+      "getter calls 2 leaves 4",
+      '{"kind":"a","inner":{"tag":"y","s":"z"}}',
+    ]);
   });
 
   test("array where a record is expected names the mismatch at the root", async () => {

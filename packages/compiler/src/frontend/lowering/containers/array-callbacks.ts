@@ -42,6 +42,7 @@ import {
   arrayValueStore,
   arrayValueType,
   currentArrayIndexPresent,
+  primitiveElement,
 } from "../array-values.js";
 import { typeKey } from "../../type-mapper.js";
 import {
@@ -827,15 +828,16 @@ function buildArrayHofFn(
     );
     returnType = outT;
     body = [
+      readLen,
       {
         kind: "varDecl",
         localId: "out.0",
         init: { kind: "arrayLit", elems: [], type: outT, loc },
         loc,
       },
-      readLen,
       // map's result has the receiver's length, holes where the receiver
-      // has them. Storage for it is reserved first and the length is set
+      // has them. Storage for it is reserved first (with the result's
+      // construction, which directly precedes it) and the length is set
       // after the loop, so a result without holes is filled by appends and
       // gets no state bytes.
       ...(method === "map"
@@ -1689,6 +1691,8 @@ function flatMapUnionPlan(
   }
   const converts = (t: IrType): boolean => {
     if (typeEquals(t, outElem)) return true;
+    // A `(T | undefined)[]` result stores T elements (primitiveElement).
+    if (t.kind === "undefinedT" && primitiveElement(outElem)) return true;
     if (outElem.kind !== "union") return false;
     return lowerer.armTag(outElem.unionId, t) >= 0;
   };
@@ -1754,24 +1758,21 @@ function flatMapUnionHelper(
     };
     if (plan.arms[tag] === "empty") return [];
     if (plan.arms[tag] === "value") {
+      // A unit arm's value is the unit itself, which has no narrowed
+      // representation.
+      const value: IrExpr = isUnitType(arm)
+        ? { kind: "unitLit", unit: arm.kind === "nullT" ? "null" : "undefined", type: arm, loc }
+        : narrowed;
       return [
         arrayValueStore(
           lowerer,
           outRef(),
           outLength(),
-          lowerer.coerceToExpected(
-            // A unit arm's value is the unit itself, which has no
-            // narrowed representation.
-            isUnitType(arm)
-              ? {
-                  kind: "unitLit",
-                  unit: arm.kind === "nullT" ? "null" : "undefined",
-                  type: arm,
-                  loc,
-                }
-              : narrowed,
-            plan.outElem,
-          ),
+          // An undefined value is a present undefined element of a
+          // primitive array (arrayValueStore).
+          arm.kind === "undefinedT" && primitiveElement(plan.outElem)
+            ? value
+            : lowerer.coerceToExpected(value, plan.outElem),
           plan.outElem,
           loc,
         ),
@@ -2347,6 +2348,43 @@ function reduceHelper(
   return name;
 }
 
+/** The comparator of a sort over a `(T | undefined)[]`, which stores T
+ * elements. The comparator only receives present elements (undefined
+ * elements sort last without a call), so the unannotated parameters of an
+ * inline comparator take the element type, and the runtime calls it
+ * without an adapter. */
+function lowerOptionalElementComparator(
+  lowerer: Lowerer,
+  argNode: ts.Expression,
+  comparator: ts.Expression,
+  elem: IrType,
+  arrT: IrType & { kind: "array" },
+): IrExpr {
+  if (
+    arrT.optionalElements !== true ||
+    !(ts.isArrowFunction(comparator) || ts.isFunctionExpression(comparator)) ||
+    isJsSourceFile(ts.getSourceFileOfNode(comparator))
+  )
+    return lowerer.lowerExpr(argNode);
+  const rebound: { symbol: ts.Symbol; previous: IrType | undefined }[] = [];
+  for (const param of comparator.parameters.nodes.slice(0, 2)) {
+    if (param.type || param.initializer || param.dotDotDotToken || !ts.isIdentifier(param.name))
+      continue;
+    const symbol = lowerer.checker.getSymbolAtLocation(param.name);
+    if (!symbol) continue;
+    rebound.push({ symbol, previous: lowerer.runtimeOptionalBindingTypes.get(symbol) });
+    lowerer.runtimeOptionalBindingTypes.set(symbol, elem);
+  }
+  try {
+    return lowerer.lowerExpr(argNode);
+  } finally {
+    for (const { symbol, previous } of rebound) {
+      if (previous === undefined) lowerer.runtimeOptionalBindingTypes.delete(symbol);
+      else lowerer.runtimeOptionalBindingTypes.set(symbol, previous);
+    }
+  }
+}
+
 /** `a.sort(cmp)` / `a.toSorted(cmp)`, desugared to an interned synthetic
  * function like the other array HOFs. sort mutates and returns the receiver;
  * toSorted takes its shallow snapshot INSIDE the helper, after the receiver
@@ -2435,7 +2473,8 @@ export function lowerArraySortCall(
       loc,
     };
   }
-  let fnArg = undefinedArg ?? lowerer.lowerExpr(argNode);
+  let fnArg =
+    undefinedArg ?? lowerOptionalElementComparator(lowerer, argNode, unwrappedArg, elem, arrT);
   // Reusable JS comparators often accept checked values. Adapt the array's
   // element ABI just as other array callbacks do before sorting.
   if (

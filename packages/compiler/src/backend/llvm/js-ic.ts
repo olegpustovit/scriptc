@@ -6,7 +6,8 @@
  *
  *   load   ordinary object whose shape is entry 0's own-property shape:
  *          read entry `slot` inline unless it is an accessor; otherwise
- *          scr_js_load_probe (polymorphic, prototype hits, misses)
+ *          scr_js_get_probe (polymorphic, prototype hits, absent keys,
+ *          misses)
  *   store  ordinary object whose shape is entry 0's replace shape, outside
  *          an intact parse region, writable data entry: replace inline;
  *          otherwise scr_js_store_probe (adds, polymorphic, misses)
@@ -384,6 +385,15 @@ function emitGet(host: Host, e: ExprOf<"call">, callee: IrFunction, key: string)
     incoming.push(`[ ${numberResult(host, count, e)}, %${B.currentLabel()} ]`);
     B.br(join);
     B.startBlock(other);
+    // So is the length of a native array passed in from typed code.
+    const rest = B.newLabel("icg.rest");
+    const arr = nativeArray(host, receiver.name, rest);
+    const native = load(host, "i32", arr, 8);
+    const nativeCount = B.tmp();
+    B.line(`${nativeCount} = uitofp i32 ${native} to double`);
+    incoming.push(`[ ${numberResult(host, nativeCount, e)}, %${B.currentLabel()} ]`);
+    B.br(join);
+    B.startBlock(rest);
   }
   // Inline hits (borrowed values) and probe hits (owned ones) share one
   // conversion to the result type.
@@ -393,9 +403,10 @@ function emitGet(host: Host, e: ExprOf<"call">, callee: IrFunction, key: string)
   B.startBlock(object);
   inlineLoad(host, receiver.name, ic, INLINE_WAYS, INLINE_PROTO, (cell) => cell, hits, hit, probe);
   B.startBlock(probe);
-  host.declare(`declare ptr @scr_js_load_probe(ptr, ptr, ptr)`);
+  // The read's probe also answers keys the receiver's plain chain lacks.
+  host.declare(`declare ptr @scr_js_get_probe(ptr, ptr, ptr)`);
   const probed = B.tmp();
-  B.line(`${probed} = call ptr @scr_js_load_probe(ptr ${receiver.name}, ptr ${name}, ptr ${ic})`);
+  B.line(`${probed} = call ptr @scr_js_get_probe(ptr ${receiver.name}, ptr ${name}, ptr ${ic})`);
   const found = B.tmp();
   B.line(`${found} = icmp ne ptr ${probed}, null`);
   const probeEnd = B.currentLabel();
@@ -623,6 +634,98 @@ function numberKey(host: Host, key: IrExpr): NumberKey | null {
   };
 }
 
+/** Branches to `yes` when `d` is a capsule of a native array passed in
+ * from typed code (a TYPED_REF bound to live array ops, not a record or
+ * class instance), with the ScrArr in `yes`; else to `no`. */
+function nativeArray(host: Host, d: string, no: string): string {
+  const B = host.B;
+  const capsule = B.newLabel("ica.cap");
+  const bound = B.newLabel("ica.ops");
+  const yes = B.newLabel("ica.arr");
+  kindIs(host, d, DYN_KIND.TYPED_REF, capsule, no);
+  B.startBlock(capsule);
+  // The flag word after `casts`: record, klass and bag_class are its top
+  // three bits; any of them means `array` holds other ops.
+  const flags = load(host, "i32", d, 88);
+  const kinds = B.tmp();
+  const plain = B.tmp();
+  B.line(`${kinds} = lshr i32 ${flags}, 29`);
+  B.line(`${plain} = icmp eq i32 ${kinds}, 0`);
+  B.condBr(plain, bound, no);
+  B.startBlock(bound);
+  const ops = load(host, "ptr", d, 64);
+  const live = B.tmp();
+  B.line(`${live} = icmp ne ptr ${ops}, null`);
+  B.condBr(live, yes, no);
+  B.startBlock(yes);
+  return load(host, "ptr", d, 16);
+}
+
+/** `xs[i]` on a native number[] passed in from typed code: an integral
+ * index below the array's hole-free prefix reads the element in place.
+ * The other cases branch to `miss`, whose probe and helper answer them as
+ * before. The result joins `incoming` at `join`. */
+function emitNativeNumberElement(
+  host: Host,
+  receiver: string,
+  e: IrExpr,
+  indexIn: (next: string) => string,
+  miss: string,
+  join: string,
+  incoming: string[],
+): void {
+  const B = host.B;
+  const arr = nativeArray(host, receiver, miss);
+  const numbers = B.newLabel("ica.f64");
+  const elem = load(host, "i8", arr, 16);
+  const f64 = B.tmp();
+  B.line(`${f64} = icmp eq i8 ${elem}, 0 ; SCR_ELEM_F64`);
+  B.condBr(f64, numbers, miss);
+  B.startBlock(numbers);
+  const index = indexIn(B.newLabel("ica.idx"));
+  const filled = load(host, "i32", arr, 20);
+  const filledD = B.tmp();
+  const nonNegative = B.tmp();
+  const below = B.tmp();
+  const ok = B.tmp();
+  B.line(`${filledD} = uitofp i32 ${filled} to double`);
+  B.line(`${nonNegative} = fcmp oge double ${index}, 0.0`);
+  B.line(`${below} = fcmp olt double ${index}, ${filledD}`);
+  B.line(`${ok} = and i1 ${nonNegative}, ${below}`);
+  const ranged = B.newLabel("ica.rng");
+  B.condBr(ok, ranged, miss);
+  B.startBlock(ranged);
+  const i = B.tmp();
+  const back = B.tmp();
+  const integral = B.tmp();
+  B.line(`${i} = fptoui double ${index} to i64`);
+  B.line(`${back} = uitofp i64 ${i} to double`);
+  B.line(`${integral} = fcmp oeq double ${back}, ${index}`);
+  const hit = B.newLabel("ica.hit");
+  B.condBr(integral, hit, miss);
+  B.startBlock(hit);
+  const data = load(host, "ptr", arr, 24);
+  const slot = B.tmp();
+  const value = B.tmp();
+  B.line(`${slot} = getelementptr inbounds double, ptr ${data}, i64 ${i}`);
+  B.line(`${value} = load double, ptr ${slot}`);
+  let out: string;
+  if (e.type.kind === "jsval") {
+    const raw = B.tmp();
+    const nan = B.tmp();
+    const bits = B.tmp();
+    out = B.tmp();
+    B.line(`${raw} = bitcast double ${value} to i64`);
+    B.line(`${nan} = fcmp uno double ${value}, ${value}`);
+    B.line(`${bits} = select i1 ${nan}, i64 ${JS_BITS.canonicalNan}, i64 ${raw}`);
+    B.line(`${out} = inttoptr i64 ${bits} to ptr`);
+  } else {
+    out = numberResult(host, value, e);
+  }
+  incoming.push(`[ ${out}, %${B.currentLabel()} ]`);
+  B.br(join);
+}
+
 function emitKeyed(host: Host, e: ExprOf<"call">, callee: IrFunction): LlValue {
   const B = host.B;
   const receiver = emitBorrowedInput(host, e.args[0]!);
@@ -645,18 +748,23 @@ function emitKeyed(host: Host, e: ExprOf<"call">, callee: IrFunction): LlValue {
     B.line(`store ptr null, ptr ${keySlot}`);
     host.ownSlot(keySlot, DYN);
   }
-  kindIs(host, receiver.name, DYN_KIND.ARR, array, probe);
+  /** The key as a double in block `next`; other keys go to the probe. */
+  const indexIn = (next: string): string => {
+    if (numeric === null) {
+      kindIs(host, key!.name, DYN_KIND.NUM, next, probe);
+      B.startBlock(next);
+      return load(host, "double", key!.name, 16);
+    }
+    B.condBr(numeric.present, next, probe);
+    B.startBlock(next);
+    return numeric.value;
+  };
+  const other = B.newLabel("ick.other");
+  kindIs(host, receiver.name, DYN_KIND.ARR, array, other);
+  B.startBlock(other);
+  emitNativeNumberElement(host, receiver.name, e, indexIn, probe, join, incoming);
   B.startBlock(array);
-  let index: string;
-  if (numeric === null) {
-    kindIs(host, key!.name, DYN_KIND.NUM, number, probe);
-    B.startBlock(number);
-    index = load(host, "double", key!.name, 16);
-  } else {
-    B.condBr(numeric.present, number, probe);
-    B.startBlock(number);
-    index = numeric.value;
-  }
+  const index = indexIn(number);
   const len = load(host, "i64", receiver.name, 16);
   const i = B.tmp();
   const back = B.tmp();

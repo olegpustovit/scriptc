@@ -24,6 +24,36 @@ import {
 } from "./arguments.js";
 import { type BuiltinModuleFn } from "../surfaces.js";
 
+/** The input of `decoder.decode(input)`. An undefined input decodes no bytes,
+ * as `decode()` does in Node: a statically undefined argument (after its
+ * effects) reads as an empty Uint8Array, and the undefined arm of a typed
+ * array or view that may be undefined (`Uint8Array | undefined`,
+ * `Uint16Array | undefined`) as an empty view of the same type. */
+function lowerDecodeInput(lowerer: Lowerer, node: ts.Expression, loc: SrcLoc): IrExpr {
+  const undefinedArg = lowerStaticallyUndefinedArgument(lowerer, node);
+  if (undefinedArg)
+    return defaultAfterUndefined(undefinedArg, {
+      kind: "bytesNew",
+      source: null,
+      type: BYTES_U8,
+      loc,
+    });
+  const value = lowerer.lowerExpr(node);
+  if (value.type.kind === "union") {
+    const def = lowerer.unions.get(value.type.unionId);
+    const view = def?.arms.find((arm) => arm.kind === "bytes");
+    if (def?.arms.length === 2 && view && def.arms.some((arm) => arm.kind === "undefinedT"))
+      return {
+        kind: "nullish",
+        left: value,
+        right: { kind: "bytesNew", source: null, type: view, loc },
+        type: view,
+        loc,
+      };
+  }
+  return value;
+}
+
 /** StringDecoder writes preserve pending bytes; end(input) performs the
  * final write and flushes the state. String input passes through unchanged. */
 export function lowerStringDecoderMethodCall(
@@ -413,7 +443,7 @@ function lowerStoredTextCodecCall(
         : { kind: "bytesNew", source: null, type: BYTES_U8, loc }
       : cls === "TextEncoder"
         ? lowerer.lowerExprExpecting(call.arguments.nodes[0]!, STRING)
-        : lowerer.lowerExpr(call.arguments.nodes[0]!);
+        : lowerDecodeInput(lowerer, call.arguments.nodes[0]!, loc);
   if (
     cls === "TextDecoder" &&
     (arg.type.kind === "dyn" || (arg.type.kind === "bytes" && arg.type.elem !== "u8"))
@@ -622,7 +652,7 @@ export function lowerTextCodecCall(
       );
     }
     const argNode = call.arguments.nodes[0]!;
-    let arg = lowerer.lowerExpr(argNode);
+    let arg = lowerDecodeInput(lowerer, argNode, loc);
     if (arg.type.kind === "dyn" || (arg.type.kind === "bytes" && arg.type.elem !== "u8")) {
       arg = {
         kind: "libCall",

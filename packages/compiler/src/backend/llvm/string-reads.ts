@@ -24,6 +24,10 @@ import { literalCapWord, literalCapWord32 } from "./string-key-hash.js";
 
 export const STRING_UTF16_LEN_DECL = "declare double @scr_str_utf16_len(ptr)";
 export const STRING_CHAR_CODE_AT_DECL = "declare double @scr_str_char_code_at(ptr, double)";
+/** Converts a string to UTF-16 units and publishes it as the scan receiver
+ * (bytes-loop-versions.ts). Like the fallbacks below, it can evict an
+ * index entry, so it carries no memory restriction. */
+export const STRING_SCAN_UNITS_DECL = "declare void @scr_str_scan_units(ptr)";
 /** The runtime fallbacks are cold: both common cases read inline. They
  * carry no
  * memory restriction: a fallback can evict an index entry, which resets
@@ -75,6 +79,19 @@ export function emitAsciiCharCode(host: LlvmEmitterContext, s: string, index: st
   return code;
 }
 
+/** Unit `index` (an i64, below their count) of a string's UTF-16 `units`
+ * (ScrStrScan): one 16-bit load, as a double. */
+export function emitUnitCharCode(host: LlvmEmitterContext, units: string, index: string): string {
+  const B = host.B;
+  const pointer = B.tmp(),
+    unit = B.tmp(),
+    code = B.tmp();
+  B.line(`${pointer} = getelementptr inbounds i16, ptr ${units}, i64 ${index}`);
+  B.line(`${unit} = load i16, ptr ${pointer}`);
+  B.line(`${code} = uitofp i16 ${unit} to double`);
+  return code;
+}
+
 /** The one-character string of unit `index` (an i64) of a proven-ASCII
  * string `s` whose length covers it: the immortal `@sc_ascii_chars` entry
  * for its byte, as the inline charAt helpers answer. */
@@ -112,6 +129,15 @@ function loadLength(sz: string): string[] {
     `  %len.p = getelementptr inbounds %ScrStr, ptr %s, i32 0, i32 1`,
     `  %len = load ${sz}, ptr %len.p`,
   ];
+}
+
+/** Whether emitted reads use the runtime's scan receiver: from ordinary
+ * global storage, or, in worker executables, from the thread's static TLS
+ * block (executableTls). */
+export function stringScanInline(host: LlvmEmitterContext): boolean {
+  return (
+    host.executableTls || (host.mod.workers !== true && host.mod.lib?.threadInstances !== true)
+  );
 }
 
 /** The runtime's ScrStrScan record and the declaration naming it. */

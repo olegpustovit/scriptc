@@ -557,6 +557,24 @@ static void check_program_growth_cap(void) {
   scr_cyc_set_growth_cap(0);
 }
 
+/* scr_cyc_set_nursery_threshold sets the trigger SCR_CYCLE_THRESHOLD sets,
+ * from the end of the next pass: with a trigger of 1024, dead rings released
+ * after a full pass wait until the 1024th, which collects them all. 0
+ * restores the default. */
+static void check_program_nursery_threshold(void) {
+  enum { THRESHOLD = 1024 };
+  if (getenv("SCR_CYCLE_THRESHOLD") != NULL) return; /* it takes precedence */
+  scr_cyc_set_nursery_threshold(THRESHOLD);
+  scr_collect_cycles(); /* re-arm with the new trigger */
+  size_t before = freed;
+  for (size_t i = 0; i < THRESHOLD - 1; i++) release_live(make_ring(1));
+  check(freed == before, "a program's nursery trigger did not hold the pass back");
+  release_live(make_ring(1));
+  check(freed - before == THRESHOLD, "a program's nursery trigger did not run the pass");
+  scr_cyc_set_nursery_threshold(0);
+  scr_collect_cycles();
+}
+
 /* The phase sweep (scr_collect_cycles_phase) is for a caller that knows a
  * phase's data has just died: it sweeps, and the growth schedule starts
  * over. After passes that find nothing have widened the old level's
@@ -1522,6 +1540,7 @@ int main(void) {
   check_unjudged_backlog_follows_growth();
   check_acyclic_objects();
   check_program_growth_cap();
+  check_program_nursery_threshold();
   printf("cycle collection checks passed: threshold=%zu growth_cap=%zu\n",
          configured_nursery_threshold(), configured_growth_cap());
   return 0;
