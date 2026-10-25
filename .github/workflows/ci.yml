@@ -1076,10 +1076,6 @@ jobs:
               lane mobile_runtime_packs_ios "${{ needs.mobile_runtime_packs_ios.result }}" "${{ needs.lanes.outputs.macos }}"
               ;;
             false)
-              if [ "${{ github.event_name }}" = workflow_dispatch ]; then
-                echo "::notice::A manual run with scope shape_overlay runs only the shape overlay validation."
-                exit 0
-              fi
               echo "::notice::Full CI is deferred until this PR becomes the lowest unmerged layer. Merge the stack from the bottom up."
               exit 1
               ;;
