@@ -62,9 +62,9 @@ test("splits generated LLVM functions and promotes only private cross-shard defi
   expect(actual!.publicSymbols).toEqual(["public_value", "public_entry"]);
   expect(actual!.shards[0]!.name).toBe("program-globals.ll");
   expect(actual!.shards[0]!.source).toContain("@hidden_value = hidden global i64 7");
-  expect(actual!.shards.slice(1).every((shard) =>
-    shard.source.includes("@hidden_value = external hidden global i64")
-  )).toBe(true);
+  // Shards declare only what they reference: `left` loads @hidden_value.
+  const leftShard = actual!.shards.find((shard) => shard.source.includes("define hidden i64 @left() #0"))!;
+  expect(leftShard.source).toContain("@hidden_value = external hidden global i64");
   expect(actual!.shards.some((shard) =>
     !shard.source.includes("define hidden i64 @right() #0") &&
     shard.source.includes("declare hidden i64 @right() #0")
@@ -102,6 +102,44 @@ test("debug metadata stays on definitions when splitting LLVM modules", async ()
     const result = spawnSync("clang", ["-Wno-override-module", "-c", path, "-o", `${path}.o`], { encoding: "utf8" });
     expect(result.status, result.stderr).toBe(0);
     expect(result.stderr).toBe("");
+  }
+});
+
+test("shards carry only their own debug metadata, numbered independently of the rest of the program", async () => {
+  // One DISubprogram + DILocation per function, all in one compile unit.
+  const program = (names: readonly string[], lineOf: (name: string) => number) => {
+    const funcs = names.map((name, i) =>
+      `define internal i64 @${name}() #0 !dbg !${4 + 2 * i} {\nentry:\n  ; ${"x".repeat(2048)}\n  ret i64 0, !dbg !${5 + 2 * i}\n}\n`);
+    const nodes = names.flatMap((name, i) => [
+      `!${4 + 2 * i} = distinct !DISubprogram(name: "${name}", scope: !0, file: !0, line: ${lineOf(name)}, type: !1, scopeLine: ${lineOf(name)}, spFlags: DISPFlagLocalToUnit | DISPFlagDefinition, unit: !2)`,
+      `!${5 + 2 * i} = !DILocation(line: ${lineOf(name)}, column: 1, scope: !${4 + 2 * i})`,
+    ]);
+    return [
+      "declare void @runtime(ptr)\n", ...funcs, "attributes #0 = { noinline }",
+      "!llvm.dbg.cu = !{!2}", "!llvm.module.flags = !{!3}",
+      '!0 = !DIFile(filename: "a.ts", directory: "/src")', "!1 = !DISubroutineType(types: !{})",
+      '!2 = distinct !DICompileUnit(language: DW_LANG_C11, file: !0, producer: "scriptc", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug)',
+      '!3 = !{i32 2, !"Debug Info Version", i32 3}', ...nodes, "",
+    ].join("\n");
+  };
+  const names = Array.from({ length: 80 }, (_, i) => `pad_${i}`);
+  const options = { minimumBytes: 0, targetBytes: 64 * 1024 };
+  const before = splitLlvmProgram(program(names, () => 1), options)!;
+  // Edit one function and add another: every later metadata id shifts in the
+  // canonical module, but only the shards owning those functions may change.
+  const after = splitLlvmProgram(program(["added", ...names], (n) => n === "pad_7" ? 2 : 1), options)!;
+  const was = new Map(before.shards.map((shard) => [shard.name, shard.source]));
+  const changed = after.shards.filter((shard) => was.get(shard.name) !== shard.source);
+  expect(changed.length).toBeGreaterThan(0);
+  expect(changed.length).toBeLessThanOrEqual(2);
+  const dir = await mkdtemp(join(tmpdir(), "scriptc-md-split-"));
+  scratch.push(dir);
+  for (const shard of after.shards) {
+    expect(shard.source).not.toMatch(/!\d{3,}/); // dense: nothing close to the canonical ids
+    const path = join(dir, shard.name);
+    await writeFile(path, shard.source);
+    const result = spawnSync("clang", ["-Wno-override-module", "-c", path, "-o", `${path}.o`], { encoding: "utf8" });
+    expect(result.status, result.stderr).toBe(0);
   }
 });
 

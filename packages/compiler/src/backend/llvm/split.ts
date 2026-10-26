@@ -12,7 +12,10 @@
  *   those hidden definitions back into local symbols on every supported object
  *   format;
  * - declarations synthesized from definitions make every shard independently
- *   valid LLVM IR without changing call signatures.
+ *   valid LLVM IR without changing call signatures;
+ * - each shard carries only the debug-metadata nodes reachable from what it
+ *   defines, renumbered densely in first-use order, so a shard's text (and
+ *   object cache key) depends on its own content and not on unrelated edits.
  *
  * The splitter deliberately accepts only the narrow grammar scriptc emits.
  * An unexpected top-level form returns null and the caller compiles the
@@ -55,6 +58,8 @@ const LIBRARY_MINIMUM_BYTES = 2 * 1024 * 1024;
 
 interface FunctionDef {
   source: string;
+  refs: number[];
+  symbols: Set<string>;
   declaration: string;
   symbol: string;
   promoted: boolean;
@@ -62,9 +67,70 @@ interface FunctionDef {
 
 interface GlobalDef {
   line: string;
+  refs: number[];
+  symbols: Set<string>;
   declaration: string | null;
   symbol: string;
   promoted: boolean;
+}
+
+// A quoted string (skipped, it may contain "!1") or a numbered metadata ref.
+const MD_REF = /"(?:[^"\\]|\\.)*"|!(\d+)/g;
+
+function mdRefs(text: string): number[] {
+  const out: number[] = [];
+  for (const m of text.matchAll(MD_REF)) if (m[1] !== undefined) out.push(Number(m[1]));
+  return out;
+}
+
+const SYMBOL_REF = /@([-$._A-Za-z][-$.\w]*)/g;
+
+function symbolRefs(text: string): Set<string> {
+  return new Set(Array.from(text.matchAll(SYMBOL_REF), (m) => m[1]!));
+}
+
+function mdRewrite(text: string, ids: ReadonlyMap<number, number>): string {
+  return text.replace(MD_REF, (all, d: string | undefined) => (d === undefined ? all : `!${ids.get(Number(d))}`));
+}
+
+interface Metadata {
+  attrs: string[];
+  nodes: Map<number, { body: string; refs: number[] }>;
+  /** DICompileUnit bodies without `globals:`; only the globals shard defines
+   * globals, and the list would pull every file's variables into every shard. */
+  bare: Map<number, { body: string; refs: number[] }>;
+  /** Named metadata other than !llvm.dbg.cu: always kept, their refs are roots. */
+  named: { line: string; refs: number[] }[];
+  cus: number[];
+}
+
+/** Metadata a shard needs: the nodes reachable from `pieces`, renumbered in
+ * first-use order, plus the rewritten tail text. Null if a ref dangles. */
+function shardTail(md: Metadata, pieces: readonly (readonly number[])[], withGlobals: boolean): { ids: Map<number, number>; tail: string } | null {
+  const ids = new Map<number, number>();
+  const order: number[] = [];
+  const stack: number[] = [];
+  for (const refs of [...md.named.map((n) => n.refs), ...pieces]) {
+    for (let i = refs.length - 1; i >= 0; i--) stack.push(refs[i]!);
+    // Roots are visited in text order: reverse-pushed above, popped here.
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      if (ids.has(id)) continue;
+      const node = (withGlobals ? undefined : md.bare.get(id)) ?? md.nodes.get(id);
+      if (node === undefined) return null;
+      ids.set(id, order.length);
+      order.push(id);
+      for (let i = node.refs.length - 1; i >= 0; i--) stack.push(node.refs[i]!);
+    }
+  }
+  const cus = md.cus.filter((id) => ids.has(id)).map((id) => ids.get(id)!).sort((a, b) => a - b);
+  const lines = [
+    ...md.attrs,
+    ...(cus.length === 0 ? [] : [`!llvm.dbg.cu = !{${cus.map((id) => `!${id}`).join(", ")}}`]),
+    ...md.named.map((n) => mdRewrite(n.line, ids)),
+    ...order.map((id, n) => `!${n} = ${mdRewrite(((withGlobals ? undefined : md.bare.get(id)) ?? md.nodes.get(id)!).body, ids)}`),
+  ];
+  return { ids, tail: lines.length === 0 ? "" : `\n${lines.join("\n")}` };
 }
 
 function symbolOf(spelling: string): string | null {
@@ -91,7 +157,7 @@ function functionDefAt(lines: readonly string[], start: number): { def: Function
   // different shard. Its owning definition retains the original metadata.
   const attrs = match[5]!.replace(/\s+!dbg !\d+/g, "");
   const declaration = `declare ${linkage}${match[2]} ${match[3]}(${match[4]})${attrs}`.trimEnd();
-  return { def: { source, declaration, symbol, promoted }, end };
+  return { def: { source, refs: mdRefs(source), symbols: symbolRefs(source), declaration, symbol, promoted }, end };
 }
 
 function globalDef(line: string): GlobalDef | null {
@@ -122,6 +188,8 @@ function globalDef(line: string): GlobalDef | null {
   if (typeEnd < 0) return null;
   const type = rest.slice(0, typeEnd);
   return {
+    refs: mdRefs(line),
+    symbols: symbolRefs(line),
     line: promoted ? line.replace(`${match[1]} = internal `, `${match[1]} = hidden `) : line,
     declaration: `${match[1]} = external ${promoted ? "hidden " : ""}${threadLocal}${match[4]} ${type}`,
     symbol,
@@ -167,7 +235,7 @@ export function splitLlvmProgram(
   const preamble: string[] = [];
   const globals: GlobalDef[] = [];
   const functions: FunctionDef[] = [];
-  const trailer: string[] = [];
+  const md: Metadata = { attrs: [], nodes: new Map(), bare: new Map(), named: [], cus: [] };
   let sawDefinition = false;
   let inTrailer = false;
   for (let i = 0; i < lines.length; i++) {
@@ -201,39 +269,64 @@ export function splitLlvmProgram(
       continue;
     }
     if (line.startsWith("attributes ") || line.startsWith("!")) inTrailer = true;
-    if (inTrailer) trailer.push(line);
-    else if (!sawDefinition || line.trim() !== "") preamble.push(line);
+    if (inTrailer) {
+      if (!line.startsWith("!")) {
+        md.attrs.push(line);
+        continue;
+      }
+      const node = /^!(\d+) = (.*)$/.exec(line);
+      if (node !== null) {
+        const id = Number(node[1]);
+        if (md.nodes.has(id)) return null;
+        md.nodes.set(id, { body: node[2]!, refs: mdRefs(node[2]!) });
+        if (node[2]!.startsWith("distinct !DICompileUnit(")) {
+          const body = node[2]!.replace(/, globals: !\d+/, "");
+          md.bare.set(id, { body, refs: mdRefs(body) });
+        }
+        continue;
+      }
+      const named = /^!([A-Za-z_.$][\w.$]*) = (.*)$/.exec(line);
+      if (named === null) return null;
+      if (named[1] === "llvm.dbg.cu") md.cus = mdRefs(named[2]!);
+      else md.named.push({ line, refs: mdRefs(named[2]!) });
+    } else if (!sawDefinition || line.trim() !== "") preamble.push(line);
   }
   if (functions.length < 2) return null;
   const chunks = chunksOf(functions, targetBytes);
   if (chunks.length < 2) return null;
-  const globalDecls = globals.flatMap((global) => global.declaration === null ? [] : [global.declaration]);
-  const tail = trailer.length === 0 ? "" : `\n${trailer.join("\n")}`;
-  const functionShards = chunks.map(({ bucket, functions: chunk }) => {
+  // A shard declares only the symbols it references, so adding or removing an
+  // unrelated function does not change it.
+  const used = (symbols: Set<string>[]) => new Set(symbols.flatMap((set) => [...set]));
+  const preambleRefs = preamble.flatMap(mdRefs);
+  const shardSource = (head: string[], body: string[], bodyRefs: number[][], withGlobals: boolean): string | null => {
+    const t = shardTail(md, [preambleRefs, ...bodyRefs], withGlobals);
+    if (t === null) return null;
+    return [mdRewrite(head.join("\n"), t.ids), ...body.map((b) => mdRewrite(b, t.ids)), t.tail].join("\n");
+  };
+  const functionShards: LlvmProgramShard[] = [];
+  for (const { bucket, functions: chunk } of chunks) {
     const owned = new Set(chunk);
+    const refd = used(chunk.map((fn) => fn.symbols));
+    const globalDecls = globals.flatMap((g) => g.declaration !== null && refd.has(g.symbol) ? [g.declaration] : []);
     const declarations = functions
-      .filter((fn) => !owned.has(fn))
+      .filter((fn) => !owned.has(fn) && refd.has(fn.symbol))
       .map((fn) => fn.declaration);
-    return {
-      name: `program-f${bucket.toString().padStart(3, "0")}.ll`,
-      source: [
-        [...preamble, ...globalDecls, ...declarations, ""].join("\n"),
-        ...chunk.map((fn) => fn.source),
-        tail,
-      ].join("\n"),
-    };
-  });
+    const text = shardSource([...preamble, ...globalDecls, ...declarations, ""], chunk.map((fn) => fn.source), chunk.map((fn) => fn.refs), false);
+    if (text === null) return null;
+    functionShards.push({ name: `program-f${bucket.toString().padStart(3, "0")}.ll`, source: text });
+  }
   // Global initializer changes are common (literal text, generated tables)
   // and should not invalidate an otherwise unrelated function bucket. Keep
   // all module storage in one dedicated shard that declares every function.
-  const globalShard: LlvmProgramShard = {
-    name: "program-globals.ll",
-    source: [
-      [...preamble, ...functions.map((fn) => fn.declaration), ""].join("\n"),
-      ...globals.map((global) => global.line),
-      tail,
-    ].join("\n"),
-  };
+  const globalRefd = used(globals.map((g) => g.symbols));
+  const globalText = shardSource(
+    [...preamble, ...functions.filter((fn) => globalRefd.has(fn.symbol)).map((fn) => fn.declaration), ""],
+    globals.map((global) => global.line),
+    globals.map((global) => global.refs),
+    true,
+  );
+  if (globalText === null) return null;
+  const globalShard: LlvmProgramShard = { name: "program-globals.ll", source: globalText };
   const shards = [globalShard, ...functionShards];
   return {
     shards,
