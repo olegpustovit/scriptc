@@ -319,8 +319,17 @@ export class CheckerFacade {
 
   /** 5.9.3's type.getProperty(name). */
   getPropertyOfType(type: Type, name: string): Ts7Symbol | undefined {
-    return this.raw.getPropertyOfType(type, name);
+    let byName = this.propertyOfType.get(type);
+    if (byName === undefined) {
+      byName = new Map();
+      this.propertyOfType.set(type, byName);
+    }
+    if (byName.has(name)) return byName.get(name);
+    const prop = this.raw.getPropertyOfType(type, name);
+    byName.set(name, prop);
+    return prop;
   }
+  private readonly propertyOfType = new WeakMap<Type, Map<string, Ts7Symbol | undefined>>();
 
   /** The 5.9.3 checker never answered undefined from getTypeAtLocation-
    * family queries (errorType/anyType stood in); the 7 client loosens them
