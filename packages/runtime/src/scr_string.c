@@ -83,6 +83,12 @@ typedef struct {
   size_t cu; /* UTF-16 code-unit offset, always a code-point boundary */
   size_t cb; /* matching UTF-8 byte offset, never a continuation byte */
 } ScrSidxPoint;
+/* One allocation: the 32-bit base of every 64th unit follows the deltas. */
+typedef struct {
+  size_t n;              /* the UTF-16 length the offsets describe */
+  uint32_t *base;        /* byte offset of every 64th unit */
+  uint8_t delta[];       /* each unit's byte offset past its block's base */
+} ScrSidxOffsets;
 typedef struct ScrSidx {
   const ScrStr *s;       /* NULL = empty slot */
   size_t u16len;         /* SCR_U16_UNKNOWN until the whole current string */
@@ -94,10 +100,12 @@ typedef struct ScrSidx {
   size_t indexed_cb;
   bool no_more_points;   /* metadata allocation failed/overflowed: fail open */
   bool points_complete;  /* points cover every stride of indexed prefix */
+  uint32_t walks;        /* index walks before the offsets exist */
   uint16_t *units;       /* the UTF-16 code units, once reads warrant them */
-  size_t nunits;
-  size_t reads;          /* indexed reads that missed the unit array */
-} ScrSidx;
+  uint32_t nunits;       /* units and offsets need at most 1 << 24 bytes */
+  uint32_t reads;        /* indexed reads that missed the unit array */
+  ScrSidxOffsets *offsets; /* every unit's byte offset, once walks warrant */
+} ScrSidx; /* 128 bytes on 64-bit targets: every lookup clears or copies one */
 /* Keep short-string cursor traffic out of the sparse cache. A short-lived
  * one-byte receiver can be far more common than a large indexed one; sharing
  * the round-robin slots would otherwise rebuild a warm index every few calls.
@@ -136,6 +144,7 @@ static void scr_sidx_clear(ScrSidx *e, unsigned *live) {
     scr_str_scan.n = 0;
   }
   free(e->units);
+  if (e->offsets) free(e->offsets); /* rare: skip the call on the hot clear */
   memset(e, 0, sizeof(*e));
 }
 
@@ -337,6 +346,9 @@ static void scr_sidx_concat_append(const ScrStr *s, size_t oldlen) {
       e->units = NULL;
       e->nunits = 0;
       e->reads = 0;
+      free(e->offsets); /* and so do the offsets */
+      e->offsets = NULL;
+      e->walks = 0;
     }
   }
 }
@@ -1576,6 +1588,8 @@ static void scr_sidx_ascii_run(const ScrStr *s, ScrSidx *e) {
 /* How far past its end a forward access may grow the cached ASCII run, and
  * how far beyond the access the growth looks ahead. */
 #define SCR_SIDX_ASCII_REACH ((size_t)4096)
+/* How far from the hot cursor an index walks from it. */
+#define SCR_SIDX_NEAR_UNITS ((size_t)64)
 #define SCR_SIDX_ASCII_AHEAD ((size_t)256)
 
 /* Grow the cached ASCII run forward until it covers byte `want` (plus a
@@ -1624,8 +1638,118 @@ static inline size_t scr_u16_to_byte_c(const ScrStr *s, ScrSidx *e, size_t u16,
   return scr_u16_to_byte_walk(s, e, u16, mid);
 }
 
+/* Index walks on one long non-ASCII receiver (slices, substrings and
+ * indexed reads taken across it) each step through bytes from the nearest
+ * known position. Once those walks would have paid for one pass over the
+ * receiver (a walk per 32 bytes, at least 64 walks), a receiver from
+ * SCR_SIDX_MIN_BYTES to SCR_SIDX_OFFSETS_MAX bytes keeps every unit's byte
+ * offset: a 32-bit base per 64 units and one byte per unit past it (64 units
+ * span at most 192 bytes). The low half of an astral character has its high
+ * half's offset. The offsets are freed with the entry, and an append drops
+ * them (scr_sidx_concat_append). */
+#define SCR_SIDX_OFFSET_BLOCK ((size_t)64)
+#define SCR_SIDX_OFFSETS_MAX ((size_t)1 << 24)
+static bool scr_sidx_offsets(const ScrStr *s, ScrSidx *e) {
+  if (e->offsets) return true;
+  if (s->len < SCR_SIDX_MIN_BYTES || s->len > SCR_SIDX_OFFSETS_MAX) return false;
+  if (++e->walks < 64 || (size_t)e->walks * 32 < s->len) return false;
+  size_t n = scr_sidx_len(s, e);
+  if (s->ascii || e->u16len == s->len) return false;
+  size_t ndelta = (n + 1 + 3) & ~(size_t)3;
+  ScrSidxOffsets *o =
+      malloc(sizeof *o + ndelta + (n / SCR_SIDX_OFFSET_BLOCK + 1) * sizeof(uint32_t));
+  if (!o) {
+    e->walks = 0;
+    return false;
+  }
+  o->n = n;
+  o->base = (uint32_t *)(o->delta + ndelta);
+  uint32_t *base = o->base;
+  uint8_t *delta = o->delta;
+  size_t cu = 0, cb = 0;
+  while (cb < s->len && cu < n) {
+    size_t seq = scr_utf8_seq_len((unsigned char)s->data[cb]);
+    for (size_t w = seq == 4 ? 2 : 1; w > 0 && cu < n; w--, cu++) {
+      if (cu % SCR_SIDX_OFFSET_BLOCK == 0) base[cu / SCR_SIDX_OFFSET_BLOCK] = (uint32_t)cb;
+      delta[cu] = (uint8_t)(cb - base[cu / SCR_SIDX_OFFSET_BLOCK]);
+    }
+    cb += seq;
+  }
+  e->offsets = o;
+  return true;
+}
+
+static inline size_t scr_sidx_offset_at(const ScrSidx *e, size_t u16) {
+  return e->offsets->base[u16 / SCR_SIDX_OFFSET_BLOCK] + e->offsets->delta[u16];
+}
+
+/* Walk from a known code-point boundary (cu, cb) to UTF-16 index u16 and
+ * leave the hot cursor there. Same contract as scr_u16_to_byte_walk. */
+static size_t scr_sidx_walk_from(const ScrStr *s, ScrSidx *e, size_t cu, size_t cb, size_t u16,
+                                 bool *mid, bool refresh_run) {
+  while (cu > u16) {
+    /* Eight bytes starting inside a sequence can reach back at most three
+     * more bytes to its lead. Such a span contains at most nine UTF-16
+     * units (seven ASCII bytes plus an astral pair), so it cannot overshoot
+     * a target at least nine units away. */
+    if (cu - u16 >= 9 && cb >= 8) {
+      size_t start = cb - 8;
+      while (start > 0 && ((unsigned char)s->data[start] & 0xC0) == 0x80)
+        start--;
+      cu -= scr_utf16_units_span(s->data + start, cb - start, NULL);
+      cb = start;
+    } else {
+      scr_sidx_back(s, &cu, &cb);
+    }
+  }
+  bool m = false;
+  while (cu < u16 && cb < s->len) {
+    if (u16 - cu >= 9 && s->len - cb >= 8) {
+      size_t end = cb + 8;
+      while (end < s->len && ((unsigned char)s->data[end] & 0xC0) == 0x80)
+        end++;
+      cu += scr_utf16_units_span(s->data + cb, end - cb, NULL);
+      cb = end;
+      continue;
+    }
+    SCR_SIDX_STEP();
+    size_t seq = scr_utf8_seq_len((unsigned char)s->data[cb]);
+    size_t w = seq == 4 ? 2 : 1;
+    if (cu + w > u16) { /* u16 lands between the halves of an astral char */
+      m = true;
+      break;
+    }
+    cu += w;
+    cb += seq;
+  }
+  e->cu = cu;
+  e->cb = cb;
+  if (refresh_run && cb < s->len && (unsigned char)s->data[cb] < 0x80)
+    scr_sidx_ascii_run(s, e);
+  *mid = m;
+  return cb;
+}
+
 static __attribute__((noinline)) size_t scr_u16_to_byte_walk(const ScrStr *s, ScrSidx *e,
                                                              size_t u16, bool *mid) {
+  if (scr_sidx_offsets(s, e)) {
+    *mid = false;
+    if (u16 >= e->offsets->n) return s->len;
+    size_t cb = scr_sidx_offset_at(e, u16);
+    size_t cu = u16;
+    if (u16 > 0 && scr_sidx_offset_at(e, u16 - 1) == cb) {
+      *mid = true; /* the low half of an astral character */
+      cu = u16 - 1;
+    }
+    e->cu = cu;
+    e->cb = cb;
+    return cb;
+  }
+  /* Within a short distance of the hot cursor (a scanner
+   * taking slices near its position), walk from that cursor: no index
+   * search, extension or ASCII-run growth is cheaper. */
+  if (e->cb <= s->len && scr_sidx_abs_diff(e->cu, u16) <= SCR_SIDX_NEAR_UNITS)
+    return scr_sidx_walk_from(s, e, e->cu, e->cb, u16, mid, false);
   /* A short step forward from the hot cursor (a sequential scan of
    * non-ASCII text) walks from the cursor itself. */
   if (u16 >= e->cu && u16 - e->cu <= 8) {
@@ -1665,48 +1789,7 @@ static __attribute__((noinline)) size_t scr_u16_to_byte_walk(const ScrStr *s, Sc
   }
   scr_sidx_materialize_identity_prefix(s, e);
   ScrSidxPoint near = scr_sidx_near_u16(s, e, u16);
-  size_t cu = near.cu, cb = near.cb;
-  while (cu > u16) {
-    /* Eight bytes starting inside a sequence can reach back at most three
-     * more bytes to its lead. Such a span contains at most nine UTF-16
-     * units (seven ASCII bytes plus an astral pair), so it cannot overshoot
-     * a target at least nine units away. */
-    if (cu - u16 >= 9 && cb >= 8) {
-      size_t start = cb - 8;
-      while (start > 0 && ((unsigned char)s->data[start] & 0xC0) == 0x80)
-        start--;
-      cu -= scr_utf16_units_span(s->data + start, cb - start, NULL);
-      cb = start;
-    } else {
-      scr_sidx_back(s, &cu, &cb);
-    }
-  }
-  bool m = false;
-  while (cu < u16 && cb < s->len) {
-    if (u16 - cu >= 9 && s->len - cb >= 8) {
-      size_t end = cb + 8;
-      while (end < s->len && ((unsigned char)s->data[end] & 0xC0) == 0x80)
-        end++;
-      cu += scr_utf16_units_span(s->data + cb, end - cb, NULL);
-      cb = end;
-      continue;
-    }
-    SCR_SIDX_STEP();
-    size_t seq = scr_utf8_seq_len((unsigned char)s->data[cb]);
-    size_t w = seq == 4 ? 2 : 1;
-    if (cu + w > u16) { /* u16 lands between the halves of an astral char */
-      m = true;
-      break;
-    }
-    cu += w;
-    cb += seq;
-  }
-  e->cu = cu;
-  e->cb = cb;
-  if (cb < s->len && (unsigned char)s->data[cb] < 0x80)
-    scr_sidx_ascii_run(s, e);
-  *mid = m;
-  return cb;
+  return scr_sidx_walk_from(s, e, near.cu, near.cb, u16, mid, true);
 }
 
 static size_t scr_byte_to_u16_walk(const ScrStr *s, ScrSidx *e, size_t byte_off);
@@ -1875,10 +1958,17 @@ static uint16_t *scr_str_units(const ScrStr *s, size_t *n) {
  * megabytes, which scanners read in full. The array is freed with the
  * entry, and an append drops it (scr_sidx_concat_append). */
 #define SCR_SIDX_UNITS_MAX ((size_t)1 << 24)
+static void scr_sidx_take_units(const ScrStr *s, ScrSidx *e) {
+  size_t n = 0;
+  e->units = scr_str_units(s, &n);
+  e->nunits = (uint32_t)n;
+}
+
 static bool scr_sidx_units(const ScrStr *s, ScrSidx *e) {
   if (!e->units) {
-    if (++e->reads < 32 || e->reads * 16 < s->len || s->len > SCR_SIDX_UNITS_MAX) return false;
-    e->units = scr_str_units(s, &e->nunits);
+    if (s->len > SCR_SIDX_UNITS_MAX || ++e->reads < 32 || (size_t)e->reads * 16 < s->len)
+      return false;
+    scr_sidx_take_units(s, e);
   }
   /* Publish the scan's receiver for emitted reads (scr_runtime.h). */
   if (scr_str_scan.s != s) {
@@ -1905,7 +1995,7 @@ void scr_str_scan_units_for(ScrStr *s, double from, double to) {
       (void)scr_sidx_units(s, e);
       return;
     }
-    e->units = scr_str_units(s, &e->nunits);
+    scr_sidx_take_units(s, e);
   }
   if (scr_str_scan.s != s) {
     scr_str_scan.s = s;
@@ -1980,8 +2070,9 @@ double scr_str_last_index_of_from(ScrStr *s, ScrStr *needle, double position) {
   size_t start_byte = scr_u16_to_byte_c(s, e, start16, &mid);
   size_t max_start = s->len - needle->len;
   if (start_byte < max_start) max_start = start_byte;
+  char first = needle->data[0];
   for (size_t i = max_start + 1; i-- > 0;) {
-    if (memcmp(s->data + i, needle->data, needle->len) == 0) {
+    if (s->data[i] == first && memcmp(s->data + i, needle->data, needle->len) == 0) {
       return (double)scr_byte_to_u16_c(s, e, i);
     }
   }

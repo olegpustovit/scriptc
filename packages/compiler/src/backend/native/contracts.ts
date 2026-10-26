@@ -126,6 +126,7 @@ export interface CcOptions {
   /** Own properties JavaScript adds to children: compiles scr_dyn_handle_props.c. */
   handleProps?: boolean;
   declAdopt?: boolean;
+  typeOrigins?: boolean;
   /** for await over checked-dynamic values: compiles scr_dyn_for_await.c. */
   dynForAwait?: boolean;
   /** events.once with options (events.onceSignal): compiles

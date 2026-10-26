@@ -968,6 +968,9 @@ const RUNTIME_FEATURE_RULES = {
    * casts, and closures boxed in a boundary program, which adopt their
    * arguments. */
   declAdopt: rule({ fns: ["dyn.declAdopt"], initial: (mod) => mod.declBoundary === true }),
+  // Checked conversions into package-declared types name the declaration
+  // in their TypeError (scr_type_origin.c).
+  typeOrigins: rule({ initial: (mod) => (mod.declOrigins?.length ?? 0) > 0 }),
   /** for await over checked-dynamic values (scr_dyn_for_await.c). */
   dynForAwait: rule({ fns: ["dyn.asyncIteratorOpen", "dyn.asyncIteratorWasSync"] }),
   /** Buffer.prototype methods called on checked-dynamic values
@@ -1268,6 +1271,7 @@ function noRuntimeFeatures(): RuntimeFeatures {
     streamDyn: false,
     handleProps: false,
     declAdopt: false,
+    typeOrigins: false,
     dynForAwait: false,
     dynBuffer: false,
     builtinValues: false,

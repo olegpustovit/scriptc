@@ -1,3 +1,9 @@
+import { nodeFrontendServices } from "./frontend/services-node.js";
+import {
+  runTypePatchCommand,
+  type TypePatchCommandRequest,
+  type TypePatchCommandResult,
+} from "./frontend/type-patches/command.js";
 import { optimizationField, type NativeOptimization } from "./backend/optimization.js";
 import { targetCpuField, targetCpuTargetRefusal } from "./backend/target-cpu.js";
 import { compilationTiming, type CompilationTiming, type TimingClock } from "./timing.js";
@@ -197,6 +203,15 @@ export {
 } from "./backend/external-c.js";
 export { warmNativeCaches } from "./backend/warm-cache.js";
 export { mergeNativeProfiles as mergeProfiles } from "./backend/native-codegen.js";
+
+/** `scriptc types patch|list` with the Node frontend's parser. */
+export async function typePatches(
+  request: TypePatchCommandRequest,
+): Promise<TypePatchCommandResult> {
+  return runTypePatchCommand(request, (path, text, kind) =>
+    nodeFrontendServices().parse(path, text, kind),
+  );
+}
 export { collectGarbageUnderHeapPressure } from "./heap-collection.js";
 export {
   ANDROID_MIN_API,
@@ -648,6 +663,7 @@ async function compileExecutableNative(
     ...(features.streamDyn ? { streamDyn: true } : {}),
     ...(features.handleProps ? { handleProps: true } : {}),
     ...(features.declAdopt ? { declAdopt: true } : {}),
+    ...(features.typeOrigins ? { typeOrigins: true } : {}),
     ...(features.dynForAwait ? { dynForAwait: true } : {}),
     ...(features.eventsOnceSignal ? { eventsOnceSignal: true } : {}),
     ...(features.mime ? { mime: true } : {}),
@@ -935,6 +951,7 @@ async function prepareExecutableInput(
       ...inlineRcOption(opts.optimization, opts.sanitize === true),
       ...(opts.detachedExit === true ? { detachedExit: true } : {}),
       ...targetCpuField(opts.targetCpu),
+      ...(opts.cpuDispatch === true ? { cpuDispatch: true } : {}),
     });
   } catch (err) {
     if (!(err instanceof LlvmUnsupportedError)) throw err;
@@ -1366,6 +1383,19 @@ async function compileTracked(
       sourceTexts: new Map(),
     };
   }
+  if (opts.cpuDispatch === true && outputKind !== "exe") {
+    return {
+      ok: false,
+      diagnostics: [
+        nativeCodegenDiag(
+          "SC3002",
+          "--cpu-dispatch is only supported for executable output",
+          entryPath,
+        ),
+      ],
+      sourceTexts: new Map(),
+    };
+  }
   if (opts.nativeLinkInfo === true && outputKind !== "obj") {
     return {
       ok: false,
@@ -1569,6 +1599,7 @@ async function compileTracked(
       ...(opts.windowsSubsystem === "gui" ? { windowsSubsystem: "gui" as const } : {}),
       ...(opts.detachedExit === true ? { detachedExit: true as const } : {}),
       ...targetCpuField(opts.targetCpu),
+      ...(opts.cpuDispatch === true ? { cpuDispatch: true as const } : {}),
       ...(profile === undefined ? {} : { profile: nativeProfileKey(profile) }),
       ...checkerField(),
       ...(youngNurseryRequested() ? { youngNursery: true as const } : {}),

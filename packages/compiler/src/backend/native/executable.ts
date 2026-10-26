@@ -304,6 +304,7 @@ const RUNTIME_UNITS: readonly RuntimeUnit[] = [
   unit((u) => u.opts.handleProps === true, "scr_dyn_handle_props.c"),
   // The declaration-typed boundary's adoption.
   unit((u) => u.opts.declAdopt === true, "scr_decl_adopt.c"),
+  unit((u) => u.opts.typeOrigins === true, "scr_type_origin.c"),
   // for await over checked-dynamic values.
   unit((u) => u.opts.dynForAwait === true, "scr_dyn_for_await.c"),
   // for await over checked-dynamic values that may hold native streams.

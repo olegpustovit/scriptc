@@ -147,7 +147,24 @@ A JavaScript package can contain operations scriptc can't compile, often in func
 
 scriptc trusts declared types: a package's `.d.ts` files, its `@types/` package, and the JSDoc types in its JavaScript. A value that contradicts its declared type throws a `TypeError` instead of flowing on, so a package whose declarations are wrong can stop a program that runs under Node.js. A common case is a member declared `string` or `number` that is sometimes `undefined`.
 
-Fix such a declaration in your project with a type patch in `package.json`:
+When the type comes from a package's declarations, the error names the declaration and the patch that would admit the value:
+
+```text
+Uncaught TypeError: expected string at $, got undefined
+    profilekit@3.1.0 declares Profile.email as string (index.d.ts:7)
+    if that declaration is wrong, patch it: scriptc types patch profilekit "Profile.email" "| undefined"
+```
+
+Fix such a declaration in your project with a type patch. `scriptc types patch` shows what a declaration path matches in the installed package and adds the patch to your `package.json`:
+
+```console
+$ scriptc types patch commander "HelpContext.helpWidth" "| undefined"
+commander 15.0.0 (node_modules/commander)
+  lib/command.js:2481  number  ->  number | undefined
+wrote package.json scriptc.typePatches["commander@^15.0.0"].declarations["HelpContext.helpWidth"]
+```
+
+The patch it writes looks like this:
 
 ```json:package.json
 {

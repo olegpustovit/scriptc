@@ -6828,11 +6828,17 @@ double scr_math_round(double x) {
   return (r == 0.0 && x < 0.0) ? -0.0 : r;
 }
 
-/* IEEE pow(±1, ±Infinity) and pow(1, NaN) return 1; ECMAScript requires
- * NaN. The other special cases, including signed zero and odd integer
- * powers, follow libm. */
+/* V8's math::pow: the platform pow, as Node's Math.pow and ** call it,
+ * after the cases V8 answers itself. IEEE pow(±1, ±Infinity) and
+ * pow(1, NaN) return 1; ECMAScript requires NaN. A NaN base becomes the
+ * quiet NaN, and the exponents 2 and 0.5 answer base * base and
+ * sqrt(base + 0) (+Infinity for an infinite base), as V8's optimizing
+ * compilers do; pow can differ from those in the last bit. */
 double scr_math_pow(double base, double exponent) {
   if (isnan(exponent) || (isinf(exponent) && fabs(base) == 1.0)) return NAN;
+  if (isnan(base)) base = NAN;
+  if (exponent == 2.0) return base * base;
+  if (exponent == 0.5) return isinf(base) ? INFINITY : sqrt(base + 0.0);
   /* 2 ** n for an integer n in the double range is an exact power of two,
    * the value pow returns; its bits are the exponent alone. */
   if (base == 2.0 && exponent >= -1074.0 && exponent <= 1023.0) {
@@ -12815,8 +12821,15 @@ ScrStr *scr_num_to_string_radix_f64(double value, double requested) {
   bool negative = value < 0;
   value = fabs(value);
   double integer = floor(value), fraction = value - integer;
-  double tolerance = 0.5 * (nextafter(value, INFINITY) - value);
-  if (tolerance <= 0) tolerance = nextafter(0, INFINITY);
+  /* The next double above the positive finite value: its bits plus one
+   * (Infinity above the largest double). */
+  uint64_t value_bits;
+  memcpy(&value_bits, &value, sizeof value_bits);
+  value_bits += 1;
+  double next;
+  memcpy(&next, &value_bits, sizeof next);
+  double tolerance = 0.5 * (next - value);
+  if (tolerance <= 0) tolerance = 0x1p-1074;
   if (fraction >= tolerance) {
     buffer[end++] = '.';
     do {

@@ -55,6 +55,7 @@ export interface NativeLinkFeatures {
    * Absent (false) for programs without them. */
   handleProps?: boolean;
   declAdopt?: boolean;
+  typeOrigins?: boolean;
   /** for await over checked-dynamic values: scr_dyn_for_await.c. Absent
    * (false) for programs without it. */
   dynForAwait?: boolean;

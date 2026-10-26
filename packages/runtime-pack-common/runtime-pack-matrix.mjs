@@ -52,6 +52,10 @@ export const BASE_RUNTIME_SOURCES = [
   "scr_alloc.c",
   // crypto.getCipherInfo's table; it links only into programs that call it.
   "scr_cipher_info.c",
+  // Math's transcendental functions as V8 computes them, and on glibc the
+  // exact libm functions that let a program link without libm.so.
+  "scr_ieee754.c",
+  "scr_glibc_math.c",
 ];
 
 export const OPTIONAL_RUNTIME_SOURCES = [
@@ -138,6 +142,7 @@ export const OPTIONAL_RUNTIME_SOURCES = [
   // Own properties JavaScript adds to children.
   ["scr_dyn_handle_props.c", "handleProps"],
   ["scr_decl_adopt.c", "declAdopt"],
+  ["scr_type_origin.c", "typeOrigins"],
   // for await over checked-dynamic values.
   ["scr_dyn_for_await.c", "dynForAwait"],
   ["scr_dyn_for_await_stream.c", all("dynForAwait", "stream", "dynAsync")],

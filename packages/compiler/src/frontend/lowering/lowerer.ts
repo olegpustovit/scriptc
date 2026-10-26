@@ -1,3 +1,10 @@
+import {
+  compactDeclOrigins,
+  inPackageFile,
+  recordOrigin,
+  slotOrigin,
+  type RecordOrigin,
+} from "./decl-origin.js";
 import { isDeclBoundaryFile } from "../decl-projection.js";
 import { relieveHeapPressure } from "../../heap-pressure.js";
 import { moduleNamespaceObject, moduleNamespaceValue } from "./module-namespace-elements.js";
@@ -129,7 +136,7 @@ import { devirtualizeVirtualCalls } from "./devirtualize.js";
 import { foldRegexSpanReads } from "./regex-span-reads.js";
 import { RuntimeOptionalProvenance } from "./runtime-optional-provenance.js";
 import { presentAtUse, reassignedBindings } from "./runtime-optional-guards.js";
-import { NarrowingStability } from "./narrowing-stability.js";
+import { NarrowingStability, widenedReceiver } from "./narrowing-stability.js";
 import { ArrayElementStates } from "./runtime-optional-elements.js";
 import { indexReadInBounds } from "./runtime-optional-bounds.js";
 import { ArrayOwnership } from "./runtime-optional-ownership.js";
@@ -3779,6 +3786,76 @@ export class Lowerer {
    * (decl-projection.ts): user-file record and array values crossing into
    * dynamic slots (package parameters) box as live capsules, so a value
    * that comes back through a boundary cast keeps its identity. */
+  /** Origins of package-declared types checked in this program
+   * (decl-origin.ts), by IrModule.declOrigins index. */
+  readonly declOrigins: string[] = [];
+  private readonly declOriginIds = new Map<string, number>();
+  private readonly packageFileMemo = new Map<ts.SourceFile, boolean>();
+  private readonly slotOriginMemo = new Map<ts.Node, string | null>();
+  /** The value whose slot coercion is being lowered, while that value is
+   * in a package file: union extractions built for it carry the slot's
+   * origin in their TypeError. */
+  coercionOriginNode: ts.Node | null = null;
+  /** Per user file, each declaration-boundary cast's index in source
+   * order (narrowing.ts recordedBoundaryOrigin). */
+  readonly boundaryCastOrder = new Map<ts.SourceFile, Map<ts.Node, number>>();
+  /** The union type of that value: only its own extraction is the slot's. */
+  coercionOriginUnion: string | null = null;
+  /** While a record projection into a package-declared type builds, the
+   * origin of the field being converted. */
+  coercionFieldOrigin: string | null = null;
+  private readonly recordOriginMemo = new Map<ts.Node, RecordOrigin | null>();
+
+  /** The package-declared record type the current coercion converts to. */
+  coercionRecordOrigin(): RecordOrigin | null {
+    const node = this.coercionOriginNode;
+    if (node === null) return null;
+    let origin = this.recordOriginMemo.get(node);
+    if (origin === undefined) {
+      try {
+        origin = recordOrigin(this.checker, node);
+      } catch {
+        origin = null;
+      }
+      this.recordOriginMemo.set(node, origin);
+    }
+    return origin;
+  }
+
+  declOriginIndex(origin: string): number {
+    let id = this.declOriginIds.get(origin);
+    if (id === undefined) {
+      id = this.declOrigins.length;
+      this.declOrigins.push(origin);
+      this.declOriginIds.set(origin, id);
+    }
+    return id;
+  }
+
+  /** The origin of the package-declared slot a value flows into. */
+  slotOriginOf(node: ts.Node): string | null {
+    let origin = this.slotOriginMemo.get(node);
+    if (origin === undefined) {
+      try {
+        origin = slotOrigin(this.checker, node);
+      } catch {
+        origin = null;
+      }
+      this.slotOriginMemo.set(node, origin);
+    }
+    return origin;
+  }
+
+  private inPackageFileOf(node: ts.Node): boolean {
+    const sf = ts.getSourceFileOfNode(node);
+    let inside = this.packageFileMemo.get(sf);
+    if (inside === undefined) {
+      inside = inPackageFile(node);
+      this.packageFileMemo.set(sf, inside);
+    }
+    return inside;
+  }
+
   private declBoundaryMemo: boolean | null = null;
   get declBoundary(): boolean {
     this.declBoundaryMemo ??= this.program.getSourceFileNames().some(isDeclBoundaryFile);
@@ -6528,19 +6605,20 @@ export class Lowerer {
       node.initializer !== undefined;
     const collectDynamicViews = (): Set<string> => {
       const keys = new Set<string>();
-      const dynamicValue = (node: ts.Expression): boolean => {
-        // A binding's declared type says whether it holds dynamic data; a
-        // flow type such as `Array.isArray(x)`'s `any[]` only narrows it.
+      // A binding's declared type says whether it holds dynamic data; a flow
+      // type such as `Array.isArray(x)`'s `any[]` only narrows it.
+      const typedNode = (node: ts.Expression): ts.Node => {
         const e = peel(node);
         const symbol = ts.isIdentifier(e) ? symbolOf(e) : null;
         const declaration = symbol ? symbol.valueDeclaration : undefined;
-        const declared =
-          declaration &&
+        return declaration &&
           (ts.isVariableDeclaration(declaration) || ts.isParameter(declaration)) &&
           ts.isIdentifier(declaration.name)
-            ? declaration.name
-            : null;
-        const type = typeOrNull(declared ?? node);
+          ? declaration.name
+          : node;
+      };
+      const dynamicValue = (node: ts.Expression): boolean => {
+        const type = typeOrNull(typedNode(node));
         if (type === null) return true;
         if ((type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) return true;
         if (!this.checker.isArrayType(type) || this.checker.isTupleType(type)) return false;
@@ -6561,57 +6639,64 @@ export class Lowerer {
             collect(field.type, depth + 1);
         } else if (type.kind === "promise") collect(type.inner, depth + 1);
       };
-      const target = (type: ts.Type | null | undefined): void => {
+      const convert = (type: ts.Type | null | undefined): void => {
         // An unanswerable target may be any array.
         if (type === null) keys.add("*");
         else if (type) collect(this.mapTypeOf(type), 0);
       };
-      const visit = (node: ts.Node): void => {
-        if ((ts.isAsExpression(node) || ts.isTypeAssertion(node)) && dynamicValue(node.expression))
-          target(typeOrNull(node));
-        else if (
-          ts.isVariableDeclaration(node) &&
-          node.type &&
-          node.initializer &&
-          dynamicValue(node.initializer)
-        )
-          target(typeOrNull(node.name));
-        else if (initializedBinding(node) && dynamicValue(node.initializer!))
-          target(typeOrNull(node.name ?? node));
-        else if (
-          ts.isBinaryExpression(node) &&
-          assignmentOperators.has(node.operatorToken.kind) &&
-          dynamicValue(node.right)
-        )
-          target(typeOrNull(node.left));
-        else if (ts.isReturnStatement(node) && node.expression && dynamicValue(node.expression))
-          target(contextualOrNull(node.expression));
-        else if (ts.isYieldExpression(node) && node.expression && dynamicValue(node.expression))
-          target(contextualOrNull(node.expression));
-        else if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+      /** Each value `node` converts, with the type it converts to. */
+      const conversions = (
+        node: ts.Node,
+        judge: (value: ts.Expression, target: () => ts.Type | null | undefined) => void,
+      ): void => {
+        if (ts.isAsExpression(node) || ts.isTypeAssertion(node))
+          judge(node.expression, () => typeOrNull(node));
+        else if (ts.isVariableDeclaration(node) && node.type && node.initializer)
+          judge(node.initializer, () => typeOrNull(node.name));
+        else if (initializedBinding(node))
+          judge(node.initializer!, () => typeOrNull(node.name ?? node));
+        else if (ts.isBinaryExpression(node) && assignmentOperators.has(node.operatorToken.kind))
+          judge(node.right, () => typeOrNull(node.left));
+        else if ((ts.isReturnStatement(node) || ts.isYieldExpression(node)) && node.expression) {
+          const value = node.expression;
+          judge(value, () => contextualOrNull(value));
+        } else if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
           for (const arg of node.arguments?.nodes ?? [])
-            if (!ts.isSpreadElement(arg) && dynamicValue(arg)) target(contextualOrNull(arg));
-        } else if (ts.isPropertyAssignment(node) && dynamicValue(node.initializer))
-          target(contextualOrNull(node.initializer));
-        else if (ts.isArrayLiteralExpression(node)) {
+            if (!ts.isSpreadElement(arg)) judge(arg, () => contextualOrNull(arg));
+        } else if (ts.isPropertyAssignment(node)) {
+          const value = node.initializer;
+          judge(value, () => contextualOrNull(value));
+        } else if (ts.isArrayLiteralExpression(node)) {
           for (const element of node.elements.nodes)
-            if (
-              !ts.isSpreadElement(element) &&
-              !ts.isOmittedExpression(element) &&
-              dynamicValue(element)
-            )
-              target(contextualOrNull(element));
-        } else if (
-          ts.isArrowFunction(node) &&
-          !ts.isBlock(node.body) &&
-          dynamicValue(node.body as ts.Expression)
-        )
-          target(contextualOrNull(node.body as ts.Expression));
+            if (!ts.isSpreadElement(element) && !ts.isOmittedExpression(element))
+              judge(element, () => contextualOrNull(element));
+        } else if (ts.isArrowFunction(node) && !ts.isBlock(node.body)) {
+          const body = node.body as ts.Expression;
+          judge(body, () => contextualOrNull(body));
+        }
       };
+      // The values' types in one batch: these bodies' reachability is not
+      // known yet.
+      const typed: ts.Node[] = [];
+      for (const sf of sourceFiles)
+        ts.walkPreorder(sf, (node) => {
+          panicSafe(() => conversions(node, (value) => typed.push(typedNode(value))), undefined);
+          return undefined;
+        });
+      this.checker.prefetchClassCollection(typed, []);
       for (const sf of sourceFiles)
         ts.walkPreorder(sf, (node) => {
           // A checker panic hides this conversion's target: any array.
-          if (!panicSafe(() => (visit(node), true), false)) keys.add("*");
+          const judged = panicSafe(
+            () => (
+              conversions(node, (value, target) => {
+                if (dynamicValue(value)) convert(target());
+              }),
+              true
+            ),
+            false,
+          );
+          if (!judged) keys.add("*");
           return undefined;
         });
       return keys;
@@ -7048,6 +7133,12 @@ export class Lowerer {
           node.operatorToken.kind === ts.SyntaxKind.EqualsToken
         )
           values.push(node.right);
+        // A for-of loop reads its iterable's array keys.
+        if (ts.isForOfStatement(node)) values.push(node.expression);
+        // A property read in such a slot reads its declared type through
+        // its receiver's (widenedType).
+        const receiver = widenedReceiver(node);
+        if (receiver !== null) values.push(receiver);
       });
       this.checker.prefetchCollectionTypes(values);
       scanSites.set(sf, nodes);
@@ -7627,7 +7718,8 @@ export class Lowerer {
       siteBase.set(sf, siteCount);
       siteCount += sitesOf(sf).length;
     }
-    siteDependencies = new SiteDependencies(siteCount);
+    // Each function's returns are one more site, after the files' sites.
+    siteDependencies = new SiteDependencies(siteCount + functionDeclBySymbol.size);
     let fullPass = true;
     for (let changed = true, first = true; changed || !fullPass; first = false) {
       fullPass = first || !changed;
@@ -7641,8 +7733,14 @@ export class Lowerer {
         }
       }
       for (const sf of sourceFiles) if (scanFile(sf)) changed = true;
+      let returnSite = siteCount;
       for (const [symbol, decl] of functionDeclBySymbol) {
-        if (!scanReturns(symbol, decl)) continue;
+        const site = returnSite++;
+        if (!fullPass && !siteDependencies.isStale(site)) continue;
+        siteDependencies.begin(site);
+        const returnsChanged = scanReturns(symbol, decl);
+        siteDependencies.end(returnsChanged);
+        if (!returnsChanged) continue;
         siteDependencies.changed(symbol);
         changed = true;
       }
@@ -8346,6 +8444,7 @@ export class Lowerer {
             ...(this.foreignElementKeys.size > 0
               ? { foreignElementKeys: [...this.foreignElementKeys].sort() }
               : {}),
+            ...(this.declOrigins.length > 0 ? { declOrigins: [...this.declOrigins] } : {}),
             ...(this.threadSlotKeys.size > 0
               ? { threadSlotKeys: [...this.threadSlotKeys].sort() }
               : {}),
@@ -8357,6 +8456,7 @@ export class Lowerer {
             ...(this.ffiImports.length > 0 ? { ffiImports: [...this.ffiImports] } : {}),
           };
     if (module) sanitizeUnregisteredClassTypes(module, (name) => this.classes.has(name));
+    if (module?.declOrigins !== undefined) compactDeclOrigins(module);
     if (module) checkCycleBindingAccesses(this, module);
     if (module) bindCompletionCallbacks(module);
     // Execution tiers from the final bodies (ir/tiers.ts). Assigned with or
@@ -10990,8 +11090,30 @@ export class Lowerer {
    * wrap implicitly (coerceToExpected), then the exact-type fence runs
    * (SC2002 for record shapes, SC2003 for unions). Every slot-directed
    * lowering goes through here (via lowerExprExpecting) or calls this
-   * directly when the expression was already lowered. */
+   * directly when the expression was already lowered. In package files, a
+   * check this coercion creates names the package declaration that types
+   * the slot (decl-origin.ts). */
   coerceInto(node: ts.Node, expr: IrExpr, expected: IrType): IrExpr {
+    if (!this.inPackageFileOf(node)) return this.coerceIntoSlot(node, expr, expected);
+    const outer = this.coercionOriginNode;
+    const outerUnion = this.coercionOriginUnion;
+    this.coercionOriginNode = node;
+    this.coercionOriginUnion = expr.type.kind === "union" ? expr.type.unionId : null;
+    let out: IrExpr;
+    try {
+      out = this.coerceIntoSlot(node, expr, expected);
+    } finally {
+      this.coercionOriginNode = outer;
+      this.coercionOriginUnion = outerUnion;
+    }
+    if (out !== expr && out.kind === "dynCheck" && out.origin === undefined) {
+      const origin = this.slotOriginOf(node);
+      if (origin !== null) return { ...out, origin: this.declOriginIndex(origin) };
+    }
+    return out;
+  }
+
+  private coerceIntoSlot(node: ts.Node, expr: IrExpr, expected: IrType): IrExpr {
     refuseInferredCallbackDrops(this, node, expr.type, expected);
     // An assertion's scalar check whose value goes straight back into a
     // checked-dynamic slot (`process.loadEnvFile({} as unknown as string)`)

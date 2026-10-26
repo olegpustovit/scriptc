@@ -223,6 +223,7 @@ const MODULE_FIELDS: Record<StringFields<Omit<IrModule, "functions">>, Role> = {
   "threadSlotKeys[]": "other",
   "foreignElementKeys[]": "other",
   "freezableArrays[]": "other",
+  "declOrigins[]": "other",
 };
 
 const loc = { file: "references.ts", start: 0, end: 0 };

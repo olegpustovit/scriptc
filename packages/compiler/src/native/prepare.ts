@@ -438,6 +438,7 @@ export function prepareNativeExecutable(
           ...inlineRcOption(options.optimization, options.sanitize === true),
           ...(options.detachedExit === true && outputKind === "exe" ? { detachedExit: true } : {}),
           ...targetCpuField(options.targetCpu),
+          ...(options.cpuDispatch === true && outputKind === "exe" ? { cpuDispatch: true } : {}),
           ...(options.optimization === "dev" && !options.strip
             ? { debugSources: prepared.sourceTexts }
             : {}),

@@ -313,19 +313,46 @@ function shapeUnionRc(host: ShapeHost, union: ShapeUnion): { retain: string; rel
   };
 }
 
+/** The widest span of shape numbers a union's arms may cover for its tag
+ * helper to switch on the shape word (emitShapeUnionHelpers). */
+const SHAPE_TAG_SWITCH_SPAN = 32;
+
 /** The tag, release and trace helpers of every shape union
  * (nullable-unions.ts). The tag helper maps a value to its arm: NULL and
  * the null sentinel are the unit arms, anything else a tagged record whose
- * shape word names its arm (the switch folds to a lookup table). */
+ * shape word names its arm.
+ * - Arms within SHAPE_TAG_SWITCH_SPAN shape numbers: the helper switches on
+ *   the shape word. Inlined, the switch folds into the caller's branch on
+ *   the arm, one indirect jump with a jump table of at most that many
+ *   entries per site.
+ * - Wider unions: the shape word indexes the union's arm table, one entry
+ *   per shape number from the arms' lowest to highest, and callers branch
+ *   on the small arm tag. Folded switches would give every site of such a
+ *   union a jump table spanning all of its arms' shape numbers. */
 export function emitShapeUnionHelpers(host: ShapeHost): string[] {
   const out: string[] = [];
   const S = host.sizeType;
   for (const union of host.nullableUnions.allShapeUnions()) {
     const header = shapeWordHeader(S);
     const tagFn = shapeTagFn(union.unionId);
-    const cases = union.arms
-      .map((arm) => `i32 ${host.nullableUnions.shapeNumber(arm.shapeId)}, label %a${arm.tag}`)
-      .join(" ");
+    const numbers = union.arms.map((arm) => host.nullableUnions.shapeNumber(arm.shapeId));
+    const lo = Math.min(...numbers);
+    const span = Math.max(...numbers) - lo + 1;
+    const byTable = span > SHAPE_TAG_SWITCH_SPAN;
+    // Entries are bytes, or 16-bit words for a union of 255 arms or more.
+    // A shape number that names no arm maps to the all-ones entry, which is
+    // above every arm tag, so callers take their path for no arm as they do
+    // for the -1 of a shape number outside the table.
+    const wide = union.arms.some((arm) => arm.tag >= 255);
+    const entry = wide ? "i16" : "i8";
+    const none = wide ? 65535 : 255;
+    const table = new Array<number>(span).fill(none);
+    union.arms.forEach((arm, i) => (table[numbers[i]! - lo] = arm.tag));
+    const tableName = tagFn.replace("@sc_stag.", "@sc_stagtab.");
+    if (byTable)
+      out.push(
+        `${tableName} = private unnamed_addr constant [${span} x ${entry}] [${table.map((t) => `${entry} ${t}`).join(", ")}]`,
+      );
     out.push(
       `define internal i32 ${tagFn}(ptr %u) alwaysinline ${FN_ATTRS} { ; shape union tag`,
       `entry:`,
@@ -343,16 +370,35 @@ export function emitShapeUnionHelpers(host: ShapeHost): string[] {
         `  ret i32 ${union.nullTag}`,
         `rec:`,
       );
-    out.push(
-      `  %wp = getelementptr inbounds ${header}, ptr %u, i32 0, i32 ${SHAPE_WORD_INDEX}`,
-      `  %w = load i32, ptr %wp`,
-      `  switch i32 %w, label %bad [ ${cases} ]`,
-      ...union.arms.flatMap((arm) => [`a${arm.tag}:`, `  ret i32 ${arm.tag}`]),
-      `bad:`,
-      `  ret i32 -1`,
-      `}`,
-      ``,
-    );
+    const cases = union.arms.map((arm, i) => `i32 ${numbers[i]}, label %a${arm.tag}`).join(" ");
+    if (!byTable)
+      out.push(
+        `  %wp = getelementptr inbounds ${header}, ptr %u, i32 0, i32 ${SHAPE_WORD_INDEX}`,
+        `  %w = load i32, ptr %wp`,
+        `  switch i32 %w, label %bad [ ${cases} ]`,
+        ...union.arms.flatMap((arm) => [`a${arm.tag}:`, `  ret i32 ${arm.tag}`]),
+        `bad:`,
+        `  ret i32 -1`,
+        `}`,
+        ``,
+      );
+    else
+      out.push(
+        `  %wp = getelementptr inbounds ${header}, ptr %u, i32 0, i32 ${SHAPE_WORD_INDEX}`,
+        `  %w = load i32, ptr %wp`,
+        `  %i = sub i32 %w, ${lo}`,
+        `  %inrange = icmp ult i32 %i, ${span}`,
+        `  br i1 %inrange, label %look, label %bad`,
+        `look:`,
+        `  %tp = getelementptr inbounds [${span} x ${entry}], ptr ${tableName}, i32 0, i32 %i`,
+        `  %t8 = load ${entry}, ptr %tp`,
+        `  %tag = zext ${entry} %t8 to i32`,
+        `  ret i32 %tag`,
+        `bad:`,
+        `  ret i32 -1`,
+        `}`,
+        ``,
+      );
     // Release and trace: one definition for the unions over the same
     // record arms (helperOwner). Unit encodings are NULL or the immortal
     // null sentinel; the shape word picks the arm.

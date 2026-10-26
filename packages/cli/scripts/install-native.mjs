@@ -49,6 +49,7 @@ export function relocateToolchain(manifest, sourceDirectory, destinationDirector
     "declarations",
     "comptime",
     "wasi_node_runner",
+    "lib_diagnostics",
   ]) {
     if (typeof relocated[name] === "string") relocated[name] = pathFrom(relocated[name]);
   }

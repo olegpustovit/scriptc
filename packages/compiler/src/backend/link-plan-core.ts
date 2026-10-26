@@ -70,3 +70,19 @@ export function executableLinkInputs(options: {
     ],
   };
 }
+
+/** The linker arguments for an executable's system libraries. On Linux, libm
+ * links as needed: the runtime defines the libm functions most programs
+ * reach (scr_glibc_math.c) and Math's transcendentals (scr_ieee754.c), so a
+ * program that calls no other libm function, such as pow, starts without
+ * loading libm.so. */
+export function systemLibraryLinkerArgs(
+  target: Pick<NativeTargetSpec, "platform">,
+  names: readonly string[],
+): string[] {
+  return names.flatMap((name) =>
+    name === "m" && target.platform === "linux"
+      ? ["-Wl,--as-needed", "-lm", "-Wl,--no-as-needed"]
+      : [`-l${name}`],
+  );
+}

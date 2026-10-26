@@ -65,6 +65,7 @@ import { STRING_READ_HELPERS, stringScanDecl, stringScanInline } from "./string-
 import { emitLibraryIdentityLines } from "../library-identity-markers.js";
 import { InternalCompilerError } from "../../errors.js";
 import { targetCpuAttribute } from "../target-cpu.js";
+import { CPU_LEVEL_INIT_CALL, cpuDispatchAttributes, cpuLevelDefs } from "./cpu-dispatch.js";
 import type { IrFunction } from "../../ir/ir.js";
 
 /** The function bodies emitted in `chunks` contiguous ranges, each by its
@@ -198,7 +199,8 @@ function readRange(dir: string, range: number): { result: ChunkResult; texts: st
  * #1 for coroutine bodies and #2 for out-of-line record clones. Each carries
  * the build's `--target-cpu` level, and `sanitize_address` in sanitized
  * builds. A group needs one attribute: without either, #0 holds a string
- * attribute that LLVM ignores. */
+ * attribute that LLVM ignores. Dispatching builds add the x86-64-v3 copies'
+ * #3 and #4 (cpu-dispatch.ts). */
 function functionAttributes(emitter: LlEmitter, hasNoInlineRecordClone: boolean): string[] {
   const cpu = targetCpuAttribute(emitter.targetCpu);
   const asan = emitter.sanitizeAttributes ? " sanitize_address" : "";
@@ -207,6 +209,7 @@ function functionAttributes(emitter: LlEmitter, hasNoInlineRecordClone: boolean)
     `attributes #0 = {${base} }`,
     ...(emitter.usesCoroutines ? [`attributes #1 = {${asan} presplitcoroutine${cpu} }`] : []),
     ...(hasNoInlineRecordClone ? [`attributes #2 = { noinline${asan}${cpu} }`] : []),
+    ...(emitter.cpuDispatch ? cpuDispatchAttributes(asan) : []),
   ];
 }
 
@@ -585,6 +588,7 @@ export function emitModuleParts(emitter: LlEmitter): string[] {
     ...(emitter.publishWalkersCache?.defs() ?? []),
     ...emitter.publishedClassNamesDefs(),
     ...(emitter.regions?.moduleDefs() ?? []),
+    ...(emitter.cpuDispatch ? cpuLevelDefs((line) => emitter.declare(line)) : []),
   ];
   if (emitter.constantNumericTables.size > 0)
     emitter.declare(`declare double @scr_arr_get_number(ptr, double)`);
@@ -1043,6 +1047,7 @@ export function emitModuleParts(emitter: LlEmitter): string[] {
     `define i32 @${emitter.mod.workers ? "sc_context_entry" : emitter.wasi ? "__main_argc_argv" : "main"}(i32 %argc, ptr %argv) ${FN_ATTRS} {`,
     `entry:`,
     ...(emitter.runtimeAbiMarker ? [`  call void @${RUNTIME_ABI_MARKER}()`] : []),
+    ...(emitter.cpuDispatch && !emitter.mod.workers ? [CPU_LEVEL_INIT_CALL] : []),
     ...(emitter.mod.workers ? [`  call void @scr_runtime_workers_v8()`] : []),
     `  call void @scr_init()`,
     // Compressed fields hold addresses in the program-lifetime region, which
@@ -1201,6 +1206,8 @@ export function emitModuleParts(emitter: LlEmitter): string[] {
       `}`,
       `define i32 @main(i32 %argc, ptr %argv) ${FN_ATTRS} {`,
       `entry:`,
+      // Worker threads enter at sc_worker_entry and read the level main set.
+      ...(emitter.cpuDispatch ? [CPU_LEVEL_INIT_CALL] : []),
       `  %result = call i32 @sc_context_entry(i32 %argc, ptr %argv)`,
       `  call void @scr_context_cleanup()`,
       `  ret i32 %result`,

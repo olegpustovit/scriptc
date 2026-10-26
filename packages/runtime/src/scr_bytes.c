@@ -4141,8 +4141,8 @@ static bool scr_bytes_rw_check(const ScrBytes *b, double offset, size_t width) {
  * exactly Node — and writes zeros downstream. */
 static bool scr_bytes_check_int(const ScrBytes *b, double value, double offset,
                                 size_t width, bool sign) {
-  double max = sign ? exp2((double)(8 * width - 1)) - 1 : exp2((double)(8 * width)) - 1;
-  double min = sign ? -exp2((double)(8 * width - 1)) : 0;
+  double max = sign ? ldexp(1.0, (int)(8 * width - 1)) - 1 : ldexp(1.0, (int)(8 * width)) - 1;
+  double min = sign ? -ldexp(1.0, (int)(8 * width - 1)) : 0;
   if (value > max || value < min) {
     char recv[48];
     scr_num_received(value, recv);

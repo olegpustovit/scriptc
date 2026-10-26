@@ -22,6 +22,7 @@ import { type NativeArtifactDependency } from "./native/contracts.js";
 import { RuntimePackError, stageRuntimePackArtifacts } from "./runtime-pack.js";
 import type { NativeLinkPlan } from "./link-plan.js";
 import { lldLinkerArgs } from "./lld.js";
+import { systemLibraryLinkerArgs } from "./link-plan-core.js";
 import {
   createDarwinDebugSymbols,
   installDarwinDebugSymbols,
@@ -248,7 +249,7 @@ export async function linkNativeExecutable(
       ...lld,
       ...plan.driverFlags,
       ...plan.inputs.map((input) => staged.replacements.get(input) ?? input),
-      ...plan.systemLibraries.map((name) => `-l${name}`),
+      ...systemLibraryLinkerArgs(plan.target, plan.systemLibraries),
       "-o",
       privateOut,
     ];

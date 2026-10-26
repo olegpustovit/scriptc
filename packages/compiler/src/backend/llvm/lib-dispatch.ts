@@ -17,6 +17,7 @@ import type { LlvmEmitterContext, LibCallExpr, LibCallPrefix, LlValue } from "./
 import {
   ASSERT_VERDICT_LIB_FNS,
   LIB_FN_SYMS,
+  PURE_MATH_LIB_FNS,
   mockTimerSym,
   USES_TIMERS_LIB_FNS,
 } from "./lib-shared.js";
@@ -779,7 +780,8 @@ function emitSymbolLibCall(
     return { name: "", type: e.type };
   }
   const t = B.tmp();
-  B.line(`${t} = call ${retDecl} @${sym}(${argList})`);
+  const attrs = PURE_MATH_LIB_FNS.has(e.fn) ? " nounwind willreturn memory(none)" : "";
+  B.line(`${t} = call ${retDecl} @${sym}(${argList})${attrs}`);
   // The result joins its frame BEFORE the pending check so an unwind
   // releases the dummy (NULL for refcounted returns) harmlessly.
   const out = host.own({ name: t, type: e.type });

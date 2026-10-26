@@ -1063,6 +1063,11 @@ export interface IrModule {
    * closures boxed for package code return records and arrays as live
    * capsules, so a value that comes back keeps its identity. */
   declBoundary?: true;
+  /** Origins of package-declared types checked by `dynCheck.origin`
+   * (frontend/lowering/decl-origin.ts): fields separated by \x1f —
+   * package, version, suggested range, selector, where it is declared,
+   * declared type. */
+  declOrigins?: string[];
   /** The program constructs LifetimeRegion (@scriptc/experimental): every
    * ProgramLifetime instance lives in a counted region (the region.*
    * intrinsics; backend/llvm/regions.ts). */
@@ -4040,12 +4045,17 @@ export type IrExpr =
    * unshared source is simply consumed. Values must be plain data
    * (ordinary objects and arrays without accessors, prototypes, symbols
    * or frozen state), otherwise the cast throws the path TypeError. */
+  /** `origin`: the target type comes from an npm package's declaration;
+   * an index into `IrModule.declOrigins`. A failing check's TypeError then
+   * names the declaration and the type patch that would admit the value
+   * (scr_type_origin.c). */
   | {
       kind: "dynCheck";
       value: IrExpr;
       preserveRefs?: true;
       adopt?: true;
       exact?: true;
+      origin?: number;
       type: IrType;
       loc: SrcLoc;
     };

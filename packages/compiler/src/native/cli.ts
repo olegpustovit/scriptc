@@ -12,6 +12,7 @@ import { mergeNativeProfiles } from "../backend/native-tools.js";
 import { setDeclarationRoot } from "../frontend/dts-paths.js";
 import { setFrontendDisposedHook } from "../frontend/dispose-hook.js";
 import { FrontendServices } from "../frontend/services.js";
+import { runTypePatchCommand } from "../frontend/type-patches/command.js";
 import { createNativeTs7Api } from "../frontend/ts7/native-api.js";
 import { resolveProvenanceSourcesWithParser } from "../frontend/provenance-core.js";
 import { setCompilerReleaseVersion } from "../library/sidecar.js";
@@ -187,6 +188,19 @@ async function main(): Promise<number> {
         profiles.push({ profile, elapsedMs: performance.now() - start });
       }
       return { cacheRoot: cache.root, profiles };
+    },
+    typePatches: async (request) => {
+      const toolchain = getCompiler().toolchain;
+      const services = new FrontendServices((options) =>
+        createNativeTs7Api({ ...options, executable: toolchain.ts7Executable }),
+      );
+      try {
+        return runTypePatchCommand(request, (path, source, kind) =>
+          services.parse(path, source, kind),
+        );
+      } finally {
+        services.close();
+      }
     },
     mergeProfiles: async (outputPath, inputPaths, sparse) => {
       const toolchain = getCompiler().toolchain;

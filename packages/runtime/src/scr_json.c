@@ -2564,7 +2564,7 @@ static void scr_dyn_record_view_freeze(ScrDyn *view) {
 
 void scr_record_freeze(void *record) {
   size_t *rc = record;
-  if (*rc != SIZE_MAX) *rc |= SCR_RC_FROZEN;
+  if (!scr_rc_immortal(record)) *rc |= SCR_RC_FROZEN;
 }
 
 void scr_record_throw_frozen(ScrStr *key, ScrStr *owner, double operation) {
@@ -11160,9 +11160,8 @@ ScrDyn *scr_dyn_arithmetic(const ScrDyn *left, const ScrDyn *right, const ScrStr
     if (result) { out = scr_dyn_new_bigint(result); scr_bigint_release(result); }
   } else {
     double a = l->v.num, b = r->v.num;
-    // ECMAScript differs from libm for ±1 ** ±Infinity and 1 ** NaN.
     double result = op == '-' ? a - b : op == '/' ? a / b : op == '%' ? fmod(a, b)
-      : operation->len == 2 ? ((fabs(a) == 1 && !isfinite(b)) ? NAN : pow(a, b)) : a * b;
+      : operation->len == 2 ? scr_math_pow(a, b) : a * b;
     out = scr_dyn_new_num(result);
   }
   scr_dyn_release(l);

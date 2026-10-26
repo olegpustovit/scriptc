@@ -1,3 +1,4 @@
+import { renderOriginNote } from "../decl-origin.js";
 import { keyedHelperName } from "../stable-names.js";
 import { buildUnionNarrow, unionNarrowFailureMessage } from "../union-narrow.js";
 import { isSafeToRepeat } from "../expressions/evaluation-safety.js";
@@ -408,7 +409,24 @@ export function narrowedArmHelper(
   if (!from || isUnitType(target)) return null;
   const tag = lowerer.armTag(fromId, target);
   if (tag < 0) return null;
-  const key = message === undefined ? `${fromId}:${tag}` : `${fromId}:${tag}:${message}`;
+  // A slot in package code typed by a package declaration: the TypeError
+  // names the declaration (decl-origin.ts). Other extractions keep their
+  // shared helper.
+  const originNode =
+    message === undefined && lowerer.coercionOriginUnion === fromId
+      ? lowerer.coercionOriginNode
+      : null;
+  const origin =
+    message !== undefined
+      ? null
+      : (lowerer.coercionFieldOrigin ??
+        (originNode === null ? null : lowerer.slotOriginOf(originNode)));
+  const key =
+    message !== undefined
+      ? `${fromId}:${tag}:${message}`
+      : origin !== null
+        ? `${fromId}:${tag}:origin:${origin}`
+        : `${fromId}:${tag}`;
   const existing = lowerer.coercions.narrows.get(key);
   if (existing) {
     lowerer.coercions.checkedNarrows.add(existing);
@@ -425,6 +443,9 @@ export function narrowedArmHelper(
     (type) => lowerer.fmt(type),
     null,
     message ?? null,
+    null,
+    origin,
+    lowerer.targetPlatform === "win32",
   );
   if (!fn) throw new InternalCompilerError("lowerer bug: invalid checked union extraction");
   lowerer.coercions.checkedNarrowArms.set(name, {
@@ -432,6 +453,7 @@ export function narrowedArmHelper(
     tag,
     target: from.arms[tag]!,
     ...(message === undefined ? {} : { message }),
+    ...(origin === null ? {} : { origin }),
   });
   lowerer.liftedFns.push(fn);
   return name;
@@ -516,8 +538,20 @@ export function checkedNarrowCall(
   let failure: IrExpr | null = null;
   for (let tag = from.arms.length - 1; tag >= 0; tag--) {
     if (tag === arm.tag) continue;
+    const failing = from.arms[tag]!;
     const message =
-      arm.message ?? unionNarrowFailureMessage(from.arms[tag]!, (t) => lowerer.fmt(t));
+      (arm.message ?? unionNarrowFailureMessage(failing, (t) => lowerer.fmt(t))) +
+      (arm.origin === undefined
+        ? ""
+        : renderOriginNote(
+            arm.origin,
+            isUnitType(failing)
+              ? failing.kind === "undefinedT"
+                ? "undefined"
+                : "null"
+              : lowerer.fmt(failing),
+            lowerer.targetPlatform === "win32",
+          ));
     const thrown = nodeThrowExpr(1, "", message, type, loc);
     failure =
       failure === null

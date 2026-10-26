@@ -348,6 +348,11 @@ async function build() {
         "artifacts/licenses/v8-number-radix.txt",
         "BSD-3-Clause",
       ],
+      [
+        join(vendorRoot, "v8-ieee754", "LICENSE"),
+        "artifacts/licenses/v8-ieee754.txt",
+        "BSD-3-Clause",
+      ],
       [join(vendorRoot, "unicode", "LICENSE"), "artifacts/licenses/unicode.txt", "Unicode-3.0"],
       [join(zlib, "LICENSE"), "artifacts/licenses/zlib.txt", "Zlib"],
       [join(vendorRoot, "brotli", "LICENSE"), "artifacts/licenses/brotli.txt", "MIT"],

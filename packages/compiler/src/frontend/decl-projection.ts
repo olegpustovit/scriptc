@@ -27,6 +27,59 @@
  * scriptc-perf/results/design-decl-boundary/DESIGN.md. */
 
 import * as ts from "./ts7/adapter.js";
+import { declarationSelector, originAt } from "./lowering/decl-origin.js";
+
+/** Per user file, the origin (lowering/decl-origin.ts) of each boundary
+ * cast in source order: the package declaration the cast's type comes
+ * from, so a failing cast names it. Set by planDeclProjection, reset per
+ * program load. */
+const boundaryOrigins = new Map<string, (string | null)[]>();
+
+export function resetDeclBoundaryOrigins(): void {
+  boundaryOrigins.clear();
+}
+
+/** The origin of the `index`-th boundary cast of a file, or null. */
+export function declBoundaryOrigin(fileName: string, index: number): string | null {
+  return boundaryOrigins.get(fileName)?.[index] ?? null;
+}
+
+/** The package declaration a projected expression's type comes from, in
+ * the declaration world. */
+function castOrigin(checker: ts.TypeChecker, node: ts.Node, type: ts.Type): string | null {
+  let inner = node as ts.Expression;
+  while (
+    ts.isParenthesizedExpression(inner) ||
+    ts.isAwaitExpression(inner) ||
+    ts.isNonNullExpression(inner)
+  )
+    inner = inner.expression;
+  let decl: ts.Node | undefined;
+  let suffix = "";
+  try {
+    if (ts.isCallExpression(inner) || ts.isNewExpression(inner)) {
+      decl = checker.getResolvedSignature(inner)?.declaration;
+      suffix = "()";
+    } else {
+      const name = ts.isPropertyAccessExpression(inner)
+        ? inner.name
+        : ts.isIdentifier(inner)
+          ? inner
+          : null;
+      if (name === null) return null;
+      let symbol = checker.getSymbolAtLocation(name);
+      if (symbol !== undefined && symbol.flags & ts.SymbolFlags.Alias)
+        symbol = checker.getAliasedSymbol(symbol);
+      decl = symbol?.declarations[0];
+    }
+    if (decl === undefined) return null;
+    const selector = declarationSelector(decl);
+    if (selector === null) return null;
+    return originAt(decl, `${selector}${suffix}`, checker.typeToString(type));
+  } catch {
+    return null;
+  }
+}
 
 /** Alias names of projected types start with this prefix; the lowering
  * recognizes boundary casts and parameters by it. */
@@ -573,6 +626,7 @@ export function planDeclProjection(input: DeclProjectionInput): DeclProjection |
     const declSf = input.declProgram.getSourceFile(file);
     if (jsSf === undefined || declSf === undefined || jsSf.text !== declSf.text) continue;
     const fileEdits: Edit[] = [];
+    const fileOrigins: (string | null)[] = [];
     /** Candidate expressions (by js node) with their declared type, named
      * only for the casts that survive suppression. */
     const exprCandidates = new Map<ts.Node, ts.Type | "any">();
@@ -946,6 +1000,12 @@ export function planDeclProjection(input: DeclProjectionInput): DeclProjection |
       const candidate = exprCandidates.get(e)!;
       const alias = candidate === "any" ? "any" : printer.project(candidate);
       if (alias === null) continue;
+      // Only casts to a projected alias are boundary casts the lowering
+      // counts (an `as any` cast is not one), so only they take a slot.
+      if (candidate !== "any") {
+        const twin = twins.get(e);
+        fileOrigins.push(twin === undefined ? null : castOrigin(declChecker, twin, candidate));
+      }
       const start = ts.tokenStartOfNode(e);
       const stmt = e.parent;
       let prefix = "(";
@@ -980,6 +1040,7 @@ export function planDeclProjection(input: DeclProjectionInput): DeclProjection |
 
     if (fileEdits.length === 0) continue;
     edits.set(file, fileEdits);
+    if (fileOrigins.some((o) => o !== null)) boundaryOrigins.set(file, fileOrigins);
   }
 
   if (edits.size === 0) return null;

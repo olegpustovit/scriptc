@@ -573,13 +573,21 @@ export function classIdLoadLines(
  * 64-bit word. The count is the i32 at offset 0. */
 export const CLASS_ID_OFFSET = 4;
 
+/** The bound on layout ids (scr_rc.h SCR_RC_LAYOUT_ID_LIMIT): the high
+ * half of a 64-bit rc word keeps the layout id in its low 30 bits, beside
+ * the program-lifetime and frozen bits. A class id is the layout id of its
+ * class's canonical layout. */
+export const LAYOUT_ID_LIMIT = 0x3fffffff;
+
 /** The rc word an LlClassMeta.idInRc instance is created with: the class
  * id, its preorder number plus 1, in the high 32 bits, and in the low 32 bits
  * a count of 1, or for a program-lifetime instance the midpoint of the 32-bit
- * count (as programLifetimeRc is of the 32-bit word). The id is never 0,
- * 0x80000000 or 0xffffffff, the high halves of other objects' rc words, so
- * the runtime can tell an object with a class id (scr_rc.h scr_rc_class_id). */
+ * count (as programLifetimeRc is of the 32-bit word). The id is a layout id
+ * (LAYOUT_ID_LIMIT), so it never sets the program-lifetime or frozen bit
+ * and the runtime reads it back (scr_rc.h scr_rc_layout_id). */
 export function classIdRcWord(meta: LlClassMeta, lifetime: boolean): string {
+  if (meta.pre + 1 >= LAYOUT_ID_LIMIT)
+    throw new InternalCompilerError(`class id ${meta.pre + 1} is not a layout id`);
   return (BigInt(meta.pre + 1) * 2n ** 32n + (lifetime ? 2n ** 31n : 1n)).toString();
 }
 

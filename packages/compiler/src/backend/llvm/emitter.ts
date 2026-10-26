@@ -147,6 +147,7 @@ import {
   bridgePlainUnwindCalls,
   unwindAbiFunctions,
 } from "./unwind-abi.js";
+import { cloneForCpuDispatch } from "./cpu-dispatch.js";
 import {
   mangleAsyncInlineAwaitCall,
   mangleAsyncSpawn,
@@ -544,6 +545,11 @@ export interface LlvmTargetOptions {
    * every emitted function carries it as its `target-cpu`. Unset, code
    * runs on any x86-64 CPU. */
   targetCpu?: TargetCpu;
+  /** Give an x86-64 executable without a `targetCpu` an x86-64-v3 copy of
+   * each program function, which it runs on CPUs at that level
+   * (cpu-dispatch.ts). Ignored for other targets, libraries and builds
+   * with debug information. */
+  cpuDispatch?: boolean;
 }
 
 /** LlvmTargetOptions.lowRegion for an executable: Linux targets without
@@ -1288,6 +1294,8 @@ export class LlEmitter {
   readonly targetCpu: TargetCpu | undefined;
   /** Emitted functions carry `sanitize_address` (LlvmTargetOptions). */
   readonly sanitizeAttributes: boolean;
+  /** LlvmTargetOptions.cpuDispatch, where it applies. */
+  readonly cpuDispatch: boolean;
   readonly wasmBoundsChecks: boolean;
   /** Interned string literals: UTF-8 text → { symbol, byte length } —
    * first-use order, the runtime ABI’s determinism discipline. */
@@ -1991,6 +1999,13 @@ export class LlEmitter {
     this.detachedExit = options.detachedExit === true;
     this.targetCpu = options.targetCpu;
     this.sanitizeAttributes = options.sanitizeAttributes !== false;
+    this.cpuDispatch =
+      options.cpuDispatch === true &&
+      options.targetCpu === undefined &&
+      !this.wasi &&
+      mod.lib === undefined &&
+      this.debug === null &&
+      /^(x86_64|amd64|x64)\b/.test(options.targetTriple || process.arch);
     this.wasmBoundsChecks =
       options.wasmBoundsChecks === true ||
       wasmBoundsChecks({
@@ -2497,7 +2512,8 @@ export class LlEmitter {
   }
   emitParts(): string[] {
     const parts = emitParts(this);
-    return this.unwindAbi.size > 0 ? bridgePlainUnwindCalls(parts) : parts;
+    const bridged = this.unwindAbi.size > 0 ? bridgePlainUnwindCalls(parts) : parts;
+    return this.cpuDispatch ? cloneForCpuDispatch(bridged) : bridged;
   }
 
   /** The dispose-observer gates the emitted frees and record writers test
@@ -3712,6 +3728,9 @@ export class LlEmitter {
     passThrough?: { name: string; type: IrType },
     poll = false,
     guard?: string,
+    /** Runs at the start of the cold unwind block, before the unwind (a
+     * package-declared check's origin note). */
+    onUnwind?: () => void,
   ): void {
     const through =
       passThrough !== undefined &&
@@ -3736,6 +3755,7 @@ export class LlEmitter {
       const lk = B.newLabel("exc.k");
       B.condBr(p, lu, lk);
       B.startBlock(lu);
+      onUnwind?.();
       this.emitUnwind(through);
       B.startBlock(lk);
       if (skip !== undefined) {
@@ -3812,6 +3832,7 @@ export class LlEmitter {
       B.condBr(cold, lu, lk);
     }
     B.startBlock(lu);
+    onUnwind?.();
     this.emitUnwind(through);
     B.startBlock(lk);
     if (skip !== undefined) {

@@ -239,6 +239,7 @@ test("early executable keys isolate compile modes, paths, implementation, checke
     { ...f.options, detachedExit: true },
     { ...f.options, targetCpu: "x86-64-v3" },
     { ...f.options, targetCpu: "x86-64-v4" },
+    { ...f.options, cpuDispatch: true },
     { ...f.options, profile: "profile-generate:/tmp/%p.profraw" },
     { ...f.options, profile: "profile-use:digest" },
     { ...f.options, checker: "tsc-ts-executable-identity" },

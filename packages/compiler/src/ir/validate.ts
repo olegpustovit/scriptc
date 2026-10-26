@@ -127,6 +127,12 @@ export function validateModule(mod: IrModule): IrValidationError[] {
     errors.push({ message: "worker execution mode must be a boolean", loc: moduleLoc });
   if (mod.declBoundary !== undefined && mod.declBoundary !== true)
     errors.push({ message: "declBoundary must be true when present", loc: moduleLoc });
+  const declOrigins = mod.declOrigins;
+  if (
+    declOrigins !== undefined &&
+    (!Array.isArray(declOrigins) || declOrigins.some((o) => typeof o !== "string"))
+  )
+    errors.push({ message: "declOrigins must be an array of strings", loc: moduleLoc });
   if (mod.untypedIntegrity !== undefined && mod.untypedIntegrity !== true)
     errors.push({ message: "untypedIntegrity must be true when present", loc: moduleLoc });
   if (mod.lifetimeRegions !== undefined && mod.lifetimeRegions !== true)
@@ -1001,6 +1007,7 @@ export function validateModule(mod: IrModule): IrValidationError[] {
       mod.workers === true,
       mod.lifetimeRegions === true,
       new Set(mod.threadSlotKeys ?? []),
+      mod.declOrigins?.length ?? 0,
     );
   }
   return errors;
@@ -1020,6 +1027,7 @@ function validateFunction(
   workers: boolean,
   lifetimeRegions: boolean,
   threadSlotKeys: ReadonlySet<string>,
+  declOriginCount: number,
 ): void {
   const locals = new Map(fn.locals.map((l) => [l.id, l]));
   const err = (message: string, loc: SrcLoc) =>
@@ -6154,6 +6162,11 @@ function validateFunction(
       case "dynCheck": {
         checkExpr(e.value);
         expectType(e.value, DYN, "dynCheck operand");
+        if (
+          e.origin !== undefined &&
+          (!Number.isInteger(e.origin) || e.origin < 0 || e.origin >= declOriginCount)
+        )
+          err(`dynCheck origin ${e.origin} is not an index of declOrigins`, e.loc);
         // The target drives the emitted validator/builder: non-dyn,
         // non-void, JSON-representable (closures/class instances can never
         // be found inside a JSON dyn — the frontend rejects those casts).

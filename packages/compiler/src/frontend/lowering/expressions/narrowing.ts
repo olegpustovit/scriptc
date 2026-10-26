@@ -1,4 +1,5 @@
 /* Type narrowing of lowered values, conditional and as-expressions, and runtime-optional receiver reads. */
+import { declBoundaryOrigin } from "../../decl-projection.js";
 import * as ts from "../../ts7/adapter.js";
 import { type Lowerer, dynFallbackType } from "../lowerer.js";
 import {
@@ -1541,7 +1542,7 @@ export function lowerAsExpression(
   // The declaration-typed boundary (decl-projection.ts): an identity-
   // preserving checked conversion of a value package code produced.
   if (isDeclBoundaryTypeNode(expr.type)) {
-    const adopted = declBoundaryCast(lowerer, inner, target, locOf(expr));
+    const adopted = declBoundaryCast(lowerer, inner, target, locOf(expr), expr);
     if (adopted) return adopted;
   }
   // An all-`unknown`-fields record target (`err as { code?: unknown }`
@@ -1649,11 +1650,42 @@ function holdsReference(lowerer: Lowerer, t: IrType, seen = new Set<string>()): 
  * becomes a live capsule of the value built from it
  * (scr_dyn_decl_adopt), so identity and mutation visibility hold on both
  * sides. Scalar targets are ordinary checked casts. */
+/** The origin the projection recorded for a boundary cast (the package
+ * declaration its type comes from, decl-projection.ts), found by the
+ * cast's position among the file's boundary casts in source order. */
+function recordedBoundaryOrigin(lowerer: Lowerer, cast: ts.Node): string | null {
+  const sf = ts.getSourceFileOfNode(cast);
+  let order = lowerer.boundaryCastOrder.get(sf);
+  if (order === undefined) {
+    const found = new Map<ts.Node, number>();
+    const visit = (node: ts.Node): void => {
+      if (ts.isAsExpression(node) && isDeclBoundaryTypeNode(node.type)) found.set(node, found.size);
+      ts.forEachChild(
+        node,
+        (child) => {
+          visit(child);
+          return undefined;
+        },
+        (list) => {
+          for (const child of list.nodes) visit(child);
+          return undefined;
+        },
+      );
+    };
+    visit(sf);
+    order = found;
+    lowerer.boundaryCastOrder.set(sf, order);
+  }
+  const index = order.get(cast);
+  return index === undefined ? null : declBoundaryOrigin(sf.fileName, index);
+}
+
 function declBoundaryCast(
   lowerer: Lowerer,
   inner: IrExpr,
   target: IrType,
   loc: SrcLoc,
+  cast: ts.Node,
 ): IrExpr | null {
   if (
     !canDynCheckTo(
@@ -1664,8 +1696,23 @@ function declBoundaryCast(
     !(target.kind === "union" && lowerer.dynConvertible(target))
   )
     return null;
+  // The package call or read the value comes from (decl-origin.ts): a
+  // failing check names it and the patch admitting the value.
+  let originText: string | null = null;
+  try {
+    originText = recordedBoundaryOrigin(lowerer, cast);
+  } catch {
+    originText = null;
+  }
+  const originId = originText === null ? undefined : lowerer.declOriginIndex(originText);
   if (!holdsReference(lowerer, target)) {
-    return { kind: "dynCheck", value: inner, type: target, loc };
+    return {
+      kind: "dynCheck",
+      value: inner,
+      type: target,
+      loc,
+      ...(originId === undefined ? {} : { origin: originId }),
+    };
   }
   const source = lowerer.declareHiddenLocal("%boundarySource", DYN);
   const value = lowerer.declareHiddenLocal("%boundaryValue", target);
@@ -1682,6 +1729,7 @@ function declBoundaryCast(
           adopt: true,
           type: target,
           loc,
+          ...(originId === undefined ? {} : { origin: originId }),
         },
         loc,
       },

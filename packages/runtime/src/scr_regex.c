@@ -2469,6 +2469,146 @@ static int scr_unicode_normalize(uint32_t **pdst, const uint32_t *src, int len,
   return (int)count;
 }
 
+/* Normalization quick check (UAX #15): a string whose every code point is
+ * inert for the form is already in that form. A code point is inert when
+ * normalizing it alone leaves it unchanged, its canonical combining class
+ * is 0, and (for the composing forms) no composition can take it as its
+ * second element. The last condition holds in the ranges below: none holds
+ * a code point with combining class 0 that composes with a preceding one
+ * (those are Hangul jamo vowels and trailing consonants, U+3099/U+309A,
+ * and vowel signs of Indic and Southeast Asian scripts above U+0900), so a
+ * code point outside them takes the full algorithm. Inert flags are
+ * computed through unicode_normalize, 256 code points at a time, when a
+ * block is first seen. */
+#define SCR_NQC_BLOCKS 0x200
+typedef struct {
+  uint8_t known[4][SCR_NQC_BLOCKS];
+  uint8_t inert[4][SCR_NQC_BLOCKS][32];
+  uint8_t starter[4][SCR_NQC_BLOCKS][32]; /* class 0, never a second element */
+  struct {
+    uint32_t cp;
+    uint8_t len;
+    char bytes[15];
+  } single[4][256]; /* a lone code point's normalized UTF-8 */
+} ScrNormalizeQuick;
+static SCR_TL ScrNormalizeQuick *scr_nqc;
+
+static void scr_nqc_free(void) {
+  free(scr_nqc);
+  scr_nqc = NULL;
+}
+
+static bool scr_nqc_in_ranges(uint32_t c) {
+  return c < 0x900 || (c >= 0x2000 && c < 0x3099) || (c >= 0x309B && c < 0xA000) ||
+         (c >= 0xAC00 && c < 0xD7A4) || (c >= 0xF900 && c < 0x10000) ||
+         (c >= 0x1F000 && c < 0x1FB00);
+}
+
+/* Bit 0: inert. Bit 1: a starter, with class 0 and never the second element
+ * of a composition, so nothing before it reorders or composes with it. */
+/* Whether c has class 0 and lies in the ranges above. U+0345 is the one
+ * code point of class 240, which the reordering test cannot tell from
+ * class 0; a mark of class 1..239 after U+0345 moves before it. */
+static bool scr_nqc_class0(uint32_t c) {
+  if (c == 0x345 || !scr_nqc_in_ranges(c)) return false;
+  uint32_t pair[2] = {0x345, c};
+  uint32_t *out = NULL;
+  int n = unicode_normalize(&out, pair, 2, UNICODE_NFD, NULL, scr_normalize_realloc);
+  bool starter = n >= 2 && out[0] == 0x345;
+  free(out);
+  return starter;
+}
+
+static unsigned scr_nqc_compute(uint32_t c, UnicodeNormalizationEnum mode) {
+  if (!scr_nqc_class0(c)) return 0;
+  uint32_t *out = NULL;
+  int n = unicode_normalize(&out, &c, 1, mode, NULL, scr_normalize_realloc);
+  bool same = n == 1 && out[0] == c;
+  free(out);
+  if (same) return 3u;
+  /* A starter's decomposition must begin with one too (U+FF9E's
+   * compatibility decomposition is U+3099, which composes with the code
+   * point before it). */
+  UnicodeNormalizationEnum decompose =
+      mode == UNICODE_NFKC || mode == UNICODE_NFKD ? UNICODE_NFKD : UNICODE_NFD;
+  out = NULL;
+  n = unicode_normalize(&out, &c, 1, decompose, NULL, scr_normalize_realloc);
+  bool leads = n >= 1 && scr_nqc_class0(out[0]);
+  free(out);
+  return leads ? 2u : 0u;
+}
+
+/* scr_nqc_compute's bits for c, from its block's flags. */
+static unsigned scr_nqc_class(uint32_t c, UnicodeNormalizationEnum mode) {
+  if (c >= (uint32_t)SCR_NQC_BLOCKS << 8) return 0;
+  if (!scr_nqc) {
+    scr_nqc = calloc(1, sizeof *scr_nqc);
+    if (!scr_nqc) return 0;
+    scr_atexit(scr_nqc_free);
+  }
+  uint32_t block = c >> 8;
+  uint8_t *inert = scr_nqc->inert[mode][block];
+  uint8_t *starter = scr_nqc->starter[mode][block];
+  if (!scr_nqc->known[mode][block]) {
+    for (uint32_t i = 0; i < 256; i++) {
+      unsigned bits = scr_nqc_compute((block << 8) | i, mode);
+      if (bits & 1) inert[i >> 3] |= (uint8_t)(1u << (i & 7));
+      if (bits & 2) starter[i >> 3] |= (uint8_t)(1u << (i & 7));
+    }
+    scr_nqc->known[mode][block] = 1;
+  }
+  unsigned bit = c & 0xff;
+  return ((inert[bit >> 3] >> (bit & 7)) & 1) | (((starter[bit >> 3] >> (bit & 7)) & 1) << 1);
+}
+
+/* Normalize the code points of data[from, to) and append them. */
+static void scr_nqc_segment(ScrJsonBuf *b, const char *data, size_t from, size_t to,
+                            UnicodeNormalizationEnum mode) {
+  size_t first_step;
+  uint32_t first = scr_case_decode(data + from, &first_step);
+  if (first_step == to - from && scr_nqc) {
+    /* One code point (a precomposed letter between inert ones): its
+     * normalized bytes repeat, so they are kept per form. */
+    __typeof__(scr_nqc->single[0][0]) *slot = &scr_nqc->single[mode][first & 0xff];
+    if (slot->cp != first || slot->len == 0) {
+      uint32_t *output = NULL;
+      int count = unicode_normalize(&output, &first, 1, mode, NULL, scr_normalize_realloc);
+      if (count < 0) scr_regex_oom();
+      ScrJsonBuf one;
+      scr_jb_init(&one);
+      for (int i = 0; i < count; i++) scr_case_put_cp(&one, output[i]);
+      free(output);
+      ScrStr *bytes = scr_jb_finish(&one);
+      if (bytes->len == 0 || bytes->len > sizeof slot->bytes) {
+        scr_jb_write(b, bytes->data, bytes->len);
+        scr_str_release(bytes);
+        return;
+      }
+      slot->cp = first;
+      slot->len = (uint8_t)bytes->len;
+      memcpy(slot->bytes, bytes->data, bytes->len);
+      scr_str_release(bytes);
+    }
+    scr_jb_write(b, slot->bytes, slot->len);
+    return;
+  }
+  uint32_t local[32];
+  uint32_t *input = to - from <= 32 ? local : malloc((to - from) * sizeof *input);
+  if (!input) scr_regex_oom();
+  int length = 0;
+  for (size_t offset = from; offset < to;) {
+    size_t step;
+    input[length++] = scr_case_decode(data + offset, &step);
+    offset += step;
+  }
+  uint32_t *output = NULL;
+  int count = scr_unicode_normalize(&output, input, length, mode);
+  if (input != local) free(input);
+  if (count < 0) scr_regex_oom();
+  for (int i = 0; i < count; i++) scr_case_put_cp(b, output[i]);
+  free(output);
+}
+
 ScrStr *scr_str_normalize(const ScrStr *s, const ScrStr *form) {
   UnicodeNormalizationEnum mode;
   if (form->len == 3 && !memcmp(form->data, "NFC", 3)) mode = UNICODE_NFC;
@@ -2483,23 +2623,58 @@ ScrStr *scr_str_normalize(const ScrStr *s, const ScrStr *form) {
   /* Every ASCII string is already normalized in all four forms. Validate
    * the form first: even an empty subject must reject an invalid form. */
   if (scr_text_ascii(s)) return scr_str_retain((ScrStr *)s);
-  if (s->len > INT32_MAX / sizeof(uint32_t)) scr_regex_oom();
-  uint32_t *input = malloc((s->len + 1) * sizeof(uint32_t));
-  if (!input) scr_regex_oom();
-  int length = 0;
+  bool inert = true;
   for (size_t offset = 0; offset < s->len;) {
+    if ((unsigned char)s->data[offset] < 0x80) {
+      offset++;
+      continue;
+    }
     size_t step;
-    input[length++] = scr_case_decode(s->data + offset, &step);
+    uint32_t c = scr_case_decode(s->data + offset, &step);
     offset += step;
+    if (!(scr_nqc_class(c, mode) & 1)) {
+      inert = false;
+      break;
+    }
   }
-  uint32_t *output = NULL;
-  int count = scr_unicode_normalize(&output, input, length, mode);
-  free(input);
-  if (count < 0) scr_regex_oom();
+  if (inert) return scr_str_retain((ScrStr *)s);
+  if (s->len > INT32_MAX / sizeof(uint32_t)) scr_regex_oom();
+  /* An inert code point bounds reordering and composition, and so does any
+   * other starter (class 0, never a composition's second element), so the
+   * text normalizes segment by segment. A segment starts at a starter: runs
+   * of inert code points copy as they are, and a segment with any other
+   * code point goes through scr_unicode_normalize. */
   ScrJsonBuf buffer;
   scr_jb_init(&buffer);
-  for (int i = 0; i < count; i++) scr_case_put_cp(&buffer, output[i]);
-  free(output);
+  size_t seg = 0, last_inert = 0;
+  bool plain = true;
+  for (size_t offset = 0; offset < s->len;) {
+    unsigned char lead = (unsigned char)s->data[offset];
+    size_t step = 1;
+    unsigned kind = 3;
+    if (lead >= 0x80) kind = scr_nqc_class(scr_case_decode(s->data + offset, &step), mode);
+    if (kind & 1) {
+      if (!plain) {
+        scr_nqc_segment(&buffer, s->data, seg, offset, mode);
+        seg = offset;
+        plain = true;
+      }
+      last_inert = offset;
+    } else if (kind & 2) {
+      if (plain) scr_jb_write(&buffer, s->data + seg, offset - seg);
+      else scr_nqc_segment(&buffer, s->data, seg, offset, mode);
+      seg = offset;
+      plain = false;
+    } else if (plain) {
+      size_t start = last_inert > seg ? last_inert : seg;
+      scr_jb_write(&buffer, s->data + seg, start - seg);
+      seg = start;
+      plain = false;
+    }
+    offset += step;
+  }
+  if (plain) scr_jb_write(&buffer, s->data + seg, s->len - seg);
+  else scr_nqc_segment(&buffer, s->data, seg, s->len, mode);
   return scr_jb_finish(&buffer);
 }
 

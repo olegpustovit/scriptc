@@ -1,6 +1,8 @@
 /* Both LLVM optimization modes must compile every corpus program and match
  * Node's stdout, successful stderr, and expected exit status. Any backend
- * refusal is a failure. SCRIPTC_SAN=1 instruments emitted code and runtime. */
+ * refusal is a failure. SCRIPTC_SAN=1 instruments emitted code and runtime.
+ * SCRIPTC_CPU_DISPATCH=1 builds with runtime CPU dispatch and runs each
+ * executable at SCRIPTC_CPU_LEVEL=0 and 3, the baseline and x86-64-v3 copies. */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { globSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -31,6 +33,8 @@ const files = corpusSelect(
   process.env["SCRIPTC_SAN"] === "1",
 );
 const sanitize = process.env["SCRIPTC_SAN"] === "1";
+const cpuDispatch = process.env["SCRIPTC_CPU_DISPATCH"] === "1";
+const cpuLevels: readonly (string | undefined)[] = cpuDispatch ? ["0", "3"] : [undefined];
 const requestedMode = process.env["SCRIPTC_LLVM_TEST_MODE"];
 if (requestedMode !== undefined && requestedMode !== "release" && requestedMode !== "dev") {
   throw new Error("SCRIPTC_LLVM_TEST_MODE must be release or dev when set");
@@ -64,7 +68,7 @@ function expectedExitCode(file: string): number {
 }
 
 /** `env` adds variables to the inherited environment (the oracle's
- * `// @define` variables). */
+ * `// @define` variables, the executable's SCRIPTC_CPU_LEVEL). */
 async function runBinary(
   cmd: string,
   args: string[],
@@ -190,6 +194,7 @@ async function build(file: string, optimization: "release" | "dev") {
   const key = hash
     .update(sanitize ? "san" : "plain")
     .update("llvm-" + optimization)
+    .update(cpuDispatch ? "cpu-dispatch" : "")
     .digest("hex")
     .slice(0, 16);
   const outDir = join(cacheDir, key);
@@ -199,11 +204,12 @@ async function build(file: string, optimization: "release" | "dev") {
     outDir,
     sanitize,
     optimization,
+    ...(cpuDispatch ? { cpuDispatch } : {}),
     ...(defines ? { define: defines.define } : {}),
   });
 }
 
-describe(`llvm differential corpus (${files.length} programs, ${optimizationModes.join("+")}${sanitize ? ", sanitized" : ""}${shardSuffix()})`, () => {
+describe(`llvm differential corpus (${files.length} programs, ${optimizationModes.join("+")}${sanitize ? ", sanitized" : ""}${cpuDispatch ? ", CPU dispatch" : ""}${shardSuffix()})`, () => {
   test.for(files.map((f) => [f.slice(corpusDir.length + 1), f] as const))(
     "%s",
     async ([rel, file]) => {
@@ -223,11 +229,18 @@ describe(`llvm differential corpus (${files.length} programs, ${optimizationMode
           );
         expect(result.backend).toBe("llvm");
         expect(result.llvmPath.endsWith(".ll")).toBe(true);
-        const actual = await runBinary(result.binaryPath, []);
-        expect(actual.stdout, `${optimization} stdout`).toEqual(oracle.stdout);
-        if (expectedExit === 0)
-          expect(comparableStderr(actual.stderr), `${optimization} stderr`).toEqual(oracle.stderr);
-        expect(actual.exitCode, `${optimization} exit status`).toBe(expectedExit);
+        for (const level of cpuLevels) {
+          const actual = await runBinary(
+            result.binaryPath,
+            [],
+            level === undefined ? undefined : { SCRIPTC_CPU_LEVEL: level },
+          );
+          const lane = level === undefined ? optimization : `${optimization} level ${level}`;
+          expect(actual.stdout, `${lane} stdout`).toEqual(oracle.stdout);
+          if (expectedExit === 0)
+            expect(comparableStderr(actual.stderr), `${lane} stderr`).toEqual(oracle.stderr);
+          expect(actual.exitCode, `${lane} exit status`).toBe(expectedExit);
+        }
       }
     },
   );

@@ -21,7 +21,7 @@ import type {
   CompileRequestResult,
 } from "../compile-types.js";
 import { LlvmUnsupportedError } from "../backend/llvm/emitter.js";
-import { executableLinkInputs } from "../backend/link-plan-core.js";
+import { executableLinkInputs, systemLibraryLinkerArgs } from "../backend/link-plan-core.js";
 import { formatNativeLinkInfo } from "../backend/native-link-info-core.js";
 import {
   emitNativeObject,
@@ -527,7 +527,7 @@ export class NativeCompiler {
           ...lld,
           ...plan.driverFlags,
           ...plan.inputs,
-          ...plan.systemLibraries.map((name) => `-l${name}`),
+          ...systemLibraryLinkerArgs(target, plan.systemLibraries),
           "-o",
           stagedOutput,
         ];
