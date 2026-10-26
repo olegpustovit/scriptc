@@ -62,11 +62,11 @@ test("splits generated LLVM functions and promotes only private cross-shard defi
   expect(actual!.publicSymbols).toEqual(["public_value", "public_entry"]);
   expect(actual!.shards[0]!.name).toBe("program-globals.ll");
   expect(actual!.shards[0]!.source()).toContain("@hidden_value = hidden global i64 7");
-  expect(
-    actual!.shards
-      .slice(1)
-      .every((shard) => shard.source().includes("@hidden_value = external hidden global i64")),
-  ).toBe(true);
+  // Shards declare only what they reference: `left` loads @hidden_value.
+  const leftShard = actual!.shards.find((shard) =>
+    shard.source().includes("define hidden i64 @left() #0"),
+  )!;
+  expect(leftShard.source()).toContain("@hidden_value = external hidden global i64");
   expect(
     actual!.shards.some(
       (shard) =>
@@ -83,9 +83,11 @@ test("thread-local definitions and declarations preserve their storage model acr
   );
   const split = splitLlvmProgram(tls, { minimumBytes: 0, targetBytes: 64 * 1024 })!;
   expect(split.shards[0]!.source()).toContain("@hidden_value = hidden thread_local global i64 7");
-  for (const shard of split.shards.slice(1)) {
-    expect(shard.source()).toContain("@hidden_value = external hidden thread_local global i64");
-  }
+  expect(
+    split.shards.some((shard) =>
+      shard.source().includes("@hidden_value = external hidden thread_local global i64"),
+    ),
+  ).toBe(true);
 });
 
 const PADDING = Array.from(
@@ -95,13 +97,22 @@ const PADDING = Array.from(
 ).join("\n");
 
 /** SAMPLE with more globals after @public_value and enough functions to
- * split into several shards. */
-function withGlobals(globals: string, tail = ""): string {
+ * split into several shards. `use` names a global some function references
+ * (a shard declares only what it references). */
+function withGlobals(globals: string, tail = "", use = ""): string {
+  const user =
+    use === ""
+      ? ""
+      : `define internal i64 @user() #0 {\nentry:\n  %p = ptrtoint ptr @${use} to i64\n  ret i64 %p\n}\n`;
   return `${SAMPLE.replace(
     "@public_value = constant i64 11",
     `@public_value = constant i64 11\n${globals}`,
-  ).replace("define i64 @public_entry", `${PADDING}\ndefine i64 @public_entry`)}${tail}`;
+  ).replace("define i64 @public_entry", `${PADDING}\n${user}\ndefine i64 @public_entry`)}${tail}`;
 }
+
+/** Whether some function shard contains `text`. */
+const declared = (functions: readonly { source: () => string }[], text: string): boolean =>
+  functions.some((shard) => shard.source().includes(text));
 
 /** Writes each shard and compiles it with clang. */
 async function compileShards(
@@ -118,14 +129,13 @@ async function compileShards(
 
 test("private unnamed_addr lookup tables are promoted like internal globals", async () => {
   const split = splitLlvmProgram(
-    withGlobals('@table = private unnamed_addr constant [2 x i8] c"\\01\\02"'),
+    withGlobals('@table = private unnamed_addr constant [2 x i8] c"\\01\\02"', "", "table"),
     { minimumBytes: 0, targetBytes: 64 * 1024 },
   )!;
   expect(split).not.toBeNull();
   const [globals, ...functions] = split.shards;
   expect(globals!.source()).toContain('@table = hidden unnamed_addr constant [2 x i8] c"\\01\\02"');
-  for (const shard of functions)
-    expect(shard.source()).toContain("@table = external hidden constant [2 x i8]");
+  expect(declared(functions, "@table = external hidden constant [2 x i8]")).toBe(true);
   expect(split.promotedSymbols).toContain("table");
   await compileShards(split.shards);
 });
@@ -133,11 +143,15 @@ test("private unnamed_addr lookup tables are promoted like internal globals", as
 test("aggregate initializers over several lines stay whole in the globals shard", async () => {
   // The regex global's comment holds unbalanced brackets.
   const split = splitLlvmProgram(
-    withGlobals(`@regex = internal global { ptr, i64 } { ptr @left, i64 0 } ; /(a|[b/
+    withGlobals(
+      `@regex = internal global { ptr, i64 } { ptr @left, i64 0 } ; /(a|[b/
 @vt = internal constant [2 x { i64, ptr }] [
   { i64, ptr } { i64 1, ptr @left },
   { i64, ptr } { i64 2, ptr @right }
-]`),
+]`,
+      "",
+      "vt",
+    ),
     { minimumBytes: 0, targetBytes: 64 * 1024 },
   )!;
   expect(split).not.toBeNull();
@@ -145,24 +159,21 @@ test("aggregate initializers over several lines stay whole in the globals shard"
   expect(globals!.source()).toContain(
     "@vt = hidden constant [2 x { i64, ptr }] [\n  { i64, ptr } { i64 1, ptr @left },\n  { i64, ptr } { i64 2, ptr @right }\n]",
   );
-  for (const shard of functions) {
-    expect(shard.source()).toContain("@vt = external hidden constant [2 x { i64, ptr }]");
-    expect(shard.source()).not.toContain("{ i64, ptr } { i64 1");
-  }
+  expect(declared(functions, "@vt = external hidden constant [2 x { i64, ptr }]")).toBe(true);
+  for (const shard of functions) expect(shard.source()).not.toContain("{ i64, ptr } { i64 1");
   expect(split.promotedSymbols).toEqual(expect.arrayContaining(["regex", "vt"]));
   await compileShards(split.shards);
 });
 
 test("globals after the attributes and metadata join the globals shard", async () => {
-  const split = splitLlvmProgram(withGlobals("", "@flag = internal constant i1 true\n"), {
+  const split = splitLlvmProgram(withGlobals("", "@flag = internal constant i1 true\n", "flag"), {
     minimumBytes: 0,
     targetBytes: 64 * 1024,
   })!;
   expect(split).not.toBeNull();
   const [globals, ...functions] = split.shards;
   expect(globals!.source()).toContain("@flag = hidden constant i1 true");
-  for (const shard of functions)
-    expect(shard.source()).toContain("@flag = external hidden constant i1");
+  expect(declared(functions, "@flag = external hidden constant i1")).toBe(true);
   await compileShards(split.shards);
 });
 
@@ -283,9 +294,11 @@ test("shared metadata bounds shard growth while preserving every definition", ()
   expect(definitions.sort()).toEqual([...names, "left", "right", "public_entry"].sort());
   expect(split!.publicSymbols).toEqual(["public_value", "public_entry"]);
 
-  // A metadata-heavy module with little code cannot repay duplication.
+  // Metadata no shard references is not duplicated into any of them.
   const shared = SAMPLE + `!0 = !{!"${"x".repeat(2 * 1024 * 1024)}"}\n`;
-  expect(splitLlvmProgram(shared, { minimumBytes: 0 })).toBeNull();
+  const unshared = splitLlvmProgram(shared, { minimumBytes: 0 });
+  expect(unshared).not.toBeNull();
+  for (const shard of unshared!.shards) expect(shard.source()).not.toContain("xxxx");
 });
 
 test("debug metadata stays on definitions when splitting LLVM modules", async () => {
@@ -321,6 +334,60 @@ test("debug metadata stays on definitions when splitting LLVM modules", async ()
     });
     expect(result.status, result.stderr).toBe(0);
     expect(result.stderr).toBe("");
+  }
+});
+
+test("shards carry only their own debug metadata, numbered independently of the rest of the program", async () => {
+  // One DISubprogram + DILocation per function, all in one compile unit.
+  const program = (names: readonly string[], lineOf: (name: string) => number) => {
+    const funcs = names.map(
+      (name, i) =>
+        `define internal i64 @${name}() #0 !dbg !${4 + 2 * i} {\nentry:\n  ; ${"x".repeat(2048)}\n  ret i64 0, !dbg !${5 + 2 * i}\n}\n`,
+    );
+    const nodes = names.flatMap((name, i) => [
+      `!${4 + 2 * i} = distinct !DISubprogram(name: "${name}", scope: !0, file: !0, line: ${lineOf(name)}, type: !1, scopeLine: ${lineOf(name)}, spFlags: DISPFlagLocalToUnit | DISPFlagDefinition, unit: !2)`,
+      `!${5 + 2 * i} = !DILocation(line: ${lineOf(name)}, column: 1, scope: !${4 + 2 * i})`,
+    ]);
+    return [
+      "declare void @runtime(ptr)\n",
+      ...funcs,
+      "attributes #0 = { noinline }",
+      "!llvm.dbg.cu = !{!2}",
+      "!llvm.module.flags = !{!3}",
+      '!0 = !DIFile(filename: "a.ts", directory: "/src")',
+      "!1 = !DISubroutineType(types: !{})",
+      '!2 = distinct !DICompileUnit(language: DW_LANG_C11, file: !0, producer: "scriptc", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug)',
+      '!3 = !{i32 2, !"Debug Info Version", i32 3}',
+      ...nodes,
+      "",
+    ].join("\n");
+  };
+  const names = Array.from({ length: 80 }, (_, i) => `pad_${i}`);
+  const options = { minimumBytes: 0, targetBytes: 64 * 1024 };
+  const before = splitLlvmProgram(
+    program(names, () => 1),
+    options,
+  )!;
+  // Edit one function and add another: every later metadata id shifts in the
+  // canonical module, but only the shards owning those functions may change.
+  const after = splitLlvmProgram(
+    program(["added", ...names], (name) => (name === "pad_7" ? 2 : 1)),
+    options,
+  )!;
+  const was = new Map(before.shards.map((shard) => [shard.name, shard.source()]));
+  const changed = after.shards.filter((shard) => was.get(shard.name) !== shard.source());
+  expect(changed.length).toBeGreaterThan(0);
+  expect(changed.length).toBeLessThanOrEqual(2);
+  const dir = await mkdtemp(join(tmpdir(), "scriptc-md-split-"));
+  scratch.push(dir);
+  for (const shard of after.shards) {
+    expect(shard.source()).not.toMatch(/!\d{3,}/); // dense: nothing close to the canonical ids
+    const path = join(dir, shard.name);
+    await writeFile(path, shard.source());
+    const result = spawnSync("clang", ["-Wno-override-module", "-c", path, "-o", `${path}.o`], {
+      encoding: "utf8",
+    });
+    expect(result.status, result.stderr).toBe(0);
   }
 });
 
