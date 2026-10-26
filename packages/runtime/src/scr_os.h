@@ -23,6 +23,9 @@ ScrStr *scr_os_hostname(void);
 ScrStr *scr_os_endianness(void);
 double scr_os_freemem(void);
 double scr_os_uptime(void);
+/* util.convertProcessSignalToExitCode: 128 plus the signal number, or NaN
+ * with ERR_INVALID_ARG_VALUE pending (scr_os.c). */
+double scr_util_signal_exit_code(const struct ScrDyn *code);
 ScrArr *scr_os_loadavg(void);
 /* os.getPriority(pid): validateInt32, then the scheduling priority;
  * failures throw Node's RangeError or SystemError (ERR_SYSTEM_ERROR). */

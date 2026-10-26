@@ -40,6 +40,12 @@ export class ProgramAnalysis {
     SourceFile,
     ReadonlyMap<VariableDeclaration, CallExpression>
   >();
+  /** Per file: its identifiers by text, each with its position in the
+   * file's preorder walk (fileIdentifiers). */
+  readonly fileIdentifiers = new Map<
+    SourceFile,
+    ReadonlyMap<string, readonly { order: number; node: Identifier }[]>
+  >();
 
   clear(): void {
     this.createRequireReasons.clear();
@@ -53,5 +59,6 @@ export class ProgramAnalysis {
     this.requireEarlyReferences.clear();
     this.requireFirstRunnable.clear();
     this.splitRequireBindings.clear();
+    this.fileIdentifiers.clear();
   }
 }

@@ -45,6 +45,11 @@ export interface CompileBaseOptions {
    * Unset or `baseline`, the code runs on any x86-64 CPU. x86-64 targets
    * only; the runtime pack keeps its baseline code. */
   targetCpu?: TargetCpu;
+  /** Give the executable an x86-64-v3 copy of each program function, which
+   * it runs instead of the baseline code on CPUs that support that level
+   * (`SCRIPTC_CPU_LEVEL` caps the level at run time). Executables for x86-64
+   * targets without a `targetCpu` only; off by default. */
+  cpuDispatch?: boolean;
   /** Instrument the executable for profile-guided optimization. Each run
    * writes a raw profile to this path pattern (`%p` expands to the process
    * id; `LLVM_PROFILE_FILE` overrides the pattern at run time). Linux

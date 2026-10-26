@@ -523,27 +523,45 @@ static void short_string_asserts(void) {
 }
 
 /* A loop's publish converts a non-ASCII receiver before any read, while a
- * lone read still walks bytes. ASCII receivers publish nothing. */
+ * lone read still walks bytes. ASCII receivers publish nothing. A loop
+ * that can read fewer than one unit per 16 bytes counts as one read. */
 static void scan_units_asserts(void) {
   ScrStr *s = scr_str_new("a\xC3\xA9\xF0\x9F\x98\x80" "b", 8); /* a é 😀 b */
   static const double codes[] = {97, 233, 0xD83D, 0xDE00, 98};
   if (scr_str_char_code_at(s, 0) != 97 || scr_str_scan.s == s) failed++;
-  scr_str_scan_units(s);
+  scr_str_scan_units_for(s, NAN, NAN);
   if (scr_str_scan.s != s || scr_str_scan.n != 5) failed++;
   for (size_t i = 0; i < 5; i++)
     if (scr_str_scan.n == 5 && (scr_str_scan.units[i] != codes[i] ||
                                 scr_str_char_code_at(s, (double)i) != codes[i])) failed++;
   if (!isnan(scr_str_char_code_at(s, 5))) failed++;
-  scr_str_scan_units(s); /* republishing keeps the same units */
+  scr_str_scan_units_for(s, NAN, NAN); /* republishing keeps the same units */
   const uint16_t *units = scr_str_scan.units;
-  scr_str_scan_units(s);
+  scr_str_scan_units_for(s, 0, 1);
   if (scr_str_scan.s != s || scr_str_scan.units != units) failed++;
   ScrStr *ascii = scr_str_new("plain", 5);
-  scr_str_scan_units(ascii);
+  scr_str_scan_units_for(ascii, NAN, NAN);
   if (scr_str_scan.s != s) failed++;
   scr_str_release(ascii);
   scr_str_release(s);
   if (scr_str_scan.s != NULL) failed++;
+  /* 200 units in 400 bytes: a loop over 25 indexes converts at once. */
+  char text[400];
+  for (size_t i = 0; i < sizeof text; i += 2) memcpy(text + i, "\xC3\xA9", 2);
+  ScrStr *wide = scr_str_new(text, sizeof text);
+  scr_str_scan_units_for(wide, 175, 200);
+  if (scr_str_scan.s != wide || scr_str_scan.n != 200 || scr_str_scan.units[199] != 233) failed++;
+  scr_str_release(wide);
+  /* A loop over 24 does not; each such loop counts as one read, so the
+   * 32nd converts (32 reads, one per 12.5 bytes). */
+  ScrStr *line = scr_str_new(text, sizeof text);
+  scr_str_scan_units_for(line, 24, 0);
+  if (scr_str_scan.s == line) failed++;
+  for (int i = 1; i < 31; i++) scr_str_scan_units_for(line, i, i + 1);
+  if (scr_str_scan.s == line) failed++;
+  scr_str_scan_units_for(line, 31, 32);
+  if (scr_str_scan.s != line || scr_str_scan.n != 200) failed++;
+  scr_str_release(line);
   total++;
 }
 #ifdef SCR_SIDX_TEST

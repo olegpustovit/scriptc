@@ -216,8 +216,9 @@ export interface RegionHooks {
   classDefinitions(cls: IrClassDef, sizeOf: string): string[];
 }
 
-/** Every emitted function/helper carries #0 = { sanitize_address } — see
- * the emitter header. */
+/** Every emitted function/helper carries attribute group #0: the build's
+ * target CPU level, and `sanitize_address` in sanitized builds (see
+ * emit-module.ts functionAttributes). */
 export const FN_ATTRS = "#0";
 
 export { computeTraced } from "../cycle-analysis.js";
@@ -312,19 +313,46 @@ function shapeUnionRc(host: ShapeHost, union: ShapeUnion): { retain: string; rel
   };
 }
 
+/** The widest span of shape numbers a union's arms may cover for its tag
+ * helper to switch on the shape word (emitShapeUnionHelpers). */
+const SHAPE_TAG_SWITCH_SPAN = 32;
+
 /** The tag, release and trace helpers of every shape union
  * (nullable-unions.ts). The tag helper maps a value to its arm: NULL and
  * the null sentinel are the unit arms, anything else a tagged record whose
- * shape word names its arm (the switch folds to a lookup table). */
+ * shape word names its arm.
+ * - Arms within SHAPE_TAG_SWITCH_SPAN shape numbers: the helper switches on
+ *   the shape word. Inlined, the switch folds into the caller's branch on
+ *   the arm, one indirect jump with a jump table of at most that many
+ *   entries per site.
+ * - Wider unions: the shape word indexes the union's arm table, one entry
+ *   per shape number from the arms' lowest to highest, and callers branch
+ *   on the small arm tag. Folded switches would give every site of such a
+ *   union a jump table spanning all of its arms' shape numbers. */
 export function emitShapeUnionHelpers(host: ShapeHost): string[] {
   const out: string[] = [];
   const S = host.sizeType;
   for (const union of host.nullableUnions.allShapeUnions()) {
     const header = shapeWordHeader(S);
     const tagFn = shapeTagFn(union.unionId);
-    const cases = union.arms
-      .map((arm) => `i32 ${host.nullableUnions.shapeNumber(arm.shapeId)}, label %a${arm.tag}`)
-      .join(" ");
+    const numbers = union.arms.map((arm) => host.nullableUnions.shapeNumber(arm.shapeId));
+    const lo = Math.min(...numbers);
+    const span = Math.max(...numbers) - lo + 1;
+    const byTable = span > SHAPE_TAG_SWITCH_SPAN;
+    // Entries are bytes, or 16-bit words for a union of 255 arms or more.
+    // A shape number that names no arm maps to the all-ones entry, which is
+    // above every arm tag, so callers take their path for no arm as they do
+    // for the -1 of a shape number outside the table.
+    const wide = union.arms.some((arm) => arm.tag >= 255);
+    const entry = wide ? "i16" : "i8";
+    const none = wide ? 65535 : 255;
+    const table = new Array<number>(span).fill(none);
+    union.arms.forEach((arm, i) => (table[numbers[i]! - lo] = arm.tag));
+    const tableName = tagFn.replace("@sc_stag.", "@sc_stagtab.");
+    if (byTable)
+      out.push(
+        `${tableName} = private unnamed_addr constant [${span} x ${entry}] [${table.map((t) => `${entry} ${t}`).join(", ")}]`,
+      );
     out.push(
       `define internal i32 ${tagFn}(ptr %u) alwaysinline ${FN_ATTRS} { ; shape union tag`,
       `entry:`,
@@ -342,16 +370,35 @@ export function emitShapeUnionHelpers(host: ShapeHost): string[] {
         `  ret i32 ${union.nullTag}`,
         `rec:`,
       );
-    out.push(
-      `  %wp = getelementptr inbounds ${header}, ptr %u, i32 0, i32 ${SHAPE_WORD_INDEX}`,
-      `  %w = load i32, ptr %wp`,
-      `  switch i32 %w, label %bad [ ${cases} ]`,
-      ...union.arms.flatMap((arm) => [`a${arm.tag}:`, `  ret i32 ${arm.tag}`]),
-      `bad:`,
-      `  ret i32 -1`,
-      `}`,
-      ``,
-    );
+    const cases = union.arms.map((arm, i) => `i32 ${numbers[i]}, label %a${arm.tag}`).join(" ");
+    if (!byTable)
+      out.push(
+        `  %wp = getelementptr inbounds ${header}, ptr %u, i32 0, i32 ${SHAPE_WORD_INDEX}`,
+        `  %w = load i32, ptr %wp`,
+        `  switch i32 %w, label %bad [ ${cases} ]`,
+        ...union.arms.flatMap((arm) => [`a${arm.tag}:`, `  ret i32 ${arm.tag}`]),
+        `bad:`,
+        `  ret i32 -1`,
+        `}`,
+        ``,
+      );
+    else
+      out.push(
+        `  %wp = getelementptr inbounds ${header}, ptr %u, i32 0, i32 ${SHAPE_WORD_INDEX}`,
+        `  %w = load i32, ptr %wp`,
+        `  %i = sub i32 %w, ${lo}`,
+        `  %inrange = icmp ult i32 %i, ${span}`,
+        `  br i1 %inrange, label %look, label %bad`,
+        `look:`,
+        `  %tp = getelementptr inbounds [${span} x ${entry}], ptr ${tableName}, i32 0, i32 %i`,
+        `  %t8 = load ${entry}, ptr %tp`,
+        `  %tag = zext ${entry} %t8 to i32`,
+        `  ret i32 %tag`,
+        `bad:`,
+        `  ret i32 -1`,
+        `}`,
+        ``,
+      );
     // Release and trace: one definition for the unions over the same
     // record arms (helperOwner). Unit encodings are NULL or the immortal
     // null sentinel; the shape word picks the arm.
@@ -589,9 +636,10 @@ interface InlineRcFamily {
  * repeats its own checks, so the fast path never duplicates it.
  *
  * The dyn release buffers a surviving value by kind (scr_dyn_release):
- * the fast path decides the always and never cases and calls
- * scr_dyn_release_survivor for kinds whose candidacy is per value,
- * including arrays and objects of intact documents (ScrDynRegion).
+ * the fast path skips scalars and values already in a candidate buffer or
+ * never candidates, and calls scr_dyn_release_survivor for the rest, which
+ * decides per value (intact documents, ScrDynRegion; capsules and handles
+ * without edges).
  *
  * The array release inlines the decrement of an array that stays alive
  * and is not headered (`a->cyc`): those are most array releases in
@@ -698,9 +746,10 @@ function requestRcHelper(host: ShapeHost, family: string, op: RcOp): string {
   for (const decl of rcHelperDecls(family, op)) host.declare(decl);
   // Its body is written last (emitInlineRcHelpers), after the requests are
   // collected: a release that can buffer a candidate requests the append
-  // helper now. The jsval row (JS_RC_ROW) has no collector header; its
-  // cells release through dyn's helper, which makes its own request.
-  if (op === "release" && row.cycle === "always") requestCycleAppend(host);
+  // helper now. The dyn release buffers through scr_dyn_release_survivor
+  // instead. The jsval row (JS_RC_ROW) has no collector header; its cells
+  // release through dyn's helper.
+  if (op === "release" && row.cycle === "always" && family !== "dyn") requestCycleAppend(host);
   return `@${inlineRcName(family, op)}`;
 }
 
@@ -820,8 +869,11 @@ function rcHelperDecls(family: string, op: RcOp): string[] {
   if (op === "retain" || row.release === null) return [];
   return [
     `declare void @${row.release}(ptr)`,
-    ...(row.cycle === "always" ? [`declare void @scr_cyc_on_release(ptr)`] : []),
-    ...(family === "dyn" ? [`declare void @scr_dyn_release_survivor(ptr)`] : []),
+    ...(family === "dyn"
+      ? [`declare void @scr_dyn_release_survivor(ptr)`]
+      : row.cycle === "always"
+        ? [`declare void @scr_cyc_on_release(ptr)`]
+        : []),
   ];
 }
 
@@ -931,21 +983,21 @@ function releaseHelper(host: ShapeHost, family: string, row: InlineRcFamily): st
             // scr_dyn_release buffers a surviving value by kind: always for
             // functions and proxies, per value for arrays and objects (not
             // while their document is intact, ScrDynRegion), capsules and
-            // handles (scr_dyn_release_survivor), never for scalars. An
-            // array or object already in a candidate buffer stays inline.
+            // handles, never for scalars. Every kind that can be buffered
+            // takes one path, which keeps each inlined site small: a value
+            // already in a candidate buffer (or never one) stays inline, and
+            // scr_dyn_release_survivor decides the rest.
             `  %kp = getelementptr i8, ptr %o, ${S} ${S === "i64" ? 8 : 4} ; ScrDyn.kind`,
             `  %kind = load i32, ptr %kp`,
-            // SCR_DYN_ARR 4, OBJ 5, FUNC 8, PROXY 13; HANDLE 9, TYPED_REF 12.
-            `  switch i32 %kind, label %done [ i32 4, label %container i32 5, label %container i32 8, label %root i32 13, label %root i32 9, label %survivor i32 12, label %survivor ]`,
-            `container:`,
+            // SCR_DYN_ARR 4, OBJ 5, FUNC 8, HANDLE 9, TYPED_REF 12, PROXY 13.
+            `  switch i32 %kind, label %done [ i32 4, label %candidate i32 5, label %candidate i32 8, label %candidate i32 9, label %candidate i32 12, label %candidate i32 13, label %candidate ]`,
+            `candidate:`,
             `  %cbufp = getelementptr i8, ptr %o, ${S} -${host.cycleBufOffset}`,
             `  %cbuf = load i32, ptr %cbufp`,
             `  %cqueued = icmp slt i32 %cbuf, 0`,
             `  br i1 %cqueued, label %done, label %survivor`,
             `survivor:`,
             `  call void @scr_dyn_release_survivor(ptr %o)`,
-            `  br label %done`,
-            `root:`,
           ]
         : family === "box"
           ? [
@@ -964,7 +1016,9 @@ function releaseHelper(host: ShapeHost, family: string, row: InlineRcFamily): st
               `root:`,
             ]
           : []),
-    ...(cycle === "always" ? cycleRootLines(host, "done") : [`  br label %done`]),
+    ...(cycle === "always" && family !== "dyn"
+      ? cycleRootLines(host, "done")
+      : [`  br label %done`]),
     `done:`,
     `  ret void`,
     `}`,

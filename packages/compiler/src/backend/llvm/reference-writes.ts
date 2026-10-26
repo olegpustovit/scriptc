@@ -92,6 +92,8 @@ const INERT_LIB_PREFIXES = [
 ];
 const INERT_LIB_CALLS = new Set([
   "dyn.compare",
+  // Reads the ambient receiver (a fresh reference to the bound value).
+  "dyn.this",
   "error.new",
   "error.nodeThrow",
   "dyn.typedRefIs",
@@ -107,6 +109,7 @@ const INERT_LIB_CALLS = new Set([
   "regex.groupParseInt",
   "regex.resultProp",
   "array.namedKeys",
+  "array.foreign",
   "array.hasNamedKey",
   "array.hasProperties",
   "process.cwd",
@@ -922,6 +925,17 @@ export class ReferenceWrites {
         case "arrayGet":
           out.push(ARRAY_KEY);
           return this.expr(node.index) === null && walk(node.arr);
+        case "recordKeyGet":
+          // Any declared field or overflow entry the key may name.
+          out.push(ANY_RECORD_KEY);
+          for (const f of this.records.get(node.shapeId)?.fields ?? []) out.push(`r:${f.name}`);
+          return this.expr(node.key) === null && walk(node.obj);
+        case "mapIntrinsic":
+          // A typed Map.get: any entry of any map.
+          if (node.method !== "get" || node.args.length !== 1 || !borrowsMapReadInputs(node))
+            return false;
+          out.push(MAP_KEY);
+          return this.expr(node.args[0]!) === null && walk(node.receiver);
         case "unionNarrow":
         case "upcast":
         case "downcast":

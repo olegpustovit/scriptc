@@ -50,7 +50,7 @@ console.log(sum);
   expect(definition(llvm, "sc_f_range")).not.toContain("@scr_coro_yield_f64(");
   expect(llvm).not.toContain("@scr_gen_take_out_f64(");
   expect(llvm).toContain("%ScrGenHead = type { i64, ptr, ptr, i32, %ScrGenSlot }");
-  expect(llvm).toContain("attributes #1 = { sanitize_address presplitcoroutine }");
+  expect(llvm).toContain("attributes #1 = { presplitcoroutine }");
   expect(definition(llvm, "sc_gs_range")).toContain("call ptr @scr_gen_new_stackless(");
   expect(llvm).not.toContain("@scr_gen_yield_f64(");
 });

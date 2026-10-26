@@ -107,7 +107,8 @@ export function resolveSelfCaptures(mod: IrModule): IrModule {
         if (creator.captures?.some((c) => c.localId === source)) return false;
         if (creator.classCaptures?.some((c) => c.localId === source)) return false;
         if (declarations.get(owner)!.get(source) !== 1) return false;
-        flow ??= new CaptureFlow(mod.functions);
+        // Only unchanged() is asked: the flow reads just the bodies it needs.
+        flow ??= new CaptureFlow(mod.functions, false);
         return flow.unchanged(owner, source, definition.writes);
       });
       if (qualifies) {

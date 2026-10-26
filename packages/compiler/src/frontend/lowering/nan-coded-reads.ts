@@ -249,6 +249,10 @@ export class NanCodedReads {
   private readonly returns = new Map<ts.Symbol, ReturnSlot>();
   /** Identifiers by text across the analyzed files. */
   private readonly names = new Map<string, ts.Identifier[]>();
+  /** The identifiers of each name, grouped by the symbol they resolve to
+   * (referencesOf), once `names` is complete. */
+  private readonly references = new Map<string, Map<ts.Symbol, ts.Identifier[]>>();
+  private named = false;
   private readonly symbolCache = new Map<ts.Node, ts.Symbol | null>();
   private readonly pneCache = new Map<ts.Node, ValueInfo | null>();
   private readonly pneReturnCache = new Map<ts.Symbol, ValueInfo | null>();
@@ -326,6 +330,7 @@ export class NanCodedReads {
         }
       });
     }
+    this.named = true;
     // A proven-present read is a plain number; only the rest may be
     // undefined. The proof needs every reference, so it runs after the walk.
     for (const [read, elem] of candidates)
@@ -879,8 +884,8 @@ export class NanCodedReads {
         else if (!decl.initializer) slot.sources.push(null);
       }
     } else return null;
-    for (const id of this.names.get(nameNode.text) ?? []) {
-      if (id === nameNode || this.symbolOf(id) !== symbol) continue;
+    for (const id of this.referencesOf(symbol, nameNode.text)) {
+      if (id === nameNode) continue;
       const write = this.writeOf(id);
       if (write !== "read") slot.reassigned = true;
       if (write === "read") slot.uses.push(id);
@@ -893,6 +898,26 @@ export class NanCodedReads {
     }
     for (const use of slot.uses) this.useNodes.add(use);
     return slot;
+  }
+
+  /** The identifiers named `text` that resolve to `symbol`, in walk order.
+   * Each name's identifiers are resolved once, not once per binding. */
+  private referencesOf(symbol: ts.Symbol, text: string): readonly ts.Identifier[] {
+    const ids = this.names.get(text) ?? [];
+    if (!this.named) return ids.filter((id) => this.symbolOf(id) === symbol);
+    let bySymbol = this.references.get(text);
+    if (bySymbol === undefined) {
+      bySymbol = new Map();
+      for (const id of ids) {
+        const resolved = this.symbolOf(id);
+        if (resolved === null) continue;
+        const list = bySymbol.get(resolved);
+        if (list === undefined) bySymbol.set(resolved, [id]);
+        else list.push(id);
+      }
+      this.references.set(text, bySymbol);
+    }
+    return bySymbol.get(symbol) ?? [];
   }
 
   /** How an identifier reference touches its binding. */

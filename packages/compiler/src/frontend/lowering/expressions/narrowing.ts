@@ -1,4 +1,5 @@
 /* Type narrowing of lowered values, conditional and as-expressions, and runtime-optional receiver reads. */
+import { declBoundaryOrigin } from "../../decl-projection.js";
 import * as ts from "../../ts7/adapter.js";
 import { type Lowerer, dynFallbackType } from "../lowerer.js";
 import {
@@ -875,8 +876,15 @@ function checkedStaleArm(
 
 /** V8's spelling of a callee in "is not a function": a string-literal
  * element key reads as a property name (`o["a"]` is `o.a`), other keys
- * keep their brackets. */
+ * keep their brackets, parentheses and non-null assertions disappear, and
+ * a call result reads `f(...)`. */
 export function v8CalleeText(node: ts.Node): string {
+  // `!` is type-only syntax: the running JavaScript has no trace of it.
+  if (ts.isNonNullExpression(node) || ts.isParenthesizedExpression(node))
+    return v8CalleeText(node.expression);
+  // A call result prints with its arguments elided.
+  if (ts.isCallExpression(node) && !node.questionDotToken)
+    return `${v8CalleeText(node.expression)}(...)`;
   if (ts.isElementAccessExpression(node)) {
     const key = node.argumentExpression;
     const object = v8CalleeText(node.expression);
@@ -1474,6 +1482,7 @@ export function lowerAsExpression(
       target?.kind === "record" &&
       inner.type.shapeId !== target.shapeId
     ) {
+      lowerer.assertedValues.set(inner, target);
       return lowerer.coerceInto(expr, inner, target);
     }
     // `u as Arm` on a UNION value is `u!`'s spelling with a named arm
@@ -1508,6 +1517,15 @@ export function lowerAsExpression(
       const asserted = checkedClassUnionAssertion(lowerer, inner, target, locOf(expr));
       if (asserted) return asserted;
     }
+    // The erased value still answers to the assertion: a slot it cannot
+    // reach by an ordinary conversion converts it as asserted
+    // (assertedConversion).
+    if (
+      target &&
+      (target.kind === "union" || target.kind === "record" || target.kind === "array") &&
+      (inner.type.kind === "union" || inner.type.kind === "array")
+    )
+      lowerer.assertedValues.set(inner, target);
     return inner; // erasure, unchanged
   }
 
@@ -1524,7 +1542,7 @@ export function lowerAsExpression(
   // The declaration-typed boundary (decl-projection.ts): an identity-
   // preserving checked conversion of a value package code produced.
   if (isDeclBoundaryTypeNode(expr.type)) {
-    const adopted = declBoundaryCast(lowerer, inner, target, locOf(expr));
+    const adopted = declBoundaryCast(lowerer, inner, target, locOf(expr), expr);
     if (adopted) return adopted;
   }
   // An all-`unknown`-fields record target (`err as { code?: unknown }`
@@ -1632,11 +1650,42 @@ function holdsReference(lowerer: Lowerer, t: IrType, seen = new Set<string>()): 
  * becomes a live capsule of the value built from it
  * (scr_dyn_decl_adopt), so identity and mutation visibility hold on both
  * sides. Scalar targets are ordinary checked casts. */
+/** The origin the projection recorded for a boundary cast (the package
+ * declaration its type comes from, decl-projection.ts), found by the
+ * cast's position among the file's boundary casts in source order. */
+function recordedBoundaryOrigin(lowerer: Lowerer, cast: ts.Node): string | null {
+  const sf = ts.getSourceFileOfNode(cast);
+  let order = lowerer.boundaryCastOrder.get(sf);
+  if (order === undefined) {
+    const found = new Map<ts.Node, number>();
+    const visit = (node: ts.Node): void => {
+      if (ts.isAsExpression(node) && isDeclBoundaryTypeNode(node.type)) found.set(node, found.size);
+      ts.forEachChild(
+        node,
+        (child) => {
+          visit(child);
+          return undefined;
+        },
+        (list) => {
+          for (const child of list.nodes) visit(child);
+          return undefined;
+        },
+      );
+    };
+    visit(sf);
+    order = found;
+    lowerer.boundaryCastOrder.set(sf, order);
+  }
+  const index = order.get(cast);
+  return index === undefined ? null : declBoundaryOrigin(sf.fileName, index);
+}
+
 function declBoundaryCast(
   lowerer: Lowerer,
   inner: IrExpr,
   target: IrType,
   loc: SrcLoc,
+  cast: ts.Node,
 ): IrExpr | null {
   if (
     !canDynCheckTo(
@@ -1647,8 +1696,23 @@ function declBoundaryCast(
     !(target.kind === "union" && lowerer.dynConvertible(target))
   )
     return null;
+  // The package call or read the value comes from (decl-origin.ts): a
+  // failing check names it and the patch admitting the value.
+  let originText: string | null = null;
+  try {
+    originText = recordedBoundaryOrigin(lowerer, cast);
+  } catch {
+    originText = null;
+  }
+  const originId = originText === null ? undefined : lowerer.declOriginIndex(originText);
   if (!holdsReference(lowerer, target)) {
-    return { kind: "dynCheck", value: inner, type: target, loc };
+    return {
+      kind: "dynCheck",
+      value: inner,
+      type: target,
+      loc,
+      ...(originId === undefined ? {} : { origin: originId }),
+    };
   }
   const source = lowerer.declareHiddenLocal("%boundarySource", DYN);
   const value = lowerer.declareHiddenLocal("%boundaryValue", target);
@@ -1665,6 +1729,7 @@ function declBoundaryCast(
           adopt: true,
           type: target,
           loc,
+          ...(originId === undefined ? {} : { origin: originId }),
         },
         loc,
       },

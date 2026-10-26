@@ -431,12 +431,14 @@ export function prepareNativeExecutable(
             (outputKind === "exe" || outputKind === "llvm" || outputKind === "asm") &&
             toolchain.target.platform === "linux",
           objectAudit: options.sanitize === true,
+          sanitizeAttributes: options.sanitize === true,
           lowRegion: lowRegionTarget(toolchain.target.platform, options.sanitize === true),
           functionWorkers: emitWorkers(),
           forkPrimitives: emitForkPrimitives(),
           ...inlineRcOption(options.optimization, options.sanitize === true),
           ...(options.detachedExit === true && outputKind === "exe" ? { detachedExit: true } : {}),
           ...targetCpuField(options.targetCpu),
+          ...(options.cpuDispatch === true && outputKind === "exe" ? { cpuDispatch: true } : {}),
           ...(options.optimization === "dev" && !options.strip
             ? { debugSources: prepared.sourceTexts }
             : {}),
@@ -545,6 +547,7 @@ export function prepareNativeLibrary(
     pointerBits: toolchain.target.pointerBits,
     wasi: toolchain.target.platform === "wasi",
     objectAudit: options.sanitize === true,
+    sanitizeAttributes: options.sanitize === true,
     ...inlineRcOption(profile.optimization, options.sanitize === true),
   });
   timing("llvm-emit");

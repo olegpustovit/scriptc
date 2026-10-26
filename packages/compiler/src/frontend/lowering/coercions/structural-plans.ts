@@ -128,6 +128,25 @@ export function widthLiftPlan(lowerer: Lowerer, src: IrType, dst: IrType): Width
       const route = presenceRoute(lowerer, src.shapeId, selected[0]!, selected[1]!);
       if (route) return route;
     }
+    // A record whose fields some arm keeps EVERY one of, each lifting
+    // (`{ id; limit; opts?: A | B }` into `{ id; limit; opts?: A | B | C } |
+    // { id; opts?: C }`): that arm is the value's own layout, widened; the
+    // others hold it only by dropping fields. Prefer the unique lossless arm.
+    if (selected.length > 1 && src.kind === "record") {
+      const source = lowerer.shapes.get(src.shapeId);
+      const lossless = selected.filter(({ arm }) => {
+        const target = arm.kind === "record" ? lowerer.shapes.get(arm.shapeId) : undefined;
+        return (
+          source !== undefined &&
+          target !== undefined &&
+          !source.tuple &&
+          !target.tuple &&
+          target.fields.length === source.fields.length &&
+          source.fields.every((field) => target.fields.some((kept) => kept.name === field.name))
+        );
+      });
+      if (lossless.length === 1) selected = lossless;
+    }
     if (selected.length !== 1) return null;
     return { how: "liftWrap", tag: selected[0]!.tag, arm: selected[0]!.arm };
   }

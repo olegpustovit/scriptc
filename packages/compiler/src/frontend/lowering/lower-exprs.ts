@@ -93,7 +93,7 @@ import { classSymbolKeyOf } from "./symbol-fields.js";
 import { lowerTypeofExpr } from "./expressions/typeof.js";
 import { lowerIdentifierExpr } from "./expressions/identifiers.js";
 import { lowerFieldCompoundValue, lowerIncDec } from "./expressions/updates.js";
-import { lowerTernary } from "./expressions/narrowing.js";
+import { lowerTernary, v8CalleeText } from "./expressions/narrowing.js";
 import {
   cjsExportTableAccessorOf,
   classFieldTarget,
@@ -438,7 +438,12 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
       const operand = assertionOperand(lowerer, expr, inner, target ?? null, loc);
       if (operand) return operand;
       if (target && target.kind !== "union" && !typeEquals(target, inner.type)) {
-        const helper = lowerer.narrowedArmHelper(inner.type.unionId, target, loc);
+        const helper = lowerer.narrowedArmHelper(
+          inner.type.unionId,
+          target,
+          loc,
+          assertedCalleeMessage(expr, target),
+        );
         if (helper) {
           return lowerer.checkedNarrowCall(helper, inner, target, loc);
         }
@@ -1173,6 +1178,19 @@ const NUMERIC_COMPOUNDS = new Set<ts.SyntaxKind>([
   ts.SyntaxKind.GreaterThanGreaterThanEqualsToken,
   ts.SyntaxKind.GreaterThanGreaterThanGreaterThanEqualsToken,
 ]);
+
+/** The TypeError Node raises when an asserted callee (`t[k]!(…)`, `o.f!()`)
+ * holds no function: `!` is erased, so the call itself throws "<callee> is
+ * not a function" in V8's spelling of the callee. */
+function assertedCalleeMessage(expr: ts.NonNullExpression, target: IrType): string | undefined {
+  if (target.kind !== "func") return undefined;
+  let child: ts.Expression = expr;
+  while (ts.isParenthesizedExpression(child.parent)) child = child.parent;
+  const call = child.parent;
+  if (!ts.isCallExpression(call) || call.expression !== child || call.questionDotToken)
+    return undefined;
+  return `${v8CalleeText(expr.expression)} is not a function`;
+}
 
 /** Whether the use of `t[i]!` tells undefined from NaN: a converting use
  * that takes the value itself (see convertingUseOf), or a destination that

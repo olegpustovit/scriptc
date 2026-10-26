@@ -128,8 +128,10 @@ bool scr_pub_mark(ScrPub *ctx, void *obj, bool cyc, int kind) {
   size_t *rc = obj;
   if (SCR_RC_PUBLISHED(obj) || ctx->refusal) return false;
   bool compact = (kind & SCR_PUB_COMPACT) != 0;
-  /* Both log the low 32 bits: a count, or a compact header word. */
-  bool class_id = compact || (kind & SCR_PUB_CLASS_ID) != 0;
+  /* Both log the low 32 bits: a count, or a compact header word. An
+   * object with a layout id in its rc word (scr_rc_layout_id) keeps it, as
+   * a class instance keeps its class id. */
+  bool class_id = compact || (kind & SCR_PUB_CLASS_ID) != 0 || scr_rc_layout_id(obj) != 0;
   kind &= ~(SCR_PUB_CLASS_ID | SCR_PUB_COMPACT);
   if (ctx->logged == ctx->log_cap)
     ctx->log = scr_pub_grow(ctx->log, &ctx->log_cap, sizeof *ctx->log, ctx->log_inline);

@@ -372,6 +372,21 @@ export function emitSerializationExpr(
       // the dummy harmlessly.
       // `JSON.parse(text) as T` fuses into one schema-directed parse that
       // falls back to exactly this route whenever the fast path declines.
+      // A package-declared target: the cold path names the declaration in
+      // the pending TypeError (scr_type_origin.c).
+      // Library archives and reactors link a fixed runtime set without the
+      // note unit: their checks keep the plain message.
+      const origin =
+        e.origin === undefined || host.mod.lib !== undefined
+          ? undefined
+          : host.mod.declOrigins?.[e.origin];
+      const note =
+        origin === undefined
+          ? undefined
+          : (): void => {
+              host.declare("declare void @scr_type_origin_note(ptr)");
+              B.line(`call void @scr_type_origin_note(ptr ${host.cstr(origin)})`);
+            };
       const parsed = e.value;
       if (!e.preserveRefs && parsed.kind === "libCall" && parsed.fn === "json.parse") {
         const fused = host.dyn.jsonParseHelper(e.type);
@@ -380,7 +395,7 @@ export function emitSerializationExpr(
           const r = B.tmp();
           B.line(`${r} = call ptr @${fused}(ptr ${text.name})`);
           const fusedOut = host.own({ name: r, type: e.type });
-          host.emitPendingCheck();
+          host.emitPendingCheck(undefined, false, undefined, note);
           return fusedOut;
         }
       }
@@ -394,14 +409,14 @@ export function emitSerializationExpr(
       }
       const dynV = emitBorrowedInput(host, e.value);
       const helper = host.dyn.dynCheckHelper(e.type, e.preserveRefs);
-      if (isDynTypedRefType(e.type)) return emitClassCheck(host, e.type, dynV.name, helper);
+      if (isDynTypedRefType(e.type)) return emitClassCheck(host, e.type, dynV.name, helper, note);
       const ty = host.llType(e.type);
       const t = B.tmp();
       B.line(
         `${t} = call ${ty === "i1" ? "zeroext i1" : ty} @${helper}(ptr ${dynV.name}, ptr null)`,
       );
       const out = host.own({ name: t, type: e.type });
-      host.emitPendingCheck();
+      host.emitPendingCheck(undefined, false, undefined, note);
       return out;
     }
     default: {
@@ -420,6 +435,7 @@ function emitClassCheck(
   type: IrType & { kind: "object" },
   value: string,
   helper: string,
+  note?: () => void,
 ): LlValue {
   const B = host.B;
   const slot = B.slot();
@@ -460,7 +476,7 @@ function emitClassCheck(
   B.line(`${result} = call ptr @${helper}(ptr ${value}, ptr null)`);
   B.line(`store ptr ${result}, ptr ${slot}`);
   // A throwing check returns null, so the unwind has nothing to release.
-  host.emitPendingCheck();
+  host.emitPendingCheck(undefined, false, undefined, note);
   B.br(done);
   B.startBlock(done);
   const out = B.tmp();

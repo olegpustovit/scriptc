@@ -134,6 +134,15 @@ export const leakSuppressions = fileURLToPath(
   new URL("../tests/harness/lsan.supp", import.meta.url),
 );
 
+// The sanitized three.js nodes build runs in its own Linux job
+// (three_nodes_san in .github/workflows/ci.yml). Beside the corpus's other
+// workers it took 860 to more than 1200 seconds, past its test timeout.
+export const sanitizedNodesJobEnv = { SCRIPTC_THREE_SANITIZED_NODES_JOB: "1" };
+
+function corpusThreeEnv(flavor, platform) {
+  return flavor === "san" && platform === "linux" ? sanitizedNodesJobEnv : {};
+}
+
 function corpusLeakEnv(flavor, platform) {
   if (flavor !== "san" || platform !== "linux") return {};
   return {
@@ -246,6 +255,7 @@ export function ciTestPlan({
       env: {
         ...env,
         ...corpusLeakEnv(flavor, platform),
+        ...corpusThreeEnv(flavor, platform),
         SCRIPTC_TEST_WORKERS: String(workers - sideWorkers),
         SCRIPTC_LLVM_TEST_MODE: "dev",
       },

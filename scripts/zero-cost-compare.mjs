@@ -398,7 +398,10 @@ export function dynamicTierSymbols(names) {
  * later too, decodes JSON.parse trees. bench/throw-chains, also added
  * later, tests caught values with `instanceof`, as bench/validate-errors
  * does. bench/dynamic-methods and
- * bench/dynamic-properties are untyped JavaScript. Every other bench workload is fully typed and must link none. The gate and
+ * bench/dynamic-properties are untyped JavaScript. bench/regex-replacers,
+ * also added later, passes checked-dynamic values to replace callbacks
+ * whose parameters the lib types `any`: captures a match can leave unset
+ * and results the checker types `any`. Every other bench workload is fully typed and must link none. The gate and
  * tests/harness/bench-dynamic-tier.test.ts enforce that, and the test also
  * fails when a listed workload stops linking them, so remove a workload here
  * when a leak fix makes its binary clean. */
@@ -421,6 +424,7 @@ export const DYNAMIC_WORKLOADS = new Set([
   "bench/line-reader",
   "bench/json-unions",
   "bench/throw-chains",
+  "bench/regex-replacers",
 ]);
 
 /** Names of the functions (text and weak symbols) in `nm` output. Mach-O

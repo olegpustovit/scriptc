@@ -47,7 +47,7 @@ import {
   type ArrayAccess,
 } from "./dense-array-access.js";
 import { emitWrappingSum, integerOrNaNRange, markWrappingOperands } from "./wrapping-sums.js";
-import { emitPowerOfTwoQuotient, isPowerOfTwoCall } from "./lib-filesystem.js";
+import { emitPowF64, emitPowerOfTwoQuotient, isPowerOfTwoCall } from "./lib-filesystem.js";
 
 /** The signed integer predicates of the number compares. */
 const INTEGER_COMPARES: Record<string, string> = {
@@ -305,7 +305,6 @@ export function emitOperatorExpr(
         "===": "oeq",
         "!==": "une",
       };
-      const libm: Record<string, string> = { "**": "pow" };
       const bit: Record<string, "and" | "or" | "xor" | "shl" | "ashr" | "lshr"> = {
         "&": "and",
         "|": "or",
@@ -367,8 +366,8 @@ export function emitOperatorExpr(
               `${result} = ${e.op === "+" ? "add" : e.op === "-" ? "sub" : "mul"} nsw i64 ${left}, ${right}`,
             );
             const number = integerNumber(host, result, range, e.type);
-            const uint32 = emitWrappingSum(host, e, l, r, li, ri);
-            return uint32 === undefined ? number : { ...number, uint32 };
+            const wrapped = emitWrappingSum(host, e, l, r, li, ri);
+            return wrapped === undefined ? number : { ...number, ...wrapped };
           }
           if (e.op === "%" && li.range.min >= 0 && ri.range.min > 0) {
             const range = { min: 0, max: Math.min(li.range.max, ri.range.max - 1) };
@@ -411,12 +410,12 @@ export function emitOperatorExpr(
           return { name: emitPowerOfTwoQuotient(host, l.name, r.name), type: e.type };
         if (arith[e.op] !== undefined) {
           B.line(`${t} = ${arith[e.op]} double ${l.name}, ${r.name}`);
-          const uint32 = emitWrappingSum(host, e, l, r, li, ri);
+          const wrapped = emitWrappingSum(host, e, l, r, li, ri);
           // The exact integer beside the double, for index consumers.
           const wideInteger = wideArithmetic(host, e.op, l, li, r, ri);
-          if (uint32 !== undefined || wideInteger) {
+          if (wrapped !== undefined || wideInteger) {
             const value: LlValue = { name: t, type: e.type };
-            if (uint32 !== undefined) value.uint32 = uint32;
+            if (wrapped !== undefined) Object.assign(value, wrapped);
             if (wideInteger) value.wideInteger = wideInteger;
             return value;
           }
@@ -471,32 +470,8 @@ export function emitOperatorExpr(
         B.line(`${t} = ${e.op === ">>>" ? "uitofp" : "sitofp"} i32 ${result} to double`);
         return { name: t, type: e.type, uint32: result };
       } else {
-        const fn = libm[e.op];
-        if (fn === undefined) throw new LlvmUnsupportedError(`bin:${e.op}`, e.loc);
-        host.declare(`declare double @${fn}(double, double)`);
-        // libm's pow answers 1 for pow(±1, ±Infinity) and pow(1, NaN), where
-        // `**` answers NaN (and LLVM folds pow(1.0, x) to 1.0): an inline
-        // guard selects NaN for a base of ±1 with a non-finite exponent and
-        // keeps the direct pow call. A finite literal exponent, or a literal
-        // base other than ±1, cannot meet those cases and needs no guard.
-        if (fn === "pow" && !libmPowAgrees(e.left, e.right)) {
-          host.declare(`declare double @llvm.fabs.f64(double)`);
-          const power = B.tmp();
-          B.line(`${power} = call double @pow(double ${l.name}, double ${r.name})`);
-          const base = B.tmp();
-          const unit = B.tmp();
-          const magnitude = B.tmp();
-          const finite = B.tmp();
-          const reject = B.tmp();
-          B.line(`${base} = call double @llvm.fabs.f64(double ${l.name})`);
-          B.line(`${unit} = fcmp oeq double ${base}, 1.0`);
-          B.line(`${magnitude} = call double @llvm.fabs.f64(double ${r.name})`);
-          B.line(`${finite} = fcmp olt double ${magnitude}, 0x7FF0000000000000`);
-          B.line(`${reject} = select i1 ${finite}, i1 false, i1 ${unit}`);
-          B.line(`${t} = select i1 ${reject}, double 0x7FF8000000000000, double ${power}`);
-        } else {
-          B.line(`${t} = call double @${fn}(double ${l.name}, double ${r.name})`);
-        }
+        if (e.op !== "**") throw new LlvmUnsupportedError(`bin:${e.op}`, e.loc);
+        return { name: emitPowF64(host, l.name, r.name, e.right), type: e.type };
       }
       return { name: t, type: e.type };
     }
@@ -649,7 +624,7 @@ export function regexLiteralTemplate(
   let re = host.regexInstances.get(key);
   if (!re) {
     re = {
-      sym: `sc_re_${host.regexInstances.size}`,
+      sym: host.contentSymbol("sc_re_", key),
       src: host.internLiteral(e.pattern),
       fl: host.internLiteral(e.flags),
       pattern: e.pattern,
@@ -659,6 +634,29 @@ export function regexLiteralTemplate(
   }
   host.journal?.entry("regex", key, re);
   return `@${re.sym}`;
+}
+
+/** The build-time replacer of a global substitution of regex literal `e`
+ * with the literal `replacement` (regex-matchers.ts), registered on first
+ * use. */
+export function regexLiteralReplacer(
+  host: LlvmEmitterContext,
+  e: IrExpr & { kind: "regexLit" },
+  replacement: string,
+): string {
+  const key = `${e.flags}/${e.pattern}\0${replacement}`;
+  let rr = host.regexReplacers.get(key);
+  if (!rr) {
+    rr = {
+      sym: host.contentSymbol("sc_rr_", key),
+      pattern: e.pattern,
+      flags: e.flags,
+      replacement,
+    };
+    host.regexReplacers.set(key, rr);
+  }
+  host.journal?.entry("regexReplacer", key, rr);
+  return `@${rr.sym}`;
 }
 
 /** A string equality or comparison between `s.charAt(i)` and a literal of
@@ -1449,20 +1447,4 @@ export function emitRecordLitFields(
     const { ptr, type, inline } = host.recordFieldPtr(rec, shapeId, f.name);
     host.initField(ptr, type, inline, v);
   }
-}
-
-/** Whether libm pow matches `**` for these operands: every case except a
- * base of ±1 with a NaN or infinite exponent agrees. */
-function libmPowAgrees(base: IrExpr, exponent: IrExpr): boolean {
-  const power = numericLiteral(exponent);
-  if (power !== null && Number.isFinite(power)) return true;
-  const value = numericLiteral(base);
-  return value !== null && !Number.isNaN(value) && Math.abs(value) !== 1;
-}
-
-function numericLiteral(expr: IrExpr): number | null {
-  if (expr.kind === "numLit") return expr.value;
-  if (expr.kind === "unary" && expr.op === "-" && expr.operand.kind === "numLit")
-    return -expr.operand.value;
-  return null;
 }

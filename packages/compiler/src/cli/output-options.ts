@@ -11,6 +11,7 @@ export interface OutputOptionValues {
   strip?: boolean;
   windowsSubsystem?: string;
   detachedExit?: boolean;
+  cpuDispatch?: boolean;
   profileGenerate?: string;
   profileUse?: string;
   ffi?: string;
@@ -74,6 +75,9 @@ export function resolveOutputOptions(
   }
   if (values.detachedExit && emit !== "exe") {
     return { ok: false, message: `--detached-exit is only supported with --emit=exe` };
+  }
+  if (values.cpuDispatch && emit !== "exe") {
+    return { ok: false, message: `--cpu-dispatch is only supported with --emit=exe` };
   }
   if (values.profileGenerate !== undefined && values.profileUse !== undefined) {
     return { ok: false, message: `--profile-generate and --profile-use cannot be combined` };

@@ -81,6 +81,7 @@ import { isClassCallback } from "./class-callbacks.js";
 import { CaughtValueDispatch } from "./caught-value-dispatch.js";
 import { refreshDescriptorGuards } from "./class-descriptors.js";
 import { ClassConstructionDispatch } from "./class-construction.js";
+import { keyedHelperName } from "./stable-names.js";
 import { DispatchSites } from "./dispatch-sites.js";
 import {
   emitterRooted,
@@ -3915,7 +3916,7 @@ export class ClassDynamicDispatch {
         if (!dispatch.fn.params.some((param) => param.localId === dispatch.keyLocal))
           params.push({ localId: dispatch.keyLocal, name: "key", type: STRING });
         const helper: IrFunction = {
-          name: `%dyn.class.keys.${lowerer.liftedFns.length}`,
+          name: keyedHelperName(lowerer, "%dyn.class.keys", helperKey),
           params,
           returnType: dispatch.fn.returnType,
           locals: params.map((p) => ({
@@ -6793,24 +6794,41 @@ export class ClassDynamicDispatch {
           type: result,
           loc,
         };
+    // A void method dispatches its overrides with statements: a ternary
+    // has no void form.
+    let voidDispatch: IrStmt[] = [{ kind: "exprStmt", expr: call, loc }];
     for (const override of overrides.toReversed()) {
       const subType: IrType = { kind: "object", className: override.cls.def.name };
+      const isOverride: IrExpr = {
+        kind: "instanceOf",
+        value: receiver,
+        className: override.cls.def.name,
+        type: BOOL,
+        loc,
+      };
+      const overrideCall: IrExpr = {
+        kind: "call",
+        callee: override.callee,
+        args: [{ kind: "downcast", value: receiver, type: subType, loc }, ...args],
+        type: result,
+        loc,
+      };
+      if (result.kind === "void") {
+        voidDispatch = [
+          {
+            kind: "if",
+            cond: isOverride,
+            then: [{ kind: "exprStmt", expr: overrideCall, loc }],
+            else_: voidDispatch,
+            loc,
+          },
+        ];
+        continue;
+      }
       call = {
         kind: "ternary",
-        cond: {
-          kind: "instanceOf",
-          value: receiver,
-          className: override.cls.def.name,
-          type: BOOL,
-          loc,
-        },
-        then: {
-          kind: "call",
-          callee: override.callee,
-          args: [{ kind: "downcast", value: receiver, type: subType, loc }, ...args],
-          type: result,
-          loc,
-        },
+        cond: isOverride,
+        then: overrideCall,
         else_: call,
         type: result,
         loc,
@@ -6818,10 +6836,7 @@ export class ClassDynamicDispatch {
     }
     let body: IrStmt[];
     if (result.kind === "void")
-      body = [
-        { kind: "exprStmt", expr: call, loc },
-        { kind: "return", value: dynUndefinedExpr(loc), loc },
-      ];
+      body = [...voidDispatch, { kind: "return", value: dynUndefinedExpr(loc), loc }];
     else {
       const boxed = lowerer.coerceToExpected(call, DYN);
       if (boxed.type.kind !== "dyn") return fence();

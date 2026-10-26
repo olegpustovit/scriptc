@@ -1,9 +1,9 @@
+import { dynDesc } from "../../ir/analysis.js";
 /* Focused LLVM expression emission extracted from emitter.ts. */
 import { arraySearchHelperName, arraySearchKind } from "./array-search.js";
 import { InternalCompilerError } from "../../errors.js";
 import { isStableReceiverOperand, undefinedArmTag } from "../../ir/analysis.js";
 import { F64, type IrExpr, type IrType, isRefCounted, typeEquals, typeKey } from "../../ir/ir.js";
-import { mangleResolveThunk } from "../mangle.js";
 import {
   arrOps,
   elemAccess,
@@ -49,11 +49,13 @@ import { emitFusedMapSet, rememberMapEntry } from "./map-entry-fusion.js";
 import { emitScratchStringSlice, emitStringSliceRead } from "./string-slices.js";
 import {
   STRING_CHAR_AT_DECL,
+  STRING_CP_AT_BYTE_DECL,
   STRING_CHAR_AT_INT_MARKER,
   STRING_CHAR_CODE_AT_DECL,
   STRING_CHAR_CODE_AT_INT_MARKER,
   emitAsciiChar,
   emitAsciiCharCode,
+  emitStringByteLength,
   emitUnitCharCode,
   STRING_UTF16_LEN_DECL,
 } from "./string-reads.js";
@@ -73,7 +75,7 @@ export function resolveThunkFor(host: LlvmEmitterContext, inner: IrType): string
   const key = typeKey(inner);
   let sym = host.resolveThunks.get(key);
   if (!sym) {
-    sym = mangleResolveThunk(host.resolveThunks.size);
+    sym = host.contentSymbol("sc_rslv_", key);
     host.resolveThunks.set(key, sym);
     host.journal?.allocated(sym, "resolveThunkFor", [inner]);
     const v = vAdapters(host.shapeHost, inner);
@@ -564,16 +566,30 @@ export function emitStrIntrinsic(
       return call("scr_str_is_well_formed", "zeroext i1 (ptr)", `ptr ${r.name}`, "i1", false);
     case "toWellFormed":
       return call("scr_str_to_well_formed", "ptr (ptr)", `ptr ${r.name}`, "ptr", true);
-    case "cpAt":
-      // The code point AT an index as a one-code-point string (+1) —
-      // the string-for-of desugar's read.
-      return call(
-        "scr_str_cp_at",
-        "ptr (ptr, double)",
-        `ptr ${r.name}, double ${args[0]!.name}`,
-        "ptr",
-        true,
-      );
+    case "byteLength": {
+      const t = B.tmp();
+      // A byte count fits in a signed size, whose conversion is one instruction.
+      B.line(`${t} = sitofp ${host.sizeType} ${emitStringByteLength(host, r.name)} to double`);
+      return { name: t, type: e.type };
+    }
+    case "cpAtByte": {
+      // sc_str_cp_at_byte (string-reads.ts) answers ASCII bytes from the
+      // charAt table inline. The cursor is a character start, an exact
+      // integer below the byte count.
+      host.declare(STRING_CHAR_AT_DECL);
+      host.declare(STRING_CP_AT_BYTE_DECL);
+      const index = e.args[0] ? exactInteger(host, args[0]!, e.args[0]) : null;
+      let wide: string;
+      if (index) {
+        wide = widenInteger(host, index);
+      } else {
+        wide = B.tmp();
+        B.line(`${wide} = fptosi double ${args[0]!.name} to i64`);
+      }
+      const t = B.tmp();
+      B.line(`${t} = call ptr @sc_str_cp_at_byte(ptr ${r.name}, i64 ${wide})`);
+      return host.own({ name: t, type: e.type });
+    }
     default: {
       const _exhaustive: never = method;
       void _exhaustive;
@@ -790,6 +806,9 @@ export function emitArrIntrinsic(
     case "shift": {
       host.emitPublishedArrayGuard(r.name, e.receiver.type, method === "pop" ? 2 : 6);
       const checkedValue = elem.kind === "dyn" && e.type.kind === "dyn";
+      // A foreign element (SCR_ARR_FOREIGN) cannot be the typed result:
+      // removing one throws the checked conversion's TypeError.
+      const foreignElements = !checkedValue && host.mayHoldForeign(elem);
       if (!checkedValue && e.type.kind !== "union")
         throw new InternalCompilerError("llvm emitter bug: array removal result is not a union");
       const def = e.type.kind === "union" ? host.unionsById.get(e.type.unionId) : undefined;
@@ -832,7 +851,25 @@ export function emitArrIntrinsic(
       );
       B.line(`${slowRaw} = load i64, ptr ${rawSlot}`);
       B.line(`${has} = icmp eq i8 ${state}, 1`);
-      B.condBr(has, lp, la);
+      const lf = foreignElements ? B.newLabel("remove.f") : la;
+      B.condBr(has, lp, lf);
+      if (foreignElements) {
+        // Only the runtime call removes a foreign element; its value moves
+        // out with the slot, and the throw releases it.
+        B.startBlock(lf);
+        const foreign = B.tmp();
+        const throwLabel = B.newLabel("remove.foreign");
+        B.line(`${foreign} = icmp eq i8 ${state}, 3`);
+        B.condBr(foreign, throwLabel, la);
+        B.startBlock(throwLabel);
+        const payload = B.tmp();
+        B.line(`${payload} = inttoptr i64 ${slowRaw} to ptr`);
+        host.declare(`declare void @scr_dyn_foreign_throw(ptr, ptr)`);
+        const want = host.cstr(dynDesc(e.type, host.recordsById, host.unionsById));
+        B.line(`call void @scr_dyn_foreign_throw(ptr ${payload}, ptr ${want})`);
+        host.emitAlwaysPendingUnwind();
+        B.br(la);
+      }
       B.startBlock(lp);
       let raw = slowRaw;
       const value = B.tmp();

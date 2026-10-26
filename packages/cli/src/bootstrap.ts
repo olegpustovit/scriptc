@@ -141,6 +141,7 @@ async function tryFastPath(): Promise<number | null> {
     ...(optimization === "dev" || optimization === "speed" ? { optimization } : {}),
     ...(values.strip ? { strip: true as const } : {}),
     ...(values["detached-exit"] ? { detachedExit: true as const } : {}),
+    ...(values["cpu-dispatch"] === true ? { cpuDispatch: true as const } : {}),
     ...(checker === undefined ? {} : { checker }),
     npmStatic,
     ffiProfile: ffiPath === null ? null : { path: ffiPath, bytes: ffiBytes! },
@@ -220,6 +221,7 @@ async function coverageFastPath(
     values.strip ||
     values["detached-exit"] ||
     values["target-cpu"] !== undefined ||
+    values["cpu-dispatch"] !== undefined ||
     values.lib ||
     values.profile !== undefined ||
     values.ffi !== undefined ||

@@ -95,7 +95,8 @@ test("a Promise.all tuple adapter requested in a range is defined", async () => 
       throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
     const ir = await readFile(outPath, "utf8");
     const serial = text(emitLlvmModuleSource(deserializeModule(ir), {}));
-    expect(serial).toContain("define internal void @sc_all_tuple_0(");
+    // The adapter is named from its key (contentSymbol).
+    expect(serial).toMatch(/define internal void @sc_all_tuple_\d+\(/);
     const chunked = text(emitLlvmModuleSource(deserializeModule(ir), { functionChunks: 2 }));
     expect(chunked === serial).toBe(true);
   } finally {

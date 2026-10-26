@@ -575,6 +575,60 @@ static void check_program_nursery_threshold(void) {
   scr_collect_cycles();
 }
 
+/* How many dead rings the release path takes to run its next pass, from
+ * the end of the previous one: the nursery trigger in effect. */
+static size_t nursery_window(void) {
+  size_t before = freed, n = 0;
+  while (freed == before && n < 65536) {
+    release_live(make_ring(1));
+    n++;
+  }
+  check(freed - before == n, "a nursery pass left dead rings behind");
+  return n;
+}
+
+/* A scheduled full pass that reclaims nothing: its only candidate is an
+ * older live leaf. */
+static void scheduled_pass_finding_nothing(Node *leaf) {
+  size_t before = freed;
+  read_live(leaf);
+  for (size_t i = 0; i < configured_nursery_threshold(); i++)
+    scr_cyc_collect_scheduled();
+  check(freed == before, "a scheduled pass over a live leaf freed something");
+}
+
+/* Unpinned, the nursery trigger starts at 256 candidates. Each scheduled
+ * full pass that reclaims promoted rings doubles it, up to 4096; each one
+ * that reclaims nothing after the nursery passes freed rings halves it,
+ * down to 256. */
+static void check_adaptive_nursery_threshold(void) {
+  if (getenv("SCR_CYCLE_THRESHOLD") != NULL) return; /* it pins the trigger */
+  scr_cyc_set_nursery_threshold(0);
+  scr_collect_cycles();
+  check(nursery_window() == 256, "the unpinned nursery trigger did not start at 256");
+  static const size_t widened[] = { 512, 1024, 2048, 4096, 4096 };
+  for (size_t i = 0; i < sizeof(widened) / sizeof(widened[0]); i++) {
+    collect_dead_mature_rings();
+    check(nursery_window() == widened[i],
+          "a full pass reclaiming promoted rings did not double the nursery trigger");
+  }
+
+  static const size_t narrowed[] = { 2048, 1024, 512, 256, 256 };
+  Node *leaf = make_leaf();
+  read_live(leaf);
+  scr_collect_cycles(); /* promote */
+  for (size_t i = 0; i < sizeof(narrowed) / sizeof(narrowed[0]); i++) {
+    scheduled_pass_finding_nothing(leaf);
+    check(nursery_window() == narrowed[i],
+          "a full pass reclaiming nothing did not halve the nursery trigger");
+  }
+  leaf->rc--;
+  scr_cyc_on_dead(leaf);
+  node_free(leaf);
+  scr_cyc_set_nursery_threshold(0);
+  scr_collect_cycles();
+}
+
 /* The phase sweep (scr_collect_cycles_phase) is for a caller that knows a
  * phase's data has just died: it sweeps, and the growth schedule starts
  * over. After passes that find nothing have widened the old level's
@@ -1506,6 +1560,9 @@ static void check_acyclic_objects(void) {
 }
 
 int main(void) {
+  /* The scheduling checks count candidates against a fixed nursery trigger;
+   * check_adaptive_nursery_threshold covers the unpinned one. */
+  scr_cyc_set_nursery_threshold((long)configured_nursery_threshold());
   check_inline_buffering();
   check_old_garbage_reclaimed_while_growing();
   check_older_rings_into_old();
@@ -1541,6 +1598,7 @@ int main(void) {
   check_acyclic_objects();
   check_program_growth_cap();
   check_program_nursery_threshold();
+  check_adaptive_nursery_threshold();
   printf("cycle collection checks passed: threshold=%zu growth_cap=%zu\n",
          configured_nursery_threshold(), configured_growth_cap());
   return 0;

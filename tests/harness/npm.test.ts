@@ -74,7 +74,7 @@ const KNOWN: Record<string, Known> = {
   "node24-file-url-conversion": { build: "SC1090" },
   "node24-fs-descriptors": { run: "SC2020" },
   "node24-mime": { run: "SC2020" },
-  "node24-mime-errors": { run: "SC1090" },
+  "node24-mime-errors": { run: "SC2020" },
   "node24-no-error-assertions": { run: "SC2020" },
   "node24-parseargs": { run: "SC1090" },
   "node24-promise-timers": { run: "SC2020" },

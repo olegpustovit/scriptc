@@ -1701,3 +1701,33 @@ ScrDyn *scr_fs_constants_object(void) {
   scr_atexit(scr_fs_constants_clear);
   return scr_dyn_retain(o);
 }
+
+/* util.convertProcessSignalToExitCode(signalCode): 128 plus the number of
+ * the os.constants.signals entry, and validateOneOf's
+ * ERR_INVALID_ARG_VALUE, listing every name, for anything else. NaN with
+ * the exception pending. */
+double scr_util_signal_exit_code(const ScrDyn *code) {
+  ScrDyn *signals = scr_dyn_new_obj();
+  scr_os_signal_constants(signals);
+  const ScrDyn *number =
+      code->kind == SCR_DYN_STR ? scr_dyn_obj_get(signals, code->v.str->data, code->v.str->len) : NULL;
+  double result = NAN;
+  if (number && number->kind == SCR_DYN_NUM) {
+    result = 128 + number->v.num;
+  } else {
+    ScrJsonBuf reason;
+    scr_jb_init(&reason);
+    scr_jb_puts(&reason, "must be one of: ");
+    for (size_t i = 0; i < signals->v.obj.len; i++) {
+      if (i > 0) scr_jb_puts(&reason, ", ");
+      scr_jb_putc(&reason, '\'');
+      scr_jb_write(&reason, signals->v.obj.entries[i].key, signals->v.obj.entries[i].key_len);
+      scr_jb_putc(&reason, '\'');
+    }
+    ScrStr *text = scr_jb_finish(&reason);
+    scr_dyn_arg_value_fail("signalCode", text->data, code);
+    scr_str_release(text);
+  }
+  scr_dyn_release(signals);
+  return result;
+}

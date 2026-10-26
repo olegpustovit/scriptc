@@ -308,13 +308,10 @@ static bool scr_js_absent_hit(const ScrDyn *receiver, const ScrJsIcEntry *entry)
          walked->v.obj.shape == entry->holder_shape && walked->prototype == NULL;
 }
 
-/* A load site's probe. With `absent`, a read of a key that the receiver and
- * its chain of plain shaped objects (ending in the default prototype) lack
- * answers undefined and caches that answer. Method reads leave absent
- * methods to the slow path, which names the missing function. */
 /* The answer of a matching entry for `receiver`, or NULL when the entry no
  * longer holds. */
-static ScrDyn *scr_js_entry_answer(ScrDyn *receiver, const ScrJsIcEntry *entry) {
+static inline __attribute__((always_inline)) ScrDyn *scr_js_entry_answer(ScrDyn *receiver,
+                                                                     const ScrJsIcEntry *entry) {
   if (entry->target == &scr_js_absent)
     return scr_js_absent_hit(receiver, entry) ? scr_dyn_retain(scr_dyn_undefined()) : NULL;
   return scr_js_load_hit(receiver, entry);
@@ -345,7 +342,8 @@ static void scr_js_load_fill(ScrJsIc *ic, uint32_t stale, ScrJsSharedLoad *share
  * its chain of plain shaped objects (ending in the default prototype) lack
  * answers undefined and caches that answer. Method reads leave absent
  * methods to the slow path, which names the missing function. */
-static ScrDyn *scr_js_probe_load(ScrDyn *receiver, const ScrStr *key, ScrJsIc *ic, bool absent) {
+static __attribute__((noinline)) ScrDyn *scr_js_probe_load(ScrDyn *receiver, const ScrStr *key,
+                                                            ScrJsIc *ic, bool absent) {
   const ScrJsShape *shape = scr_js_shape_of(receiver);
   if (!shape) return NULL;
   uint32_t stale = UINT32_MAX;
@@ -397,11 +395,20 @@ static ScrDyn *scr_js_probe_load(ScrDyn *receiver, const ScrStr *key, ScrJsIc *i
   return scr_dyn_retain(found->value);
 }
 
+/* Receivers other than ordinary objects have no shape: they miss before
+ * the probe sets up its frame. */
 ScrDyn *scr_js_load_probe(ScrDyn *receiver, const ScrStr *key, ScrJsIc *ic) {
+  if (receiver->kind != SCR_DYN_OBJ) return NULL;
   return scr_js_probe_load(receiver, key, ic, false);
 }
 
 ScrDyn *scr_js_get_probe(ScrDyn *receiver, const ScrStr *key, ScrJsIc *ic) {
+  if (receiver->kind != SCR_DYN_OBJ) return NULL;
+  return scr_js_probe_load(receiver, key, ic, true);
+}
+
+ScrDyn *scr_js_get_probe_native(ScrDyn *receiver, const ScrStr *key, ScrJsIc *ic) {
+  if (receiver->kind != SCR_DYN_OBJ) return scr_dyn_tier_unshaped_get(receiver, key);
   return scr_js_probe_load(receiver, key, ic, true);
 }
 

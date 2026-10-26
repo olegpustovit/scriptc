@@ -227,15 +227,21 @@ ScrNetSocket *scr_net_connect_lookup(double port, ScrStr *host /*borrowed*/,
                                       ScrClosure *lookup /*moves*/, void *answer_fn); /* +1 */
 void scr_net_lookup_answer(ScrClosure *self, bool has_err, ScrStr *msg /*borrowed, nullable*/,
                             ScrArr *ips /*borrowed, nullable*/);
-void scr_net_sock_write_str(ScrNetSocket *s, ScrStr *data /*borrowed*/);
-void scr_net_sock_write_bytes(ScrNetSocket *s, ScrBytes *data /*borrowed*/);
+/* write(): Node's Writable answer — false when the bytes the write left
+ * unsent reach the 65536-byte high-water mark, after which 'drain' fires
+ * when the write buffer empties; false on an ended or closed socket. */
+bool scr_net_sock_write_str(ScrNetSocket *s, ScrStr *data /*borrowed*/);
+bool scr_net_sock_write_bytes(ScrNetSocket *s, ScrBytes *data /*borrowed*/);
+double scr_net_sock_writable_length(ScrNetSocket *s);
+bool scr_net_sock_writable_need_drain(ScrNetSocket *s);
+void scr_net_sock_on_drain(ScrNetSocket *s, ScrClosure *cb /*moves*/, bool once);
 void scr_net_sock_end(ScrNetSocket *s);
 void scr_net_sock_end_str(ScrNetSocket *s, ScrStr *data /*borrowed*/);
 void scr_net_sock_end_bytes(ScrNetSocket *s, ScrBytes *data /*borrowed*/);
 /* Checked-dynamic chunk forms (an untyped JS payload into a typed
  * socket): STR/BYTES dispatch; end() takes undefined/null as no chunk;
  * anything else throws Node's ERR_INVALID_ARG_TYPE chunk TypeError. */
-void scr_net_sock_write_dynv(ScrNetSocket *s, const ScrDyn *d /*borrowed*/);
+bool scr_net_sock_write_dynv(ScrNetSocket *s, const ScrDyn *d /*borrowed*/);
 void scr_net_sock_end_dynv(ScrNetSocket *s, const ScrDyn *d /*borrowed*/);
 void scr_net_sock_destroy(ScrNetSocket *s);
 /* Flow control (pause/resume — see the struct's flag comments), the

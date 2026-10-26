@@ -317,13 +317,19 @@ test("worker programs test each receiver's shared storage once in the guard", ()
   const body = /^define internal [^\n]*@sc_bf_kernel[^]*?^}/m.exec(emitLlvmModule(mod))![0];
   const guard = body.slice(0, body.search(/^bytes\.version\.(fast|slow)\d+:$/m));
   expect(guard.match(/icmp eq ptr %\S+, null/g)).toHaveLength(2);
-  const fast = /^bytes\.version\.fast\d+:$[^]*?^bytes\.version\.done\d+:$/m.exec(body)![0];
+  const fast = /^bytes\.version\.fast\d+:$[^]*?^bytes\.version\.fast\.shared\d+:$/m.exec(body)![0];
   expect(fast).not.toContain("bytes.shared");
   expect(fast).not.toMatch(/(load|store) atomic double/);
-  // The checked copy keeps the shared-memory path for each access.
+  // The checked copy keeps the shared-memory path for each access, and so
+  // does the copy for shared views whose bounds hold.
   const slow = body.slice(body.search(/^bytes\.version\.slow\d+:$/m), body.indexOf(fast));
   expect(slow).toContain("load atomic double");
   expect(slow).toContain("store atomic double");
+  const shared = /^bytes\.version\.fast\.shared\d+:$[^]*?^bytes\.version\.done\d+:$/m.exec(
+    body,
+  )![0];
+  expect(shared).toContain("load atomic double");
+  expect(shared).toContain("store atomic double");
 });
 
 test("index temps of a version's counter are integers in the fast copy", () => {

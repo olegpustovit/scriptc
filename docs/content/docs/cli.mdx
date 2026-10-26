@@ -2,7 +2,7 @@
 title: "CLI Reference"
 ---
 
-The `scriptc` command has five subcommands: `build`, `run`, `coverage`, `cache warm`, and `merge-profiles`. `scriptc --help` prints this summary and the options below, and `scriptc --version` prints the installed version.
+The `scriptc` command has six subcommands: `build`, `run`, `coverage`, `types`, `cache warm`, and `merge-profiles`. `scriptc --help` prints this summary and the options below, and `scriptc --version` prints the installed version.
 
 ```console
 $ scriptc --help
@@ -21,6 +21,13 @@ Usage:
                                             exporting the profile symbols; a profile
                                             with a sidecar section also gets the
                                             contract sidecar JSON beside the archive
+  scriptc types patch <package> <selector> <type> [--range <r>] [--dry-run]
+                                            fix a wrong declaration of an installed
+                                            package: shows what the selector
+                                            matches and adds the type patch to
+                                            package.json ("| undefined" widens)
+  scriptc types list                        the project's type patches and what
+                                            they match
   scriptc cache warm [runtime|tls…] verify and load precompiled runtime families
                                             for the current compiler/SDK/target
   scriptc merge-profiles -o <out.profdata> [--sparse] <profile…>
@@ -88,6 +95,24 @@ $ scriptc run fib.ts
 
 Analyzes the program without building it and reports what compiles and what blocks the rest. See [Coverage Reports](/docs/coverage).
 
+## scriptc types
+
+Writes and lists [type patches](/docs/dependencies#fix-a-packages-types), the project's fixes for wrong declarations of npm packages.
+
+<dl>
+  <dt><code>scriptc types patch &lt;package&gt; &lt;selector&gt; &lt;type&gt;</code></dt>
+  <dd>Finds the package installed for the working directory, prints every declaration the selector matches in its declaration files, its JSDoc and its <code>@types/</code> package with the type before and after, and adds the patch to the nearest <code>package.json</code>. The patch joins an entry whose range covers the installed version, or gets the range <code>^&lt;installed version&gt;</code>. Nothing is written when the selector matches nothing. <code>--range &lt;range&gt;</code> chooses the range, and <code>--dry-run</code> only prints.</dd>
+  <dt><code>scriptc types list</code></dt>
+  <dd>Prints each type patch in the nearest <code>package.json</code>, whether it applies to the installed version, and what it matches.</dd>
+</dl>
+
+```console
+$ scriptc types list
+commander@^15.0.0
+  HelpContext.helpWidth: | undefined
+    node_modules/commander/lib/command.js:2481  number  ->  number | undefined
+```
+
 ## scriptc cache warm
 
 Verifies and loads the installed precompiled runtime objects and vendored libraries, and prints the cache directory. Pass `runtime`, `tls`, or both to select which to warm. Ordinary builds don't need this step. With `--sanitize`, it builds the instrumented runtime objects using a C toolchain.
@@ -137,6 +162,9 @@ With `--sparse`, the profile leaves out the functions the runs never reached. Th
 
   <dt><code>--target-cpu &lt;baseline|x86-64-v2|x86-64-v3|x86-64-v4|native&gt;</code></dt>
   <dd>On x86-64 targets, compile the program's code for an x86-64 microarchitecture level. The default, <code>baseline</code>, runs on any x86-64 CPU. A higher level lets LLVM use more instructions, and the executable then runs only on CPUs that support that level. <code>native</code> uses the highest level the build machine supports. Valid for executable, assembly, and object output on x86-64 targets. See <a href="#target-cpu">Target CPU</a>.</dd>
+
+  <dt><code>--cpu-dispatch</code></dt>
+  <dd>On x86-64 targets, compile the program's code twice, for the baseline and for <code>x86-64-v3</code>, and choose the copy when the program starts. The executable runs on any x86-64 CPU and uses the <code>x86-64-v3</code> code on CPUs that support it. Not used with a <code>--target-cpu</code> level above <code>baseline</code>. Valid only for executable builds. See <a href="#runtime-cpu-dispatch">Runtime CPU dispatch</a>.</dd>
 
   <dt><code>--profile-generate &lt;pattern&gt;</code></dt>
   <dd>On Linux, build an instrumented executable for profile-guided optimization. Each run writes a raw profile to the path pattern, where <code>%p</code> expands to the process ID; the <code>LLVM_PROFILE_FILE</code> environment variable overrides the pattern at run time. A relative pattern resolves from the current working directory. Instrumented programs run slower. Valid only for executable builds with <code>--optimization=release</code> or <code>speed</code>.</dd>
@@ -270,6 +298,22 @@ Loops over typed arrays and numbers gain the most, because LLVM vectorizes them 
 An executable built for a level runs only on CPUs that support that level. On an older CPU, it crashes with an illegal-instruction signal (`SIGILL`) when it reaches an instruction the CPU lacks. A named level is portable to every machine of that level. `native` selects the highest level the build machine supports, so use it only for executables that run on the machine that built them or on identical machines.
 
 The level applies to the program's own code. The runtime pack keeps its baseline code. Builds for different levels never share cached artifacts, and `baseline` builds are the same as builds without the option.
+
+### Runtime CPU dispatch
+
+`--cpu-dispatch` keeps the executable portable and still uses the higher level where the CPU has it. The program's functions are compiled for the baseline and for `x86-64-v3`. At startup, the executable checks the CPU and the operating system's register support, and then runs the `x86-64-v3` code on CPUs that support every feature of that level. Calls between the program's functions stay within the chosen copy.
+
+```console
+$ scriptc build app.ts --optimization=speed --cpu-dispatch -o app
+```
+
+The second copy makes the executable larger and the first build of the program slower, since LLVM compiles the program's code twice. Unchanged rebuilds are not affected. Both copies compute the same results: neither contracts floating-point operations into fused multiply-adds.
+
+The `SCRIPTC_CPU_LEVEL` environment variable caps the level the executable uses, for example to test the baseline code on a newer machine. It takes a level from `0` to `4`, `baseline`, or a level name such as `x86-64-v3`; any other value selects the baseline code.
+
+```console
+$ SCRIPTC_CPU_LEVEL=baseline ./app
+```
 
 ## LLVM backend
 

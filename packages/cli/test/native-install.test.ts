@@ -53,6 +53,7 @@ function fixture() {
     dsymutil: "dsymutil",
     comptime: "../lib/comptime",
     wasi_node_runner: "../lib/wasi/cli/wasi-runner.js",
+    lib_diagnostics: "../lib/lib-diagnostics.json",
   };
   writeFileSync(binary + ".json", JSON.stringify(toolchain));
   const helpers = [
@@ -92,6 +93,9 @@ test("installs a direct executable and relocatable references to platform assets
   expect(resolve(dirname(installed), manifest.ts7)).toBe(join(platform, "typescript/lib/tsc"));
   expect(resolve(dirname(installed), manifest.wasi_node_runner)).toBe(
     join(platform, "wasi/cli/wasi-runner.js"),
+  );
+  expect(resolve(dirname(installed), manifest.lib_diagnostics)).toBe(
+    join(platform, "lib-diagnostics.json"),
   );
   expect(resolve(dirname(installed), manifest.runtime_packs[0].path)).toBe(
     join(platform, "runtime"),

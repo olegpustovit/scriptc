@@ -16,6 +16,7 @@ Application-shaped workloads for measuring the speed of compiled executables. Ea
 | `dynamic-methods` | cpu | untyped JavaScript calling builtin methods on values it does not type: string `slice`/`indexOf`/`toUpperCase`/`padStart`, array `push`/`pop`/`includes`, `Map` and `Set`, and an object's own methods |
 | `dynamic-properties` | cpu | untyped JavaScript reading and writing properties of values it does not type: records built by object literals in two key orders, nested records, and instances of a class and its subclass |
 | `functional-pipeline` | cpu | `filter`/`map`/`reduce`/`flatMap` chains, closures, small records |
+| `handler-tables` | cpu | dispatch tables of functions: `Record<string, fn>` read as `t[k]!(…)`, `t[k]?.(…)` and through a checked local, a `Map<string, fn>`, an array of handlers, and an object literal of methods; some handlers declare fewer parameters than the table type |
 | `intern-table`, `intern-table-map`, `intern-table-1`, `intern-table-map-1` | cpu | worker threads interning the same type-like objects under string keys and records under number keys, then hits and misses: one shared `InternTable` per kind of key, or a module-level `Map` per thread (the `-map` entries), with 8 threads or 1 (the `-1` entries); under Node.js every thread has its own tables |
 | `json-records` | cpu | `JSON.stringify`, typed `JSON.parse`, Map aggregation |
 | `json-unions` | cpu | `JSON.parse` into discriminated unions: an event log with eight kinds and nested expression trees with nine, evaluated after the cast |
@@ -30,7 +31,9 @@ Application-shaped workloads for measuring the speed of compiled executables. Ea
 | `record-boundaries` | cpu | records built from unchecked array reads passed to and returned from annotated functions |
 | `records-sort` | cpu | comparator sorts, group-by, `reduce`/`filter` |
 | `regex-logs` | cpu | regex `exec` with groups, `test`, global `replace` |
+| `regex-replacers` | cpu | regex `replace`/`replaceAll` with inline callbacks whose parameters have no annotations: dictionary placeholders, snake_case to camelCase, date reordering, optional captures, capitalization, and a string search that reads the offset |
 | `region-builds` | cpu | a watch-mode build loop over `LifetimeRegion`: each build binds a program in a new region and releases the previous one, which a cache keeps referenced for two builds |
+| `string-iteration` | cpu | code point iteration over text that mixes ASCII, Latin-1 letters, CJK and emoji: a for-of word tokenizer, spread reversal, and `Array.from` over words |
 | `template-render` | cpu | template literals, escaping, `map`/`join` |
 | `throw-chains` | cpu | exceptions caught 2, 5 and 20 recursive calls above the throw, through direct calls and through a callback, and a backtracking parser that throws on a failed alternative |
 | `thread-slots`, `thread-slots-cache` | cpu | worker threads reading one published type graph from an `InternTable` and keeping per-thread state for each type they visit: a `ThreadSlots` family, or a direct-mapped cache by id in front of a `Map` by id (the `-cache` entry); under Node.js both are per thread |

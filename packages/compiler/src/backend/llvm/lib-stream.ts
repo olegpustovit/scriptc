@@ -743,7 +743,7 @@ export function emitStreamLibCall(host: LlvmEmitterContext, e: LibCallExpr): LlV
     const helpers = packed(5 + n + k, helperCount);
     let at = 5 + n + k + helperCount;
     const take = (present: boolean): string => (present ? args[at++]!.name : "null");
-    const box = take(((flags >> 1) & 3) === 2);
+    const box = take(((flags >> 1) & 3) >= 2);
     const signal = take((flags & 32) !== 0);
     const abort = take((flags & 32) !== 0);
     const head =

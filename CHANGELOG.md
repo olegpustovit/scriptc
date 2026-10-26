@@ -6,6 +6,42 @@ All notable changes to scriptc will be documented in this file.
 
 <!-- release:start -->
 
+## 0.4.5
+
+### Highlights
+
+- **Fixes:**
+  - Release builds read a typed array's length without a header load that could read a freed view.
+  - `net.Socket` `write()` returns Node's backpressure boolean and fires `'drain'`.
+  - Super calls in JavaScript method values call the declared base method.
+  - Calling a non-function through an asserted callee throws Node's TypeError.
+- **Faster programs:**
+  - Exceptions propagate by unwinding from directly called functions on Linux, instead of status checks after every call.
+  - Typed-array loops prove their bounds and keep their views disjoint in more cases, including views over shared memory in worker programs; integer loops stay in integers across nested counted loops, pure helper calls, powers of two and byte reads.
+  - Lone array callbacks run as loops with their bodies inlined, and row sums run two rows per pass.
+  - Number-key maps look keys up on their integer view and write updates through the entry the read found; small number-key maps use a direct index.
+  - Strings: base64 decodes eight characters at a time; Buffers fill, swap byte order and decode `utf16le` a word at a time; readline splits input in one scan; string scans over non-ASCII strings use their UTF-16 units.
+  - Untyped code: property caches also cache absent properties, object literal members go through the store caches, calls on plain arrays skip the method ladder, and dynamic values dispose without key-cache walks.
+  - JSON parses into discriminated unions, and dynamic values convert into nested unions, in one pass.
+  - BigInt division settles quotients from the top limbs, and limb shifts are vectorized.
+- **Faster builds:**
+  - Function bodies are emitted on up to eight workers, including in dev builds, and repeated work in LLVM module emission is cut.
+  - Linux executables link with lld when the driver finds it, and unchanged executables are reused without selecting the runtime pack.
+  - Dev builds reuse their frontend output after edits that keep token positions, and unchanged frontend inputs are checked by file identity before hashing.
+  - Lowering fetches only the syntax trees it reads, and the large compiler tables are built on first use.
+  - Release builds of the native compiler use a profile collected on the release commit.
+  - Type checking can use a tsc-ts server shared by later builds (opt-in).
+- **Node.js parity:**
+  - Crypto: RSA key generation lengths, RSA-PSS keys, encrypted private keys, `X509Certificate` fields and methods, and TLS certificates and `tls.Server` contexts.
+  - zlib: Brotli compression and decompression.
+  - Dates are mutable objects with Node's setters and conversions; URL hosts and paths parse as the URL Standard does, including non-ASCII hosts with UTS #46.
+  - `Math`, `JSON` and `Reflect` are real objects in JavaScript; objects can inherit from JavaScript class prototypes; typed arrays held as untyped values support named properties and `Symbol.species`.
+  - Error messages: `JSON.parse` syntax errors use V8's messages and positions; `Object.getPrototypeOf` of an Error answers `Error.prototype`.
+  - `util.inspect` of dynamic classes, functions and `%o` arguments, and `Symbol.toStringTag` fields and getters, match Node.
+- **npm packages:** more npm and CommonJS dependencies compile statically, including namespace-style packages with guarded declarations and `var` exports, and untyped Maps, Sets and arrays are typed from their uses.
+
+<!-- release:end -->
+
 ## 0.4.4
 
 ### Highlights
@@ -28,8 +64,6 @@ All notable changes to scriptc will be documented in this file.
   - TypedArray methods run on typed arrays held as untyped values, and unions of typed-array classes compile. Borrowed `TypedArray.prototype.set` calls compile and throw Node's TypeError for other targets.
   - Split CommonJS `require` bindings, `__`-prefixed exports, string-key destructuring of `any` values, and record key order for values JavaScript built.
 - **npm packages:** zod 4 and `@hono/zod-validator` values are projected at the declaration boundary.
-
-<!-- release:end -->
 
 ## 0.4.3
 

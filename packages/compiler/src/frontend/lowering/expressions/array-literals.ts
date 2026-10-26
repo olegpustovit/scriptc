@@ -29,6 +29,7 @@ import { lowerTernary } from "./narrowing.js";
 import { lowerCollectionSpread } from "../containers/collection-methods.js";
 import { strCharsCall } from "../containers/array-construction.js";
 import { generatorDrain } from "../iterator-adapters.js";
+import { isMimeParamsIterable } from "../builtins/mime.js";
 import { isSearchParamsIterable } from "../builtins/url.js";
 import { dynUndefinedExpr, varRef } from "../../../ir/build.js";
 import { arrayValueStore, primitiveElement } from "../array-values.js";
@@ -504,7 +505,7 @@ export function lowerArrayLiteral(
       // interned helper as Array.from(s); the result rides the array
       // machinery below like any string[] source.
       if (src.type.kind === "string") {
-        src = strCharsCall(lowerer, src, locOf(el));
+        src = strCharsCall(src, locOf(el));
       }
       // `[...typedArray]`: represented typed arrays are dense numeric
       // iterables, so drain their elements into the fresh number[] that
@@ -543,7 +544,9 @@ export function lowerArrayLiteral(
       // `[...sp]` and `[...sp.entries()]` over a URLSearchParams: its
       // checked-dynamic view iterates the live pair list, and the drained
       // [name, value] pairs convert to the literal's tuple elements.
-      const searchParamsSource = isSearchParamsIterable(lowerer, el.expression);
+      const searchParamsSource =
+        isSearchParamsIterable(lowerer, el.expression) ||
+        isMimeParamsIterable(lowerer, el.expression);
       if (src.type.kind === "searchParams") src = lowerer.coerceInto(el.expression, src, DYN);
       // A native checked iterable can supply scalar elements even when
       // the checker inferred a typed array from its producer. Drain once

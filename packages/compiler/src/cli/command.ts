@@ -1,3 +1,4 @@
+import type { TypePatchCommandRequest } from "../frontend/type-patches/command.js";
 import { rmSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -19,7 +20,12 @@ import {
 } from "../node-islands/policy.js";
 import { TIER_MODES, type TierMode } from "../frontend/tier-analysis.js";
 import { buildEnvelope } from "../diagnostics/envelope.js";
-import { renderConfigWarnings, renderWarnings } from "../diagnostics/render.js";
+import {
+  renderConfigWarnings,
+  renderTypePatchWarnings,
+  renderWarnings,
+} from "../diagnostics/render.js";
+import { isTypePatchCode } from "../diagnostics/diagnostic.js";
 import { isPerformanceCode, renderPerformanceWarnings } from "../diagnostics/dynamic-tier.js";
 import { isNativeOptimization } from "../backend/optimization.js";
 import {
@@ -111,6 +117,7 @@ async function main(args: string[], host: CliHost): Promise<number> {
       values["windows-subsystem"] !== undefined ||
       values["detached-exit"] ||
       values["target-cpu"] !== undefined ||
+      values["cpu-dispatch"] !== undefined ||
       values["profile-generate"] !== undefined ||
       values["profile-use"] !== undefined ||
       values.sparse ||
@@ -171,6 +178,7 @@ async function main(args: string[], host: CliHost): Promise<number> {
       values["windows-subsystem"] !== undefined ||
       values["detached-exit"] ||
       values["target-cpu"] !== undefined ||
+      values["cpu-dispatch"] !== undefined ||
       values["profile-generate"] !== undefined ||
       values["profile-use"] !== undefined ||
       (values["npm-static"] ?? []).length > 0 ||
@@ -200,6 +208,39 @@ async function main(args: string[], host: CliHost): Promise<number> {
     process.stdout.write(`${outputPath}\n`);
     return 0;
   }
+  if (command === "types") {
+    const sub = positionals[1];
+    const rest = positionals.slice(2);
+    let request: TypePatchCommandRequest;
+    if (sub === "patch" && rest.length === 3) {
+      request = {
+        action: "patch",
+        cwd: process.cwd(),
+        pkg: rest[0]!,
+        selector: rest[1]!,
+        type: rest[2]!,
+        range: values.range ?? null,
+        dryRun: values["dry-run"],
+      };
+    } else if (
+      sub === "list" &&
+      rest.length === 0 &&
+      values.range === undefined &&
+      !values["dry-run"]
+    ) {
+      request = { action: "list", cwd: process.cwd() };
+    } else {
+      fail(
+        `scriptc types takes "patch <package> <selector> <type>" (with --range or --dry-run) or "list"\n\n${USAGE}`,
+      );
+    }
+    const result = await host.typePatches(request);
+    process.stdout.write(result.stdout);
+    process.stderr.write(result.stderr);
+    return result.exitCode;
+  }
+  if (values.range !== undefined || values["dry-run"])
+    fail(`--range and --dry-run are scriptc types patch options\n\n${USAGE}`);
   if (values.sparse) fail(`--sparse is a merge-profiles option\n\n${USAGE}`);
   if (command !== "build" && command !== "run" && command !== "coverage") {
     fail(`unknown command "${command}"\n\n${USAGE}`);
@@ -229,6 +270,7 @@ async function main(args: string[], host: CliHost): Promise<number> {
       values["windows-subsystem"] !== undefined ||
       values["detached-exit"] ||
       values["target-cpu"] !== undefined ||
+      values["cpu-dispatch"] !== undefined ||
       values["profile-generate"] !== undefined ||
       values["profile-use"] !== undefined ||
       (values["npm-static"] ?? []).length > 0 ||
@@ -238,7 +280,7 @@ async function main(args: string[], host: CliHost): Promise<number> {
       hasNodeIslandFlags(values)
     ) {
       fail(
-        "scriptc build --lib takes no --backend/--emit/--print/--optimization/--strip/--windows-subsystem/--detached-exit/--target-cpu/--profile-generate/--profile-use/--npm-static/--ffi/--external-types/--tier/--explain-dynamic: the profile pins the emission and optimization, npm imports are judged automatically, outbound FFI belongs to executable builds, external type mappings belong to coverage, and library artifacts are static-tier only",
+        "scriptc build --lib takes no --backend/--emit/--print/--optimization/--strip/--windows-subsystem/--detached-exit/--target-cpu/--cpu-dispatch/--profile-generate/--profile-use/--npm-static/--ffi/--external-types/--tier/--explain-dynamic: the profile pins the emission and optimization, npm imports are judged automatically, outbound FFI belongs to executable builds, external type mappings belong to coverage, and library artifacts are static-tier only",
       );
     }
     const profilePath = resolve(profileArg);
@@ -283,6 +325,9 @@ async function main(args: string[], host: CliHost): Promise<number> {
   }
   if (command === "coverage" && values["target-cpu"] !== undefined) {
     fail(`--target-cpu is a build/run option\n\n${USAGE}`);
+  }
+  if (command === "coverage" && values["cpu-dispatch"] !== undefined) {
+    fail(`--cpu-dispatch is a build/run option\n\n${USAGE}`);
   }
   if (command === "coverage" && values["detached-exit"]) {
     fail(`--detached-exit is a build/run option\n\n${USAGE}`);
@@ -464,6 +509,7 @@ async function main(args: string[], host: CliHost): Promise<number> {
           ...(values.optimization === undefined ? {} : { optimization: values.optimization }),
           strip: values.strip,
           detachedExit: values["detached-exit"],
+          ...(values["cpu-dispatch"] === undefined ? {} : { cpuDispatch: values["cpu-dispatch"] }),
           ...(values["profile-generate"] === undefined
             ? {}
             : { profileGenerate: values["profile-generate"] }),
@@ -584,6 +630,7 @@ async function main(args: string[], host: CliHost): Promise<number> {
       ...(windowsSubsystem !== undefined ? { windowsSubsystem } : {}),
       ...(values["detached-exit"] ? { detachedExit: true } : {}),
       ...targetCpuField(targetCpu),
+      ...(values["cpu-dispatch"] === undefined ? {} : { cpuDispatch: values["cpu-dispatch"] }),
       // The instrumented program resolves a relative pattern against its own
       // working directory; resolve it here, where the user wrote it.
       ...(values["profile-generate"] === undefined
@@ -637,20 +684,30 @@ async function main(args: string[], host: CliHost): Promise<number> {
       // keeps stderr for the program's own output.
       const color = process.stderr.isTTY ?? false;
       const config = warnings.filter((d) => d.code === "SC8004");
-      const divergences = warnings.filter((d) => !isPerformanceCode(d.code) && d.code !== "SC8004");
+      const patches = warnings.filter((d) => isTypePatchCode(d.code));
+      const divergences = warnings.filter(
+        (d) => !isPerformanceCode(d.code) && d.code !== "SC8004" && !isTypePatchCode(d.code),
+      );
       const performance = warnings.filter((d) => isPerformanceCode(d.code));
       if (config.length > 0)
         process.stderr.write(
           renderConfigWarnings(config, result.sourceTexts ?? new Map(), { color }) + "\n",
         );
-      if (divergences.length > 0) {
+      if (patches.length > 0) {
         if (config.length > 0) process.stderr.write("\n");
+        process.stderr.write(
+          renderTypePatchWarnings(patches, result.sourceTexts ?? new Map(), { color }) + "\n",
+        );
+      }
+      if (divergences.length > 0) {
+        if (config.length > 0 || patches.length > 0) process.stderr.write("\n");
         process.stderr.write(
           renderWarnings(divergences, result.sourceTexts ?? new Map(), { color }) + "\n",
         );
       }
       if (performance.length > 0) {
-        if (divergences.length > 0 || config.length > 0) process.stderr.write("\n");
+        if (divergences.length > 0 || config.length > 0 || patches.length > 0)
+          process.stderr.write("\n");
         process.stderr.write(renderPerformanceWarnings(performance) + "\n");
       }
     }

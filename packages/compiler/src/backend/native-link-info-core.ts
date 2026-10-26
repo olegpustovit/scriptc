@@ -55,18 +55,26 @@ export interface NativeLinkFeatures {
    * Absent (false) for programs without them. */
   handleProps?: boolean;
   declAdopt?: boolean;
+  typeOrigins?: boolean;
   /** for await over checked-dynamic values: scr_dyn_for_await.c. Absent
    * (false) for programs without it. */
   dynForAwait?: boolean;
   /** events.once with options: scr_events_once_signal.c. Absent (not
    * false) for programs without it. */
   eventsOnceSignal?: boolean;
+  /** util.MIMEType and util.MIMEParams: scr_mime.c. */
+  mime?: boolean;
+  /** util.debounce and util.throttle: scr_util_timing.c. */
+  utilTiming?: boolean;
   /** Buffer.prototype methods called on checked-dynamic values link
    * scr_bytes_dyn.c; absent (false) for programs without them. */
   dynBuffer?: boolean;
   /** Builtin functions read as values (Buffer.byteLength, Buffer.alloc,
    * fs.realpathSync) link scr_builtin_values.c; absent (false) otherwise. */
   builtinValues?: boolean;
+  /** createRequire's computed require and require.resolve link
+   * scr_require.c; absent (false) otherwise. */
+  computedRequire?: boolean;
   events: boolean;
   emitter: boolean;
   symbol: boolean;

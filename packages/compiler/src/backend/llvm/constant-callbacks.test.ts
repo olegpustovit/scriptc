@@ -299,6 +299,47 @@ test("receiver readers propagate backwards through direct calls and recursion", 
   ).toBe(false);
 });
 
+test("signature adapters that only forward the receiver ignore it with their original", () => {
+  const forward = (receiver: IrExpr): IrStmt => ({
+    kind: "return",
+    value: {
+      kind: "callValue",
+      callee: ref("f.0"),
+      receiver,
+      args: [{ kind: "varRef", localId: "a.0", type: F64, loc }],
+      type: BOOL,
+      loc,
+    },
+    loc,
+  });
+  const ambient: IrExpr = { kind: "libCall", fn: "dyn.this", args: [], type: { kind: "dyn" }, loc };
+  const adapter: IrFunction = {
+    name: "%fn.adapt.x.impl",
+    params: [{ localId: "a.0", name: "a", type: F64 }],
+    captures: [{ localId: "f.0", name: "f", type: callback }],
+    locals: [
+      { id: "f.0", name: "f", type: callback, mutable: false, boxed: true },
+      { id: "a.0", name: "a", type: F64, mutable: false },
+    ],
+    returnType: BOOL,
+    body: [forward(ambient)],
+    loc,
+  };
+  const readers = (): AmbientReceiverReaders =>
+    new AmbientReceiverReaders(new Map([[adapter.name, adapter]]));
+  // The adapter itself reads the receiver, only to forward it.
+  expect(readers().ignores(adapter)).toBe(false);
+  expect(readers().forwardsOnly(adapter)).toBe(true);
+  // Any other read of the receiver, or forwarding something else, does not.
+  adapter.body = [thisRead, forward(ambient)];
+  expect(readers().forwardsOnly(adapter)).toBe(false);
+  adapter.body = [forward(ref("a.0", F64))];
+  expect(readers().forwardsOnly(adapter)).toBe(false);
+  adapter.body = [forward(ambient)];
+  adapter.captures = [];
+  expect(readers().forwardsOnly(adapter)).toBe(false);
+});
+
 test("virtual calls admit every same-named method", () => {
   const call: IrStmt = {
     kind: "exprStmt",

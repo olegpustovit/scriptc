@@ -424,7 +424,7 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
   );
 
   test.each(["llvm"] as const)(
-    "a package probing for optional addons through createRequire compiles with deferred refusals (%s)",
+    "a package probing for optional addons through createRequire resolves at run time (%s)",
     async (backend) => {
       const entry = join(pilotRoot, "addon-probe-cli.ts");
       const { coverage } = analyze(entry, { npmStatic: "auto" });
@@ -433,10 +433,18 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
       expect(
         (coverage.runtimeFences ?? []).filter((f) => f.code === "SC2020").map((f) => f.message),
       ).toEqual([
-        expect.stringContaining("'createRequire's require with a computed specifier"),
-        expect.stringContaining("'createRequire's require.resolve as a value'"),
-        expect.stringContaining("'createRequire's require.resolve with a computed request'"),
-        expect.stringContaining("'createRequire's require.resolve with a computed request'"),
+        expect.stringContaining(
+          "createRequire's require with a computed specifier resolves at run time",
+        ),
+        expect.stringContaining(
+          "createRequire's require.resolve with a computed specifier resolves at run time",
+        ),
+        expect.stringContaining(
+          "createRequire's require.resolve with a computed specifier resolves at run time",
+        ),
+        expect.stringContaining(
+          "createRequire's require.resolve with a computed specifier resolves at run time",
+        ),
       ]);
       const outDir = join(cacheDir, "addon-probe", sanitize ? "san" : "plain", backend);
       const result = await compile(entry, {
@@ -461,37 +469,75 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
     },
   );
 
+  // Node would load the installed file, which the compiled program cannot:
+  // the require ends the program with the refusal instead of throwing, so
+  // the package's catch clause does not take its fallback.
   test.each([
     [
-      "computed specifier",
-      'const spec = "node:path"; const path = load(spec);',
-      "computed specifier",
+      "addon",
+      /^scriptc: native addon '.*[\\/]native[\\/]installed\.node' requires Node's addon runtime, which is unavailable in scriptc \[SC2020 at .*index\.js:\d+\]\n$/,
     ],
+    [
+      "module",
+      /^scriptc: createRequire's require of '.*[\\/]installed\.js' resolves to '.*[\\/]installed\.js', which is not part of the compiled program: the module graph is fixed at build time \[SC2020 at .*index\.js:\d+\]\n$/,
+    ],
+  ] as const)(
+    "a computed require of an installed %s ends the program with a refusal",
+    async (kind, stderr) => {
+      const entry = join(pilotRoot, "addon-probe-installed-cli.ts");
+      const outDir = join(cacheDir, "addon-probe-installed", sanitize ? "san" : "plain");
+      const result = await compile(entry, {
+        backend: "llvm",
+        npmStatic: "auto",
+        sanitize,
+        outDir,
+        outPath: join(outDir, "program"),
+      });
+      if (!result.ok)
+        throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+      const nativeRes = await runBinary(result.binaryPath, [kind]);
+      expect(nativeRes.stdout.toString()).toBe("before\n");
+      expect(comparableStderr(nativeRes.stderr).toString()).toMatch(stderr);
+      expect(nativeRes.exitCode).toBe(1);
+    },
+  );
+
+  test.each([
     ["escaped require", 'const alias = load; const path = alias("node:path");', "escapes"],
     [
-      "computed specifier in a catch clause",
-      'try { load("node:path"); } catch { load(String(1)); } const path = load("node:path");',
+      "computed resolve.paths request in a catch clause",
+      'try { load("node:path"); } catch { load.resolve.paths(String(1)); } const path = load("node:path");',
       "outside a try block",
     ],
     [
-      "computed specifier in a function inside a try block",
-      'try { [1].map((n) => load(String(n))); } catch {} const path = load("node:path");',
+      "computed resolve.paths request in a function inside a try block",
+      'try { [1].map((n) => load.resolve.paths(String(n))); } catch {} const path = load("node:path");',
       "outside a try block",
     ],
     [
-      "computed specifier in a class field inside a try block",
-      'try { new (class { addon = load(String(1)); })(); } catch {} const path = load("node:path");',
+      "spread require arguments in a class field inside a try block",
+      'try { new (class { addon = load(...[String(1)]); })(); } catch {} const path = load("node:path");',
       "outside a try block",
     ],
     [
-      "resolve value outside a try block",
-      'const find = load.resolve; const path = load("node:path");',
+      "resolve.paths value outside a try block",
+      'const find = load.resolve.paths; const path = load("node:path");',
       "outside a try block",
     ],
     [
       "escaped require in a try block",
       'try { const alias = load; alias("node:path"); } catch {} const path = load("node:path");',
       "escapes",
+    ],
+    [
+      "computed resolve.paths request",
+      'const spec = "node:path"; load.resolve.paths(spec); const path = load("node:path");',
+      "outside a try block",
+    ],
+    [
+      "spread require arguments",
+      'const specs = ["node:path"]; load(...specs); const path = load("node:path");',
+      "outside a try block",
     ],
     [
       "reassigned require",
@@ -1198,6 +1244,18 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
   test("recursive inferred JavaScript results retain their promised ABI", async () => {
     const entry = join(pilotRoot, "recursive-result-cli.ts");
     const binary = await buildStatic(entry, ["recursive-result"]);
+    const [nodeRes, nativeRes] = await Promise.all([
+      runBinary("node", [entry]),
+      runBinary(binary, []),
+    ]);
+    expect(nativeRes.stdout).toEqual(nodeRes.stdout);
+    expect(comparableStderr(nativeRes.stderr)).toEqual(nodeRes.stderr);
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  }, 180_000);
+
+  test("package values cross at the members their declarations promise", async () => {
+    const entry = join(pilotRoot, "declared-members-cli.ts");
+    const binary = await buildStatic(entry, ["declared-members"]);
     const [nodeRes, nativeRes] = await Promise.all([
       runBinary("node", [entry]),
       runBinary(binary, []),

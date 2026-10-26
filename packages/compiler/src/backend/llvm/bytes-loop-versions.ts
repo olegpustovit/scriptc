@@ -20,6 +20,7 @@ import {
 } from "./counted-loops.js";
 import { emitBytesData, emitBytesHeaderLength, emitBytesSharedStorage } from "./expr-bytes.js";
 import { f64Lit } from "./common.js";
+import { InternalCompilerError } from "../../errors.js";
 import {
   emitStringAsciiFlag,
   emitStringByteLength,
@@ -85,8 +86,15 @@ export interface BytesLoopVersion {
   /** Root receiver bindings, read once before the loop; `string` marks a
    * string whose `charCodeAt` and `charAt` reads the version covers. */
   receivers: { ref: VarRef; global: boolean; string: boolean }[];
-  /** Receivers the guard requires to have no shared storage. */
+  /** Receivers the guard requires to have no shared storage for the fast
+   * copy. */
   ownedReceivers: number[];
+  /** Worker programs: when the bounds hold but a receiver in
+   * `ownedReceivers` has shared storage, the loop runs a second fast copy
+   * instead of the checked one. It skips the bounds checks of `bounds` and
+   * keeps shared-safe accesses (emitBytesLoopVersionGuard's `sharedFast`). Set
+   * when the version proves bounds as well as ownership. */
+  sharedCopy: boolean;
   /** The string reads among `bounds`. */
   stringReads: ReadonlySet<Node>;
   /** The version's one string receiver, when the loop may also run over
@@ -752,6 +760,7 @@ export function matchBytesLoopVersion(
     owned: ownedNodes,
     receivers: order.map((index) => receivers[index]!),
     ownedReceivers: ownedKept.map(([receiver]) => renumber.get(receiver)!),
+    sharedCopy: ownedKept.length > 0 && bounds.size > 0,
     stringReads,
     unitsReceiver,
     unitLengths: unitLengths ?? new Set<IrExpr>(),
@@ -1102,6 +1111,10 @@ function findWhileCounterAccesses(
  * storage, and to `slow` otherwise (including a counted loop whose
  * integer form is not established, or a module receiver not yet set).
  *
+ * With `sharedFast` (a version with `sharedCopy`), the ownership tests are
+ * separate: when everything else holds but a view has shared storage, the
+ * guard branches to `sharedFast` instead of `slow`.
+ *
  * With `unitsFast`, the version's units receiver may instead be a string
  * that is not ASCII: the guard has the runtime publish it as the scan
  * receiver (one read), tests the same accesses against its UTF-16 length,
@@ -1115,6 +1128,7 @@ export function emitBytesLoopVersionGuard(
   fast: string,
   slow: string,
   unitsFast?: string,
+  sharedFast?: string,
 ): { units: string | null; length: string | null } | null {
   const B = host.B;
   const next = (cond: string): void => {
@@ -1146,7 +1160,7 @@ export function emitBytesLoopVersionGuard(
   };
   const lengths = receivers.map((receiver, index) => {
     if (index === unitsIndex) {
-      const read = emitUnitsLength(host, receiver);
+      const read = emitUnitsLength(host, receiver, () => emitUnitsSpan(host, version, index));
       units.read = read;
       return read.length;
     }
@@ -1165,10 +1179,13 @@ export function emitBytesLoopVersionGuard(
     if (string && index !== unitsIndex)
       conditions.push(emitStringAsciiFlag(host, receivers[index]!));
   });
+  // Without `sharedFast`, shared storage sends the loop to the checked copy
+  // with the other failed tests; with it, only to the shared fast copy.
+  const ownership: string[] = [];
   for (const index of version.ownedReceivers) {
     const owned = B.tmp();
     B.line(`${owned} = icmp eq ptr ${emitBytesSharedStorage(host, receivers[index]!)}, null`);
-    conditions.push(owned);
+    (sharedFast !== undefined ? ownership : conditions).push(owned);
   }
   for (const check of version.fixed) {
     const ok = B.tmp();
@@ -1351,7 +1368,22 @@ export function emitBytesLoopVersionGuard(
   const length = version.unitsReceiver !== null ? lengths[version.unitsReceiver]! : null;
   const taken = units.read;
   const target = taken ? B.newLabel("bytes.version.units") : fast;
-  if (valid === "true") B.br(target);
+  if (sharedFast !== undefined && taken)
+    throw new InternalCompilerError("llvm emitter bug: a shared fast copy with a units copy");
+  if (sharedFast !== undefined && ownership.length > 0) {
+    // The bounds hold: unshared views take the owned copy.
+    const split = B.newLabel("bytes.version.owned");
+    let owned = ownership[0]!;
+    for (const cond of ownership.slice(1)) {
+      const all = B.tmp();
+      B.line(`${all} = and i1 ${owned}, ${cond}`);
+      owned = all;
+    }
+    if (valid === "true") B.br(split);
+    else B.condBr(valid, split, slow);
+    B.startBlock(split);
+    B.condBr(owned, target, sharedFast);
+  } else if (valid === "true") B.br(target);
   else B.condBr(valid, target, slow);
   if (!taken) return { units: null, length };
   B.startBlock(target);
@@ -1359,15 +1391,49 @@ export function emitBytesLoopVersionGuard(
   return { units: taken.pointer, length };
 }
 
+/** The range of indexes a version's loop reads from its units receiver, as
+ * two doubles: a counted loop's start and limit, or a while loop's one
+ * counter and the receiver's bound. Both NaN when the version gives no such
+ * range. The runtime converts the receiver at once only when the range is
+ * long enough to pay for it (scr_str_scan_units_for). */
+function emitUnitsSpan(
+  host: LlvmEmitterContext,
+  version: BytesLoopVersion,
+  receiver: number,
+): { from: string; to: string } {
+  // Locals and literals only: they read no string (a `length` of the
+  // receiver would measure it). Anything else leaves the range unbounded.
+  const number = (expr: IrExpr): string | null => {
+    if (expr.kind !== "varRef" && expr.kind !== "numLit") return null;
+    const value = host.emitExpr(expr);
+    return value.type.kind === "f64" ? value.name : null;
+  };
+  const unbounded = { from: "0x7FF8000000000000", to: "0x7FF8000000000000" };
+  const counted = version.counted;
+  let from: IrExpr, to: IrExpr;
+  if (counted) [from, to] = [counted.start, counted.limit];
+  else {
+    const bounded = version.bounded.filter((check) => check.receiver === receiver);
+    if (version.counters.length !== 1 || bounded.length !== 1 || version.paired !== null)
+      return unbounded;
+    [from, to] = [version.counters[0]!.ref, bounded[0]!.bound];
+  }
+  const start = number(from),
+    limit = number(to);
+  return start !== null && limit !== null ? { from: start, to: limit } : unbounded;
+}
+
 /** The length of a version's units receiver `s` in UTF-16 units: its byte
  * length when it is ASCII; otherwise, once it is the scan receiver, the
  * published unit count (0 when the runtime does not hold its units). When
  * `s` is not already the scan receiver, the runtime converts it to units
- * and publishes it (scr_str_scan_units). Also the units pointer, whether
- * the loop is to read it, and whether the published receiver is `s`. */
+ * and publishes it if the loop's `span` makes that pay
+ * (scr_str_scan_units_for). Also the units pointer, whether the loop is to
+ * read it, and whether the published receiver is `s`. */
 function emitUnitsLength(
   host: LlvmEmitterContext,
   s: string,
+  span: () => { from: string; to: string },
 ): { length: string; pointer: string; taken: string; published: string } {
   const B = host.B;
   const sz = host.sizeType;
@@ -1381,14 +1447,15 @@ function emitUnitsLength(
   B.startBlock(publish);
   // When `s` is already the scan receiver (an earlier loop over it published
   // it), its units stay published until the runtime clears the scan: skip
-  // the call.
+  // the call. Loops re-entered over one string take that path; the weights
+  // keep the call and its reach out of the loop's code.
   const held = B.tmp(),
     holds = B.tmp();
   B.line(`${held} = load ptr, ptr @scr_str_scan`);
   B.line(`${holds} = icmp eq ptr ${held}, ${s}`);
   const call = B.newLabel("bytes.version.publish.units"),
     load = B.newLabel("bytes.version.publish.load");
-  B.condBr(holds, load, call);
+  B.condBr(holds, load, call, `, !prof !{!"branch_weights", i32 1000, i32 1}`);
   B.startBlock(call);
   host.declare(STRING_SCAN_UNITS_DECL);
   const receiver = B.tmp(),
@@ -1398,7 +1465,8 @@ function emitUnitsLength(
     countSlot = B.tmp(),
     count = B.tmp(),
     published = B.tmp();
-  B.line(`call void @scr_str_scan_units(ptr ${s})`);
+  const { from: first, to: bound } = span();
+  B.line(`call void @scr_str_scan_units_for(ptr ${s}, double ${first}, double ${bound})`);
   B.br(load);
   B.startBlock(load);
   B.line(`${receiver} = load ptr, ptr @scr_str_scan`);

@@ -160,7 +160,12 @@ export const JS_ANY_OPERATOR_CODES: ReadonlySet<number> = new Set([2362, 2363, 2
  * whose types come entirely from inference (checkJs + JSDoc) and whose JS
  * relaxation stance applies. */
 export function isJsSourceFileName(fileName: string): boolean {
-  // Only the final few code units can match. Keep the same expression so
-  // unusual filenames retain its classification.
-  return /\.(js|mjs|cjs|jsx)$/.test(fileName.slice(-6));
+  // The same classification as /\.(js|mjs|cjs|jsx)$/, without a regular
+  // expression: this runs for most type queries.
+  return (
+    fileName.endsWith(".js") ||
+    fileName.endsWith(".mjs") ||
+    fileName.endsWith(".cjs") ||
+    fileName.endsWith(".jsx")
+  );
 }

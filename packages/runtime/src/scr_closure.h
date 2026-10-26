@@ -98,7 +98,7 @@ typedef struct ScrClosure {
    * (like the dyn→closure edge): a cycle through it is merely never
    * collected. */
   ScrBox *props;
-  uint32_t function_kind; /* low bits: 0 ordinary, 1 generator, 2 async, 3 async generator; bit 2: ordinary own prototype; bit 3: checked callable adapter in caps[0] */
+  uint32_t function_kind; /* low bits: 0 ordinary, 1 generator, 2 async, 3 async generator; bit 2: ordinary own prototype; bit 3: checked callable adapter in caps[0]; bit 4: SCR_FN_RECEIVER_FREE */
   /* The root's `length` as boxed values report it; meaningful only when
    * identity is set (the root's own boxes carry their arity). */
   uint32_t identity_length;
@@ -116,6 +116,13 @@ typedef struct ScrClosure {
   void *fn_borrowed;
   ScrBox *caps[];
 } ScrClosure;
+
+/* function_kind bit 4: the body never observes the ambient receiver (the
+ * `this` an unbound call binds), so compiled callers skip the receiver
+ * bracket around an indirect call. Set only by the compiler; the kind
+ * proper is function_kind & SCR_FN_KIND_MASK. */
+#define SCR_FN_RECEIVER_FREE 16u
+#define SCR_FN_KIND_MASK 15u
 
 ScrClosure *scr_closure_new(void *fn, size_t ncaps); /* +1; caller fills caps with +1 box refs */
 

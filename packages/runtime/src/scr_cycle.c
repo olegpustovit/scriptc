@@ -603,7 +603,8 @@ static SCR_TL unsigned scr_cyc_backlog_shift[SCR_CYC_NGENS];
 static SCR_TL bool scr_cyc_backlog_judged[SCR_CYC_NGENS];
 #endif
 
-/* Mature objects in the last full pass's dead set (scr_cyc_adapt_growth). */
+/* Mature objects in the last pass's dead set (scr_cyc_adapt_growth,
+ * scr_cyc_adapt_nursery). */
 #ifndef SCR_WORKERS
 static SCR_TL size_t scr_cyc_mature_dead = 0;
 #endif
@@ -639,23 +640,74 @@ static SCR_TL size_t scr_cyc_death_due_live = 0;
 
 /* The nursery trigger a program sets for itself
  * (scr_cyc_set_nursery_threshold), 0 for the default; SCR_CYCLE_THRESHOLD
- * takes precedence over it. */
+ * takes precedence over it. Either pins the trigger. */
 static long scr_cyc_nursery_threshold_set = 0;
 static SCR_TL size_t scr_cyc_nursery_threshold_cached = 0;
+#define SCR_CYC_NURSERY_ADAPTIVE SIZE_MAX
 
-static size_t scr_cyc_nursery_threshold(void) {
+/* An unpinned trigger follows where cyclic garbage dies. Garbage that
+ * outlives the nursery window survives its nursery pass and is promoted,
+ * and then only a mature or full pass finds it, after walking that level's
+ * live candidates. So after each scheduled mature or full pass whose dead
+ * set held more mature and old objects than 1/SCR_CYC_NURSERY_RATIO of what
+ * the nursery passes since the previous one freed, the window doubles, up
+ * to SCR_CYC_NURSERY_MAX_SHIFT doublings (4096 candidates); after one that
+ * held less than a quarter of that share, it halves, down to
+ * SCR_CYC_NURSERY_CANDIDATES.
+ * `nursery_freed`: what the nursery passes freed since the last scheduled
+ * mature or full pass. */
+#define SCR_CYC_NURSERY_RATIO 8
+#define SCR_CYC_NURSERY_MAX_SHIFT 4
+static SCR_TL unsigned char scr_cyc_nursery_shift = 0;
+static SCR_TL size_t scr_cyc_nursery_freed = 0;
+
+static size_t scr_cyc_nursery_pinned(void) {
   if (scr_cyc_nursery_threshold_cached == 0) {
     const char *env = scr_getenv("SCR_CYCLE_THRESHOLD");
     long v = env ? strtol(env, NULL, 10) : 0;
     if (v <= 0) v = scr_cyc_nursery_threshold_set;
-    scr_cyc_nursery_threshold_cached = v > 0 ? (size_t)v : SCR_CYC_NURSERY_CANDIDATES;
+    scr_cyc_nursery_threshold_cached = v > 0 ? (size_t)v : SCR_CYC_NURSERY_ADAPTIVE;
   }
   return scr_cyc_nursery_threshold_cached;
+}
+
+/* The pinned trigger, or the default one. The scheduled-age rule counts
+ * collection points in it, so the adaptation does not lengthen how long an
+ * older backlog waits at them. */
+static size_t scr_cyc_nursery_base(void) {
+  size_t pinned = scr_cyc_nursery_pinned();
+  return pinned != SCR_CYC_NURSERY_ADAPTIVE ? pinned : SCR_CYC_NURSERY_CANDIDATES;
+}
+
+static size_t scr_cyc_nursery_threshold(void) {
+  size_t pinned = scr_cyc_nursery_pinned();
+  if (pinned != SCR_CYC_NURSERY_ADAPTIVE) return pinned;
+  return (size_t)SCR_CYC_NURSERY_CANDIDATES << scr_cyc_nursery_shift;
+}
+
+/* Adapts an unpinned trigger to the mature and old objects a scheduled
+ * mature or full pass reclaimed; returns whether the trigger changed. */
+static SCR_CYC_SCHEDULING bool scr_cyc_adapt_nursery(size_t older_freed) {
+  size_t nursery_freed = scr_cyc_nursery_freed;
+  scr_cyc_nursery_freed = 0;
+  if (scr_cyc_nursery_pinned() != SCR_CYC_NURSERY_ADAPTIVE) return false;
+  if (older_freed * SCR_CYC_NURSERY_RATIO > nursery_freed) {
+    if (scr_cyc_nursery_shift == SCR_CYC_NURSERY_MAX_SHIFT) return false;
+    scr_cyc_nursery_shift++;
+    return true;
+  }
+  if (older_freed * SCR_CYC_NURSERY_RATIO * 4 < nursery_freed && scr_cyc_nursery_shift > 0) {
+    scr_cyc_nursery_shift--;
+    return true;
+  }
+  return false;
 }
 
 void scr_cyc_set_nursery_threshold(long threshold) {
   scr_cyc_nursery_threshold_set = threshold;
   scr_cyc_nursery_threshold_cached = 0;
+  scr_cyc_nursery_shift = 0;
+  scr_cyc_nursery_freed = 0;
 }
 
 /* The number of buffered candidates (across every generation) at which the
@@ -881,7 +933,14 @@ static SCR_CYC_SCHEDULING void scr_cyc_scheduled_pass(unsigned gen, bool by_grow
   size_t freed = scr_cyc_pass(gen);
   scr_cyc_keep_base = false;
   size_t old_reclaimed = scr_cyc_old_freed - old_freed_before + scr_cyc_mature_dead;
-  if (gen == SCR_CYC_NURSERY) return;
+  if (gen == SCR_CYC_NURSERY) {
+    scr_cyc_nursery_freed += freed;
+    return;
+  }
+  if (scr_cyc_adapt_nursery(old_reclaimed)) {
+    scr_cyc_trigger = scr_cyc_buffered() + scr_cyc_nursery_threshold();
+    scr_cyc_window_update();
+  }
   if (scr_cands.n != 0) {
     scr_cyc_backlog_judged[gen] = true;
     if (freed * SCR_CYC_GROWTH_DIV >= scr_cands.n)
@@ -940,7 +999,7 @@ void scr_cyc_collect_scheduled(void) {
   if (!scr_cyc_older_backlog()) {
     scr_cyc_scheduled_mature_age = 0;
   } else if (++scr_cyc_scheduled_mature_age
-             >= scr_cyc_nursery_threshold()) {
+             >= scr_cyc_nursery_base()) {
     scr_cyc_scheduled_pass(SCR_CYC_OLD, false, false);
     return;
   }
@@ -1981,7 +2040,7 @@ static SCR_CYC_COMPACT size_t scr_cyc_settle(unsigned gen_limit, bool doomed) {
     ScrCycHdr *h = scr_cyc_hdr(obj);
     const ScrCycType *type = scr_cyc_type(h);
     if (gen_limit < SCR_CYC_OLD) scr_cyc_freed(type, gen_limit);
-    else scr_cyc_mature_dead += scr_cyc_gen(h) == SCR_CYC_MATURE;
+    scr_cyc_mature_dead += scr_cyc_gen(h) == SCR_CYC_MATURE;
 #ifdef SCR_YIN
     if (scr_cyc_gen(h) == SCR_CYC_YOUNG) scr_yin_leave(h, obj);
 #endif

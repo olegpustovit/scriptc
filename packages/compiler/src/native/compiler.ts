@@ -21,7 +21,7 @@ import type {
   CompileRequestResult,
 } from "../compile-types.js";
 import { LlvmUnsupportedError } from "../backend/llvm/emitter.js";
-import { executableLinkInputs } from "../backend/link-plan-core.js";
+import { executableLinkInputs, systemLibraryLinkerArgs } from "../backend/link-plan-core.js";
 import { formatNativeLinkInfo } from "../backend/native-link-info-core.js";
 import {
   emitNativeObject,
@@ -70,6 +70,7 @@ import { prepareNativeExecutable, prepareNativeLibrary } from "./prepare.js";
 import { buildSanitizedRuntime, sanitizerDriver, sanitizerFlags } from "./sanitizer.js";
 import { lldLinkerArgs } from "../backend/lld.js";
 import { openNativeExecutableCache } from "./executable-cache.js";
+import { LinkerJobs } from "./linker-job.js";
 import { nativeFileIdentity } from "./file-identity.js";
 
 /** The first partition keeps the whole-object key used before partitioning. */
@@ -526,15 +527,18 @@ export class NativeCompiler {
           ...lld,
           ...plan.driverFlags,
           ...plan.inputs,
-          ...plan.systemLibraries.map((name) => `-l${name}`),
+          ...systemLibraryLinkerArgs(target, plan.systemLibraries),
           "-o",
           stagedOutput,
         ];
-        const cacheable = executableCache?.trace(linkArgs, stage) ?? false;
+        // Host Linux links with lld run the linker job the driver would.
+        const jobs = LinkerJobs.open(this.cache, toolchain, lld, options.sanitize ?? false);
+        const job = jobs?.link([...plan.inputs, stagedOutput], stage);
+        const cacheable = executableCache?.trace(linkArgs, stage, job) ?? false;
         timing("link-inputs");
         // A successful dependency trace already produced this executable.
         // Keep its verified output instead of asking the linker to repeat it.
-        if (!cacheable) {
+        if (!cacheable && (job?.run(linkArgs, true) ?? null) === null) {
           const driver = options.sanitize ? sanitizerDriver(toolchain) : toolchain.linker;
           try {
             runNativeTool(driver, linkArgs);

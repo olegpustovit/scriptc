@@ -348,6 +348,11 @@ async function build() {
         "artifacts/licenses/v8-number-radix.txt",
         "BSD-3-Clause",
       ],
+      [
+        join(vendorRoot, "v8-ieee754", "LICENSE"),
+        "artifacts/licenses/v8-ieee754.txt",
+        "BSD-3-Clause",
+      ],
       [join(vendorRoot, "unicode", "LICENSE"), "artifacts/licenses/unicode.txt", "Unicode-3.0"],
       [join(zlib, "LICENSE"), "artifacts/licenses/zlib.txt", "Zlib"],
       [join(vendorRoot, "brotli", "LICENSE"), "artifacts/licenses/brotli.txt", "MIT"],
@@ -366,7 +371,7 @@ async function build() {
       package: packageManifest.name,
       version: packageManifest.version,
       target: RUNTIME_PACK_MATRIX.target,
-      runtime_abi: { version: 44, marker: "scr_runtime_abi_v44" },
+      runtime_abi: { version: 46, marker: "scr_runtime_abi_v46" },
       compiler: {
         command: compiler,
         identity: compilerVersion,

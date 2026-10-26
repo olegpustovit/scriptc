@@ -67,13 +67,12 @@ export class NarrowingStability {
     // Program-level queries before the program's files are split concern
     // declarations, never narrowed reads in function bodies.
     if (this.files === null) return null;
-    const position = widePosition(node);
-    if (position === null) return null;
     const cached = this.widened.get(node);
     if (cached !== undefined) return cached;
+    const position = widePosition(node);
     let result: ts.Type | null = null;
     try {
-      result = this.computeWidened(node, position);
+      if (position !== null) result = this.computeWidened(node, position);
     } finally {
       this.widened.set(node, result);
     }
@@ -915,6 +914,15 @@ const INERT_CONSTRUCTORS = new Set([
   "BigInt64Array",
   "BigUint64Array",
 ]);
+
+/** The receiver whose type widenedType reads for `node`: a property read in
+ * a slot that accepts its declared type (an argument, a return, a typed
+ * binding or literal). Whole-program analyses batch these receivers. */
+export function widenedReceiver(node: ts.Node): ts.Expression | null {
+  return ts.isPropertyAccessExpression(node) && widePosition(node) === "context"
+    ? node.expression
+    : null;
+}
 
 /** Where a stale narrowed read can keep its declared representation: the
  * receiver of `?.`, an absence/type/truthiness test, or a slot whose

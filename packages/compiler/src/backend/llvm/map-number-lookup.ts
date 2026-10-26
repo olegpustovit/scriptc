@@ -4,9 +4,10 @@
  * direct index in the runtime (scr_map.c). Reads go through the internal
  * sc_map_entry_f64 helper (emitter.ts helperDefs), which LLVM inlines: it
  * resolves directly indexed maps without a call and other maps through
- * the internal sc_map_entry_f64_hashed probe, which hashes the key as the
- * runtime does and defers to scr_map_entry_f64 only for wide bucket
- * tables. Both only read memory. The generated code then reads the entry's
+ * the internal sc_map_entry_f64_hashed probe (sc_map_entry_f64_hashed_int
+ * for a key with an integer view), which hashes the key as the runtime
+ * does and defers to scr_map_entry_f64 only for wide bucket tables. Both
+ * only read memory. The generated code then reads the entry's
  * value slot itself and retains a reference value with the value type's own
  * retain, which is the adapter the collection was constructed with.
  * String-keyed reads use the same entry contract through the internal

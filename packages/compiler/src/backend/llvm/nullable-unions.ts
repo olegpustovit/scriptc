@@ -89,19 +89,28 @@ export const NULLABLE_ABSENT = "@sc_nullable_absent";
 
 /** The reference arms whose instances are never NULL. Class and record
  * entry points all tolerate NULL; strings, Stats snapshots, arrays, maps and
- * sets retain through a NULL-skipping wrapper (shapes.ts). Object arms are
- * always truthy and compare by identity; string arms are truthy when
- * non-empty and compare bytes. */
+ * sets retain through a NULL-skipping wrapper (shapes.ts), as do closures
+ * (function arms). Object arms are always truthy and compare by identity
+ * (function arms by identity root); string arms are truthy when non-empty
+ * and compare bytes. */
 export type NullableRefArm =
   | { kind: "object"; className: string }
   | { kind: "record"; shapeId: string }
   | { kind: "string" }
   | { kind: "stats" }
-  | (IrType & { kind: "array" | "map" | "set" });
+  | (IrType & { kind: "array" | "map" | "set" | "func" });
 
-/** The arm is a JS object: always truthy, compared by identity. */
+/** The arm is a JS object: always truthy. */
 export function isObjectArm(nullable: PointerUnion): boolean {
   return nullable.repr === "shapes" || nullable.arm.kind !== "string";
+}
+
+/** The arm compares by pointer identity. Function arms compare identity
+ * roots instead: a signature adapter is the function it adapts. */
+export function isPointerIdentityArm(nullable: PointerUnion): boolean {
+  return (
+    nullable.repr === "shapes" || (nullable.arm.kind !== "string" && nullable.arm.kind !== "func")
+  );
 }
 
 /** The representation decision for every union of one module. It is a
@@ -264,7 +273,8 @@ function nullableShape(
     return { ...base, arm: { kind: "record", shapeId: arm.shapeId } };
   if (arm.kind === "string") return { ...base, arm: { kind: "string" } };
   if (arm.kind === "stats") return { ...base, arm: { kind: "stats" } };
-  if (arm.kind === "array" || arm.kind === "map" || arm.kind === "set") return { ...base, arm };
+  if (arm.kind === "array" || arm.kind === "map" || arm.kind === "set" || arm.kind === "func")
+    return { ...base, arm };
   return null;
 }
 

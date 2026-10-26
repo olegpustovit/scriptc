@@ -2425,7 +2425,9 @@ function lowerNetSocketMethodCall(
     };
   }
   if (name === "write" || name === "end") {
-    requireStatementPosition(lowerer, call, `socket.${name}(...)`);
+    // write() answers Node's backpressure boolean; end() stays a statement
+    if (name === "end") requireStatementPosition(lowerer, call, `socket.${name}(...)`);
+    const resultT = name === "write" ? BOOL : VOID;
     // write(chunk, encoding) — the two-argument encoding form: 'buffer'
     // beside a string chunk is Writable's encoding check (a synchronous
     // ERR_UNKNOWN_ENCODING TypeError, "Unknown encoding: buffer" — the
@@ -2451,7 +2453,7 @@ function lowerNetSocketMethodCall(
           const socket = coerceToHandle(lowerer, access.expression, NETSOCKET_T);
           const chunk = lowerer.lowerExpr(args[0]!);
           const fn: IrLibFn = chunk.type.kind === "string" ? "net.sockWrite" : "net.sockWriteBytes";
-          return { kind: "libCall", fn, args: [socket, chunk], type: VOID, loc };
+          return { kind: "libCall", fn, args: [socket, chunk], type: BOOL, loc };
         }
       }
     }
@@ -2510,7 +2512,7 @@ function lowerNetSocketMethodCall(
             NARROW_DATA_HINT,
           );
         }
-        main = { kind: "libCall", fn, args: [receiver(), data], type: VOID, loc };
+        main = { kind: "libCall", fn, args: [receiver(), data], type: resultT, loc };
       }
       const cb = lowerer.lowerExpr(last);
       let register: IrExpr;
@@ -2531,8 +2533,24 @@ function lowerNetSocketMethodCall(
           loc,
         };
       }
-      stmts.push({ kind: "exprStmt", expr: main, loc });
-      return { kind: "seqExpr", stmts, result: register, type: VOID, loc };
+      if (resultT.kind === "void") {
+        stmts.push({ kind: "exprStmt", expr: main, loc });
+        return { kind: "seqExpr", stmts, result: register, type: VOID, loc };
+      }
+      // write(data, cb): the data is written, the callback registered, and
+      // the write's answer is the value
+      const okLocal = lowerer.declareHiddenLocal("%sockWriteOk", BOOL);
+      stmts.push(
+        { kind: "varDecl", localId: okLocal.id, init: main, loc },
+        { kind: "exprStmt", expr: register, loc },
+      );
+      return {
+        kind: "seqExpr",
+        stmts,
+        result: { kind: "varRef", localId: okLocal.id, type: BOOL, loc },
+        type: BOOL,
+        loc,
+      };
     }
     const maxArgs = name === "write" ? 1 : 1;
     const minArgs = name === "write" ? 1 : 0;
@@ -2552,17 +2570,17 @@ function lowerNetSocketMethodCall(
     const data = lowerer.lowerExpr(args[0]!);
     if (data.type.kind === "string") {
       const fn: IrLibFn = name === "write" ? "net.sockWrite" : "net.sockEndStr";
-      return { kind: "libCall", fn, args: [receiver, data], type: VOID, loc };
+      return { kind: "libCall", fn, args: [receiver, data], type: resultT, loc };
     }
     if (data.type.kind === "bytes" && data.type.elem === "u8") {
       const fn: IrLibFn = name === "write" ? "net.sockWriteBytes" : "net.sockEndBytes";
-      return { kind: "libCall", fn, args: [receiver, data], type: VOID, loc };
+      return { kind: "libCall", fn, args: [receiver, data], type: resultT, loc };
     }
     if (data.type.kind === "dyn") {
       // An untyped JS payload (a helper's parameter): the runtime
       // dispatches STR/BYTES and throws Node's chunk TypeError otherwise.
       const fn: IrLibFn = name === "write" ? "net.sockWriteDyn" : "net.sockEndDyn";
-      return { kind: "libCall", fn, args: [receiver, data], type: VOID, loc };
+      return { kind: "libCall", fn, args: [receiver, data], type: resultT, loc };
     }
     lowerer.noLowering(
       `${name} of '${lowerer.fmt(data.type)}' data`,
@@ -2944,6 +2962,7 @@ function lowerNetSocketMethodCall(
       event === "connect" ||
       event === "ready" ||
       event === "timeout" ||
+      event === "drain" ||
       event === "readable"
     ) {
       const { cb } = lowerCallbackArg(
@@ -2962,11 +2981,13 @@ function lowerNetSocketMethodCall(
             ? "net.sockOnClose"
             : event === "timeout"
               ? "net.sockOnTimeout"
-              : event === "readable"
-                ? "net.sockOnReadable"
-                : event === "ready"
-                  ? "net.sockOnReady"
-                  : "net.sockOnConnect";
+              : event === "drain"
+                ? "net.sockOnDrain"
+                : event === "readable"
+                  ? "net.sockOnReadable"
+                  : event === "ready"
+                    ? "net.sockOnReady"
+                    : "net.sockOnConnect";
       return { kind: "libCall", fn, args: [receiver, cb, once], type: VOID, loc };
     }
     if (event === "lookup") {
@@ -3956,6 +3977,18 @@ export function lowerServerProperty(
     // counts those too; plaintext on TLS sockets).
     const receiver = coerceToHandle(lowerer, expr.expression, NETSOCKET_T);
     return { kind: "libCall", fn: "net.sockBytesWritten", args: [receiver], type: F64, loc };
+  }
+  if (
+    recvKind === "netSocket" &&
+    lowerer.isStdlibMember(expr) &&
+    (expr.name.text === "writableLength" || expr.name.text === "writableNeedDrain")
+  ) {
+    // The write buffer's unsent bytes, and whether a write answered false
+    // and 'drain' has not fired yet.
+    const receiver = coerceToHandle(lowerer, expr.expression, NETSOCKET_T);
+    return expr.name.text === "writableLength"
+      ? { kind: "libCall", fn: "net.sockWritableLength", args: [receiver], type: F64, loc }
+      : { kind: "libCall", fn: "net.sockWritableNeedDrain", args: [receiver], type: BOOL, loc };
   }
   if (recvKind === "netSocket" && lowerer.isStdlibMember(expr) && expr.name.text === "readable") {
     // true until the read half is done (peer FIN / destroy).

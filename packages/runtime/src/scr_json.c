@@ -96,9 +96,13 @@ static SCR_TL ScrDyn *scr_iterator_symbol;
 static SCR_TL ScrDyn *scr_async_iterator_symbol;
 static SCR_TL ScrDyn *scr_to_primitive_symbol;
 static bool scr_dyn_generator(const ScrDyn *value) {
-  return value && value->kind == SCR_DYN_TYPED_REF &&
-    (value->v.typed_ref.type_key[0] == 'g' || value->v.typed_ref.type_key[0] == 'a') &&
-    (!strncmp(value->v.typed_ref.type_key, "generator<", 10) || !strncmp(value->v.typed_ref.type_key, "async-generator<", 16));
+  if (!value || value->kind != SCR_DYN_TYPED_REF) return false;
+  /* Array keys also start with 'a': the second byte sets them apart before
+   * any comparison. */
+  const char *key = value->v.typed_ref.type_key;
+  size_t len = value->v.typed_ref.type_key_len;
+  if (key[0] == 'g') return len >= 10 && !memcmp(key, "generator<", 10);
+  return key[0] == 'a' && key[1] == 's' && len >= 16 && !memcmp(key, "async-generator<", 16);
 }
 static bool scr_dyn_generator_symbol(const ScrDyn *value, const ScrDyn *key) {
   const ScrDyn *symbol = value->v.typed_ref.type_key[0] == 'a' ? scr_async_iterator_symbol : scr_iterator_symbol;
@@ -179,6 +183,24 @@ bool scr_dyn_is_async_dispose_symbol(const ScrDyn *key) {
   return scr_async_dispose_symbol && key->kind == SCR_DYN_SYMBOL &&
          key->v.symbol.value == scr_async_dispose_symbol->v.symbol.value;
 }
+
+/* Symbol.for('nodejs.util.inspect.custom'), installed by the symbol unit
+ * when the program creates it: the key util.inspect reads custom inspect
+ * functions under. */
+static SCR_TL ScrDyn *scr_inspect_custom_symbol;
+
+static void scr_inspect_custom_symbol_cleanup(void) {
+  scr_dyn_release(scr_inspect_custom_symbol);
+  scr_inspect_custom_symbol = NULL;
+}
+
+void scr_dyn_install_inspect_custom_symbol(ScrDyn *key) {
+  if (scr_inspect_custom_symbol) return;
+  scr_inspect_custom_symbol = scr_dyn_retain(key);
+  scr_atexit(scr_inspect_custom_symbol_cleanup);
+}
+
+ScrDyn *scr_dyn_inspect_custom_symbol(void) { return scr_inspect_custom_symbol; }
 
 static void scr_to_primitive_symbol_cleanup(void) {
   scr_dyn_release(scr_to_primitive_symbol);
@@ -1165,8 +1187,20 @@ static bool scr_dyn_to_primitive_result_is_object(const ScrDyn *d);
  * are never the native records the kept-source table is keyed by. */
 static SCR_TL bool scr_weak_observing;
 static void scr_weak_disposed(void *key);
+/* One bit per key address, set when a key enters the weak-key table: a
+ * disposed object whose bit is clear was never a key, so its disposal makes
+ * no call. Bits are cleared when the table empties. */
+#define SCR_WEAK_KEY_FILTER_BITS ((size_t)1 << 16)
+static SCR_TL uint64_t scr_weak_key_filter[SCR_WEAK_KEY_FILTER_BITS / 64];
+static inline size_t scr_weak_key_filter_bit(const void *key) {
+  return ((uintptr_t)key >> 4) & (SCR_WEAK_KEY_FILTER_BITS - 1);
+}
+static inline bool scr_weak_maybe_key(const void *key) {
+  size_t bit = scr_weak_key_filter_bit(key);
+  return scr_weak_observing && (scr_weak_key_filter[bit >> 6] & (UINT64_C(1) << (bit & 63)));
+}
 static inline void scr_dyn_weak_dispose(ScrDyn *d) {
-  if (scr_weak_observing) scr_weak_disposed(d);
+  if (scr_weak_maybe_key(d)) scr_weak_disposed(d);
 }
 
 /* A disposed node's child: most getters, setters, prototypes and symbol
@@ -1305,14 +1339,18 @@ static void scr_dyn_gcfree(void *ptr) { scr_dyn_dispose(ptr, true); }
 static void scr_dyn_destroy(void *ptr) { scr_dyn_dispose(ptr, false); }
 
 /* The cycle bookkeeping of a value that survives a release. Compiled
- * release fast paths decrement first and call this for the kinds whose
- * candidacy depends on per-value state, matching scr_dyn_release: arrays
- * and objects not yet buffered (skipped while their document is intact,
+ * release fast paths decrement first and call this for every kind that can
+ * be a candidate and is not one yet, matching scr_dyn_release: functions
+ * and proxies, arrays and objects (skipped while their document is intact,
  * ScrDynRegion), capsules and handles. */
 void scr_dyn_release_survivor(ScrDyn *d) {
   if (d->kind == SCR_DYN_ARR || d->kind == SCR_DYN_OBJ) {
     const ScrDynRegion *region = scr_dyn_region_of(d);
     if (!region || !region->intact) scr_cyc_released(d);
+    return;
+  }
+  if (d->kind == SCR_DYN_FUNC || d->kind == SCR_DYN_PROXY) {
+    scr_cyc_released(d);
     return;
   }
   if ((d->kind == SCR_DYN_TYPED_REF &&
@@ -2526,7 +2564,7 @@ static void scr_dyn_record_view_freeze(ScrDyn *view) {
 
 void scr_record_freeze(void *record) {
   size_t *rc = record;
-  if (*rc != SIZE_MAX) *rc |= SCR_RC_FROZEN;
+  if (!scr_rc_immortal(record)) *rc |= SCR_RC_FROZEN;
 }
 
 void scr_record_throw_frozen(ScrStr *key, ScrStr *owner, double operation) {
@@ -3479,7 +3517,7 @@ static void scr_record_source_disposed(void *rec) {
 /* The single native dispose hook serves weak collections and the table
  * above; each observer runs only while it has entries to forget. */
 static void scr_dispose_observers(void *object) {
-  if (scr_weak_observing) scr_weak_disposed(object);
+  if (scr_weak_maybe_key(object)) scr_weak_disposed(object);
   if (scr_record_source_count) scr_record_source_disposed(object);
 }
 
@@ -4332,6 +4370,7 @@ ScrDyn *scr_dyn_typed_ref_element(const ScrDyn *d, size_t index) {
   double state = scr_arr_state(arr, (double)index);
   if (state == (double)SCR_ARR_VALUE) return scr_dyn_typed_ref_array_ops(d)->get(arr, (double)index);
   if (state == (double)SCR_ARR_UNDEFINED) return scr_dyn_retain(scr_dyn_undefined());
+  if (state == (double)SCR_ARR_FOREIGN) return scr_arr_get_foreign(arr, (double)index);
   return NULL;
 }
 
@@ -6776,11 +6815,12 @@ static ScrDyn *scr_dyn_fn_properties(const ScrDyn *function) {
     owner->props = scr_box_retain(function->v.fn.class_obj->static_data);
   if (!owner->props) {
     ScrDyn *table = scr_dyn_new_obj();
+    /* V8's own-key order: length, then name. */
+    scr_dyn_obj_set(table, "length", 6, scr_dyn_new_num((double)function->v.fn.arity));
     const char *name = function->v.fn.name ? function->v.fn.name : "";
     ScrStr *name_string = scr_str_new(name, strlen(name));
     scr_dyn_obj_set(table, "name", 4, scr_dyn_new_str(name_string));
     scr_str_release(name_string);
-    scr_dyn_obj_set(table, "length", 6, scr_dyn_new_num((double)function->v.fn.arity));
     for (size_t i = 0; i < table->v.obj.len; i++) {
       table->v.obj.entries[i].writable = false;
       table->v.obj.entries[i].enumerable = false;
@@ -6868,7 +6908,7 @@ ScrDyn *scr_dyn_class_base_prototype(ScrDyn *constructor) {
   default: break;
   }
   if (constructor->kind != SCR_DYN_FUNC || constructor->v.fn.class_obj ||
-      scr_closure_identity(constructor->v.fn.clo)->function_kind != 4) {
+      (scr_closure_identity(constructor->v.fn.clo)->function_kind & SCR_FN_KIND_MASK) != 4) {
     static const char message[] = "Class extends value is not a native ordinary constructor";
     scr_throw_error_msg(SCR_ERR_TYPE, message, sizeof message - 1);
     return NULL;
@@ -7016,7 +7056,8 @@ void scr_dyn_name_class_prototype(ScrDyn *prototype, const ScrStr *name) {
 /* Ordinary native function constructors retain their live prototype table.
  * A constructor may replace the fresh receiver with another object. */
 ScrDyn *scr_dyn_construct(const ScrDyn *callee, const ScrDyn *args, const ScrStr *what) {
-  if (callee->kind != SCR_DYN_FUNC || callee->v.fn.class_obj || scr_closure_identity(callee->v.fn.clo)->function_kind != 4)
+  if (callee->kind != SCR_DYN_FUNC || callee->v.fn.class_obj ||
+      (scr_closure_identity(callee->v.fn.clo)->function_kind & SCR_FN_KIND_MASK) != 4)
     return scr_bytes_construct(callee, args, what);
   ScrDyn *prototype = scr_dyn_fn_get(callee, "prototype", 9);
   if (!prototype) return NULL;
@@ -7481,6 +7522,23 @@ static ScrDyn *scr_native_iterator_new(ScrDyn *source) {
   scr_native_iterator_release(iterator);
   return result;
 }
+
+#ifdef SCR_JS_TIER
+/* A read site's answer for a receiver without a JS shape whose property is
+ * plain data the runtime holds directly: a native array's length (the
+ * generic read would build its checked view first) and a native iterator's
+ * `next` (the builtin the generic read returns). +1, or NULL for the slow
+ * path. */
+ScrDyn *scr_dyn_tier_unshaped_get(const ScrDyn *receiver, const ScrStr *key) {
+  if (key->len == 6 && receiver->kind == SCR_DYN_TYPED_REF && !memcmp(key->data, "length", 6) &&
+      scr_dyn_typed_ref_array_ops(receiver) && scr_dyn_ref_is_array(receiver))
+    return scr_dyn_new_num((double)((ScrArr *)receiver->v.typed_ref.ptr)->len);
+  if (key->len == 4 && receiver->kind == SCR_DYN_HANDLE &&
+      receiver->v.handle.tag == SCR_DYNH_ITERATOR && !memcmp(key->data, "next", 4))
+    return scr_native_iterator_get(receiver->v.handle.ptr, key->data, key->len);
+  return NULL;
+}
+#endif
 
 static ScrDyn *scr_native_collection_iterator(ScrDyn *source, unsigned selection) {
   ScrDyn *result = scr_native_iterator_new(source);
@@ -8372,7 +8430,9 @@ ScrDyn *scr_dyn_iterator(const ScrDyn *source, const ScrStr *spell) {
   }
   /* An array whose iterator method is the builtin values(): what calling
    * it with the array as `this` returns, without the call. */
-  if (source->kind == SCR_DYN_ARR && method == scr_iterator_functions[1]) {
+  if (method == scr_iterator_functions[1] &&
+      (source->kind == SCR_DYN_ARR ||
+       (source->kind == SCR_DYN_TYPED_REF && scr_dyn_ref_is_array(source)))) {
     scr_dyn_release(method);
     return scr_native_iterator_new((ScrDyn *)source);
   }
@@ -9132,7 +9192,9 @@ bool scr_dyn_is_callable(const ScrDyn *value) {
 
 int scr_dyn_function_kind(const ScrDyn *value) {
   while (value->kind == SCR_DYN_PROXY) value = value->v.proxy.target;
-  return value->kind == SCR_DYN_FUNC ? scr_closure_identity(value->v.fn.clo)->function_kind : 0;
+  return value->kind == SCR_DYN_FUNC
+             ? (int)(scr_closure_identity(value->v.fn.clo)->function_kind & SCR_FN_KIND_MASK)
+             : 0;
 }
 
 void scr_dyn_adopt_identity(ScrClosure *adapter, const ScrDyn *value) {
@@ -10348,7 +10410,8 @@ ScrStr *scr_dyn_to_string(const ScrDyn *d, const ScrStr *enc) {
     if (scr_dyn_error_encoding(d) && !scr_dyn_property_owner(d, "toString", 8)) return scr_dyn_error_string(d);
     return scr_str_new("[object Object]", 15);
   case SCR_DYN_HANDLE:
-    if (d->v.handle.tag == SCR_DYNH_REGEXP || d->v.handle.tag == SCR_DYNH_URL || d->v.handle.tag == SCR_DYNH_DATE) {
+    if (d->v.handle.tag == SCR_DYNH_REGEXP || d->v.handle.tag == SCR_DYNH_URL || d->v.handle.tag == SCR_DYNH_DATE ||
+        d->v.handle.tag == SCR_DYNH_MIME_TYPE || d->v.handle.tag == SCR_DYNH_MIME_PARAMS) {
       ScrDyn *text = scr_dyn_handle_ops_of(d)->invoke(d->v.handle.ptr, (ScrDyn *)d, "toString", NULL, 0, "RegExp.toString");
       if (!text) return NULL;
       ScrStr *out = scr_str_retain(text->v.str);
@@ -11097,9 +11160,8 @@ ScrDyn *scr_dyn_arithmetic(const ScrDyn *left, const ScrDyn *right, const ScrStr
     if (result) { out = scr_dyn_new_bigint(result); scr_bigint_release(result); }
   } else {
     double a = l->v.num, b = r->v.num;
-    // ECMAScript differs from libm for ±1 ** ±Infinity and 1 ** NaN.
     double result = op == '-' ? a - b : op == '/' ? a / b : op == '%' ? fmod(a, b)
-      : operation->len == 2 ? ((fabs(a) == 1 && !isfinite(b)) ? NAN : pow(a, b)) : a * b;
+      : operation->len == 2 ? scr_math_pow(a, b) : a * b;
     out = scr_dyn_new_num(result);
   }
   scr_dyn_release(l);
@@ -13783,7 +13845,9 @@ static ScrDyn *scr_json_to_json_at(ScrDyn *value, const ScrStr *key, size_t inde
   if (scr_exc_pending()) { scr_dyn_release(view); scr_dyn_release(value); return NULL; }
   if (inspected->kind == SCR_DYN_HANDLE && (inspected->v.handle.tag == SCR_DYNH_DATE || inspected->v.handle.tag == SCR_DYNH_URL ||
                                              inspected->v.handle.tag == SCR_DYNH_NET_SOCKET_ADDRESS ||
-                                             inspected->v.handle.tag == SCR_DYNH_NET_BLOCK_LIST)) {
+                                             inspected->v.handle.tag == SCR_DYNH_NET_BLOCK_LIST ||
+                                             inspected->v.handle.tag == SCR_DYNH_MIME_TYPE ||
+                                             inspected->v.handle.tag == SCR_DYNH_MIME_PARAMS)) {
     const ScrDynHandleOps *ops = scr_dyn_handle_ops_of(inspected);
     ScrDyn *converted = ops->invoke(inspected->v.handle.ptr, value, "toJSON", NULL, 0, "toJSON");
     scr_dyn_release(value);
@@ -14384,6 +14448,13 @@ void scr_jb_put_dyn_entries(ScrJsonBuf *b, void *rec, ScrMap *map, bool *first) 
 void scr_jb_put_dyn(ScrJsonBuf *b, const ScrDyn *d) {
   if (scr_json_omitted(d)) scr_jb_puts(b, "null");
   else scr_json_replaced_write(b, d, scr_dyn_undefined(), NULL, &scr_json_compact_gap, b->seen_len);
+}
+
+void scr_jb_put_dyn_element(ScrJsonBuf *b, const ScrDyn *d, double index) {
+  ScrDyn *value = scr_json_to_json_at(scr_dyn_retain((ScrDyn *)d), NULL, (size_t)index);
+  if (!value) return;
+  scr_jb_put_dyn(b, value);
+  scr_dyn_release(value);
 }
 
 /* Untyped RC adapters (box/promise/exception-cell currency). */
@@ -17413,6 +17484,8 @@ static ScrWeakKeySlot *scr_weak_key_slot_put(void *key) {
     scr_weak_keys[j].key = key;
     scr_weak_keys[j].head = NULL;
     scr_weak_keys_used++;
+    size_t bit = scr_weak_key_filter_bit(key);
+    scr_weak_key_filter[bit >> 6] |= UINT64_C(1) << (bit & 63);
   }
   return &scr_weak_keys[j];
 }
@@ -17422,6 +17495,7 @@ static void scr_weak_key_slot_delete(ScrWeakKeySlot *slot) {
   if (--scr_weak_keys_used == 0) {
     free(scr_weak_keys);
     scr_weak_keys = NULL;
+    memset(scr_weak_key_filter, 0, sizeof scr_weak_key_filter);
     return;
   }
   for (size_t k = i;;) {

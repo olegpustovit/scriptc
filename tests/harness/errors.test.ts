@@ -1065,6 +1065,38 @@ console.log(\`\${register(7)}\`);
   });
 });
 
+// An RSA-PSS key whose parameters restrict it to a digest the runtime does
+// not sign with (sha512-224 and sha512-256, which OpenSSL reads) throws a
+// coded SC2020 error naming the digest, instead of importing the key
+// without the restrictions it carries.
+describe("RSA-PSS keys restricted to unimplemented digests", () => {
+  test("importing one throws SC2020 naming the digest", async () => {
+    const r = await compileAndRun(
+      "pss-restricted-digest",
+      `import { createPublicKey } from "node:crypto";
+const keys = [
+  "-----BEGIN PUBLIC KEY-----\\nMIGQMEEGCSqGSIb3DQEBCjA0oA8wDQYJYIZIAWUDBAIFBQChHDAaBgkqhkiG9w0B\\nAQgwDQYJYIZIAWUDBAIFBQCiAwIBCANLADBIAkEArMDQESqjeWDLqFa1E5SzsMl4\\n6tyUsEqcDKSwRUvPilv1AUudf/w6qaXlPnAxBmFjZYihdQSZlk0czRLOX3o7gwID\\nAQAB\\n-----END PUBLIC KEY-----\\n",
+  "-----BEGIN PUBLIC KEY-----\\nMIGQMEEGCSqGSIb3DQEBCjA0oA8wDQYJYIZIAWUDBAIBBQChHDAaBgkqhkiG9w0B\\nAQgwDQYJYIZIAWUDBAIGBQCiAwIBCANLADBIAkEAuOa9NkzXzMDelHCIEkf0mnKe\\nnQdalNUm9vZtIMwpDJcn5U0Vbhhd6MTfRPhSo5nW71Oh5eU7v5M3PMYOHS7cMQID\\nAQAB\\n-----END PUBLIC KEY-----\\n",
+];
+for (const key of keys) {
+  try {
+    console.log(createPublicKey(key).asymmetricKeyType);
+  } catch (error) {
+    const e = error as Error & { code?: string };
+    console.log(e.name, e.code, e.message);
+  }
+}
+`,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe(
+      "Error SC2020 'RSA-PSS keys restricted to sha512-224' is part of the standard library types but has no scriptc lowering yet\n" +
+        "Error SC2020 'RSA-PSS keys restricted to sha512-256' is part of the standard library types but has no scriptc lowering yet\n",
+    );
+    expect(r.stderr).toBe("");
+  });
+});
+
 // A cipher name Node lists in crypto.getCiphers() but the runtime does not
 // implement throws a coded SC2020 error naming the cipher when the name is
 // computed; literal names are refused at compile time (node-types-fenced).
@@ -2443,6 +2475,53 @@ console.log("unreachable");
     expect(push.stderr).toMatch(
       /^Uncaught Error: Elements on Array\.prototype are not supported yet \[SC2020[^\]]*\]\n$/,
     );
+  });
+});
+
+// The runtime formatter (format strings known only at run time, spread
+// arguments, options objects) throws a coded SC2020 error for renderings
+// it has no lowering for.
+describe("runtime format refusals", () => {
+  test("%s of a class instance with toString, %o of objects, colored errors and options", async () => {
+    const r = await compileAndRun(
+      "format-runtime-refusals",
+      `import * as util from "node:util";
+class Named {
+  name = "n";
+  toString(): string {
+    return this.name;
+  }
+}
+const s: string = process.argv.length > 99 ? "" : "%s";
+const o: string = process.argv.length > 99 ? "" : "%o";
+const attempts: Array<() => string> = [
+  () => util.format(s, new Named()),
+  () => util.format(o, { a: 1 }),
+  () => util.formatWithOptions({ colors: true }, s, "x", new Error("e")),
+  () => util.formatWithOptions({ maxArrayLength: 1 }, [1, 2]),
+  () => util.formatWithOptions({ compact: true }, [1, 2]),
+];
+for (const attempt of attempts) {
+  try {
+    console.log(attempt());
+  } catch (error) {
+    const e = error as Error & { code?: string };
+    console.log(e.name, e.code, e.message);
+  }
+}
+console.log(util.format(s, { a: 1 }), util.formatWithOptions({ maxArrayLength: 100 }, [1, 2]));
+`,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe(
+      "Error SC2020 util.format %s of a class instance whose class defines toString has no lowering\n" +
+        "Error SC2020 util.format %o of objects renders hidden properties, which have no lowering; use %O\n" +
+        "Error SC2020 colored inspect output of Error values has no lowering\n" +
+        "Error SC2020 util.formatWithOptions with the maxArrayLength option has no lowering\n" +
+        "Error SC2020 util.formatWithOptions with this compact option has no lowering (compact must be false or a number)\n" +
+        "{ a: 1 } [ 1, 2 ]\n",
+    );
+    expect(r.stderr).toBe("");
   });
 });
 

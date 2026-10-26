@@ -1,3 +1,4 @@
+import { fieldOrigin } from "../decl-origin.js";
 import { keyedHelperName } from "../stable-names.js";
 import { constructedValue } from "../constructor-returns.js";
 import { countedFor, dynUndefinedExpr, varRef } from "../../../ir/build.js";
@@ -394,7 +395,15 @@ export function recordWidthHelper(
   // orphan one).
   const plan = lowerer.recordWidthPlan(fromId, toId);
   if (!plan) return null;
-  const key = `rec:${fromId}:${toId}`;
+  // Package code converting into a package-declared record type (an
+  // object literal returned under `@returns {HelpContext}`): its field
+  // extractions name the declared fields (decl-origin.ts), so the helper
+  // is keyed by that type's declaration too (two packages may declare
+  // records of the same name and shape). Every other projection is shared
+  // as before.
+  const declared = lowerer.coercionRecordOrigin();
+  const key =
+    declared === null ? `rec:${fromId}:${toId}` : `rec:${fromId}:${toId}:origin:${declared.key}`;
   const existing = lowerer.valueHelpers.get(key);
   if (existing) return existing;
   const name = keyedHelperName(lowerer, "%rec.width", key);
@@ -402,7 +411,21 @@ export function recordWidthHelper(
   // (self-referential shapes) resolves to this helper itself.
   lowerer.valueHelpers.set(key, name);
   const fromT: IrType = { kind: "record", shapeId: fromId };
-  lowerer.liftedFns.push(buildRecordProjection(lowerer, name, fromT, to, plan, loc));
+  const outerNode = lowerer.coercionOriginNode;
+  const outerField = lowerer.coercionFieldOrigin;
+  // Nested conversions see only their own field's origin.
+  lowerer.coercionOriginNode = null;
+  lowerer.coercionFieldOrigin = null;
+  try {
+    lowerer.liftedFns.push(
+      buildRecordProjection(lowerer, name, fromT, to, plan, loc, (field) =>
+        declared === null ? null : fieldOrigin(lowerer.checker, declared, field),
+      ),
+    );
+  } finally {
+    lowerer.coercionOriginNode = outerNode;
+    lowerer.coercionFieldOrigin = outerField;
+  }
   return name;
 }
 
@@ -799,6 +822,7 @@ function buildRecordProjection(
   target: IrRecordShape,
   plan: Map<string, FieldLift>,
   loc: SrcLoc,
+  originOf: (field: string) => string | null = () => null,
 ): IrFunction {
   const parameter = source.kind === "record" ? "r" : "o";
   const localId = parameter + ".0";
@@ -855,7 +879,12 @@ function buildRecordProjection(
                     type: conversion.src,
                     loc,
                   };
+            // Only the field's own extraction (a plain narrow) carries the
+            // declared field's origin; nested conversions are shared.
+            lowerer.coercionFieldOrigin =
+              conversion.lift.how === "narrow" ? originOf(field.name) : null;
             const lifted = lowerer.applyWidthLift(conversion.lift, read, field.type, loc);
+            lowerer.coercionFieldOrigin = null;
             return {
               name: field.name,
               value:

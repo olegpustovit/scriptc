@@ -180,6 +180,9 @@ void scr_dyn_from_enter(const void *v);
 void scr_dyn_from_leave(void);
 void scr_jb_putc(ScrJsonBuf *b, char c);
 void scr_jb_puts(ScrJsonBuf *b, const char *s);
+/* Array.prototype.join's conversion of one element, appended to `b`:
+ * nothing for undefined and null, ToString of anything else. */
+void scr_jb_join_dyn(ScrJsonBuf *b, const ScrDyn *d);
 /* JS JSON.stringify number rules: NaN/±Infinity → null, -0 → 0, else
  * shortest-roundtrip via scr_f64_to_str. */
 void scr_jb_put_f64(ScrJsonBuf *b, double v);
@@ -199,6 +202,10 @@ void scr_jb_put_date(ScrJsonBuf *b, const ScrDate *date);
  * slot's rule); containers follow JSON.stringify (toJSON, accessors,
  * circular structures). May leave an exception pending. */
 void scr_jb_put_dyn(ScrJsonBuf *b, const ScrDyn *d);
+/* scr_jb_put_dyn for array element `index` (a foreign element of a typed
+ * array): its toJSON runs first, with the index as its key. May leave an
+ * exception pending. */
+void scr_jb_put_dyn_element(ScrJsonBuf *b, const ScrDyn *d, double index);
 /* The entries of record `rec`'s `unknown` index signature (its overflow
  * map) after the record's earlier members: separators, keys and values in
  * JS own-key order with JSON.stringify's member rules (toJSON called with

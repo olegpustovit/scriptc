@@ -64,6 +64,37 @@ console.log(read(o), at(dyn([5, 6]), 1), call(o), o.n);
   }
 });
 
+test("object literal members with constant keys add through store caches", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "scriptc-js-ic-literal-"));
+  try {
+    const entry = join(dir, "main.js");
+    const outPath = join(dir, "main.ir.json");
+    await writeFile(
+      entry,
+      `
+function make(v, k) { return { a: v, b: 2, [k]: 3 }; }
+var top = { t: 1 };
+console.log(JSON.stringify(make(1, "c")), top.t);
+`,
+    );
+    const result = await compile(entry, { outDir: dir, outPath, outputKind: "ir" });
+    if (!result.ok)
+      throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+    const mod = deserializeModule(await readFile(outPath, "utf8"));
+    expect(moduleUsesDynTier(mod)).toBe(true);
+    const llvm = emitLlvmModule(mod);
+    const make = body(llvm, "make");
+    // Each constant-key member tries its site's store cache first and
+    // falls back to the generic member store; the computed key keeps the
+    // generic store only.
+    expect(make.match(/@scr_js_store_probe\(/g)).toHaveLength(2);
+    expect(make.match(/@scr_dyn_key_set\(/g)).toHaveLength(2);
+    expect(make).toContain("@scr_dyn_key_set_computed(");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("property sites keep their caches in programs that declare classes and subclasses", async () => {
   const dir = await mkdtemp(join(tmpdir(), "scriptc-js-ic-class-"));
   try {
@@ -170,7 +201,7 @@ console.log(lib.total([1, 2, 3]));
     expect(fn).toContain("@scr_js_keyed_probe(");
     // The length read answers from the native array's length.
     expect(fn).toContain("icg.rest");
-    expect(fn).toContain("@scr_js_get_probe(");
+    expect(fn).toContain("@scr_js_get_probe_native(");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

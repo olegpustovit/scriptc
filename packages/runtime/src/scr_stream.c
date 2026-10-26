@@ -93,6 +93,10 @@ struct ScrStreamState {
   bool is_transform; /* the writable side routes through transform/flush */
   bool allow_half_open;
   bool auto_destroy, emit_close;
+  /* Duplex.from of a pipeline() argument that is not a stream: the
+   * pipeline takes it as that stage's stream without wiring the stage
+   * (scr_stream_unbox_dyn_stage) */
+  bool pipeline_body;
 
   /* shared lifecycle */
   bool destroyed, destroy_calling, error_emitted, close_emitted, error_scheduled, close_scheduled;
@@ -954,8 +958,14 @@ static bool scr_stream_add_chunk(ScrStream *s, ScrBytes *chunk, bool front) {
     }
     entry = dec; /* owned */
   } else {
-    entry = scr_bytes_retain(chunk);
     entry_len = chunk->len;
+    if (entry_len == 0) {
+      /* Node's readableAddChunk adds no empty chunk outside object mode:
+       * it clears reading and may read more */
+      if (!front) scr_stream_maybe_read_more(s);
+      return !st->r.ended && (st->r.length < st->r.hwm || st->r.length == 0);
+    }
+    entry = scr_bytes_retain(chunk);
   }
   if (entry_len > 0 &&
       st->r.flowing == 1 && st->r.length == 0 && !st->r.in_read_sync && !front &&
@@ -3844,7 +3854,9 @@ typedef ScrPromise *(*ScrPipeNextFn)(ScrClosure *, ScrGen *);
 typedef ScrDyn *(*ScrPipeReadFn)(ScrClosure *, void *);
 typedef ScrDyn *(*ScrPipeBoxFn)(ScrClosure *, ScrPromise *);
 
-enum { SCR_PIPE_DEST_STREAM, SCR_PIPE_DEST_GEN, SCR_PIPE_DEST_PROMISE };
+/* SCR_PIPE_DEST_DYN: an untyped destination function's result, a
+ * checked-dynamic value the pipeline classifies (scr_pipe_dest_dyn_kind) */
+enum { SCR_PIPE_DEST_STREAM, SCR_PIPE_DEST_GEN, SCR_PIPE_DEST_PROMISE, SCR_PIPE_DEST_DYN };
 /* flags bit 7: the callback is typed code's (stream.pipelineStagesDyn) */
 enum { SCR_PIPE_TYPED_CB = 128 };
 
@@ -3862,7 +3874,9 @@ typedef struct {
    * async generator destination's PassThrough included), in pipeline
    * order, or NULL */
   ScrClosure **helpers;
-  ScrClosure *box;           /* SCR_PIPE_DEST_PROMISE: boxes its promise as a dyn promise */
+  /* SCR_PIPE_DEST_PROMISE: boxes its promise as a dyn promise;
+   * SCR_PIPE_DEST_DYN: answers the async generator over a dyn iterable */
+  ScrClosure *box;
 } ScrPipeStages;
 
 static bool scr_pipe_is_stage(const ScrPipeStages *fs, size_t j) {
@@ -4228,6 +4242,71 @@ static void scr_pipe_dest_promise(ScrStreamPipeCtx *ctx, ScrPromise *p /*moves*/
   scr_promise_release(scr_async_spawn_after(d->boxed->v.promise, &scr_pipe_dest_entry, d));
 }
 
+/* An untyped destination's promise: scr_pipe_dest_promise over a promise
+ * that already holds dyn values. */
+static void scr_pipe_dest_dyn_promise(ScrStreamPipeCtx *ctx, ScrDyn *boxed /*moves*/, size_t pi,
+                                      bool end) {
+  ScrPipeDest *d = malloc(sizeof *d);
+  if (!d) scr_stream_oom();
+  d->ctx = scr_stream_pipectx_retain_v(ctx);
+  d->typed = scr_promise_retain(boxed->v.promise);
+  d->boxed = boxed;
+  d->pi = pi;
+  d->end = end;
+  scr_promise_release(scr_async_spawn_after(d->boxed->v.promise, &scr_pipe_dest_entry, d));
+}
+
+typedef ScrGen *(*ScrPipeIterFn)(ScrClosure *, ScrDyn *);
+static bool scr_stream_dyn_has_method(const ScrDyn *value, const char *key);
+static bool scr_stream_dyn_transform_like(const ScrDyn *value);
+static void scr_stream_throw_web_stage(void);
+static bool scr_stream_dyn_stage_returned_stream(const ScrDyn *value);
+static void scr_stream_throw_invalid_return(const char *expected, const char *name,
+                                           const ScrDyn *got);
+
+/* What pipelineImpl does with an untyped destination function's result:
+ * a promise settles the pipeline's value (the `then` branch), and an
+ * async iterable, or a { readable, writable } pair's readable side, is
+ * pumped into the PassThrough. *out answers the promise or that
+ * iterable's async generator (+1). Other values throw
+ * ERR_INVALID_RETURN_VALUE, and thenables that are not promises and web
+ * streams throw the not-supported Error; -1 then. */
+enum { SCR_PIPE_DYN_PROMISE, SCR_PIPE_DYN_ITER };
+static int scr_pipe_dest_dyn_kind(const ScrPipeStages *fs, ScrDyn *r, void **out) {
+  if (r->kind == SCR_DYN_PROMISE) {
+    *out = scr_dyn_retain(r);
+    return SCR_PIPE_DYN_PROMISE;
+  }
+  if (r->kind == SCR_DYN_OBJ && scr_stream_dyn_has_method(r, "then")) {
+    static const char msg[] =
+        "pipeline destinations that return a thenable other than a promise are not supported yet";
+    scr_throw_error_msg_code(SCR_ERR_ERROR, msg, sizeof msg - 1, "SC2020");
+    return -1;
+  }
+  if (scr_exc_pending() || scr_stream_dyn_stage_returned_stream(r)) return -1;
+  ScrDyn *read = NULL;
+  int kind = scr_dyn_iterable_kind(r);
+  if (kind < 0) return -1;
+  if (r->kind == SCR_DYN_HANDLE &&
+      (r->v.handle.tag == SCR_DYNH_WEB_STREAM || r->v.handle.tag == SCR_DYNH_WEB_TRANSFORM)) {
+    scr_stream_throw_web_stage();
+    return -1;
+  }
+  if (kind == 2) {
+    read = scr_dyn_retain(r);
+  } else if (scr_stream_dyn_transform_like(r)) {
+    read = scr_dyn_obj_read(r, "readable", 8);
+  }
+  if (!read) {
+    if (!scr_exc_pending()) scr_stream_throw_invalid_return("AsyncIterable or Promise", "destination", r);
+    return -1;
+  }
+  ScrGen *g = ((ScrPipeIterFn)fs->box->fn)(fs->box, read);
+  if (!g) return -1;
+  *out = g;
+  return SCR_PIPE_DYN_ITER;
+}
+
 static ScrStream *scr_stream_pipeline_ex(size_t n, ScrStream **streams, ScrClosure *cb,
                                          ScrStreamErrInv inv, bool end_opt, ScrDyn *signal,
                                          ScrAbortAddFn add, const ScrPipeStages *fs,
@@ -4288,8 +4367,18 @@ static ScrStream *scr_stream_pipeline_ex(size_t n, ScrStream **streams, ScrClosu
                             : (void *)scr_stream_retain(ret);
       ret_gen = NULL;
       void *out = scr_pipe_call_stage(fs, k++, src);
+      int dyn_kind = -1;
+      if (!scr_exc_pending() && dest && fs->dest == SCR_PIPE_DEST_DYN) {
+        ScrDyn *r = out ? out : scr_dyn_retain(scr_dyn_undefined());
+        out = NULL;
+        dyn_kind = scr_pipe_dest_dyn_kind(fs, r, &out);
+        scr_dyn_release(r);
+      }
       if (scr_exc_pending()) {
-        if (out && dest) scr_promise_release(out);
+        if (out && dest && fs->dest == SCR_PIPE_DEST_DYN) {
+          if (dyn_kind == SCR_PIPE_DYN_ITER) scr_gen_release(out);
+          else scr_dyn_release(out);
+        } else if (out && dest) scr_promise_release(out);
         else if (out) scr_gen_release(out);
         scr_stream_pipectx_drop(ctx);
         scr_stream_pipectx_release_v(ctx);
@@ -4309,9 +4398,12 @@ static ScrStream *scr_stream_pipeline_ex(size_t n, ScrStream **streams, ScrClosu
       size_t pi = ctx->n++;
       ctx->streams[pi] = pt;
       ctx->finish_count++;
-      if (fs->dest == SCR_PIPE_DEST_GEN) {
+      if (fs->dest == SCR_PIPE_DEST_GEN ||
+          (fs->dest == SCR_PIPE_DEST_DYN && dyn_kind == SCR_PIPE_DYN_ITER)) {
         /* pumpToNode(ret, pt, finish, { end }) */
         scr_pump_start(ctx, out, fs->helpers + 3 * h++, pt, end);
+      } else if (fs->dest == SCR_PIPE_DEST_DYN) {
+        scr_pipe_dest_dyn_promise(ctx, out, pi, end);
       } else {
         scr_pipe_dest_promise(ctx, out, fs->box, pi, end);
       }
@@ -4326,6 +4418,20 @@ static ScrStream *scr_stream_pipeline_ex(size_t n, ScrStream **streams, ScrClosu
       continue;
     }
     ScrStream *s = streams[i];
+    if (s->st->pipeline_body) {
+      /* ret = Duplex.from(stream) for an argument that is not a stream:
+       * no destroyer or 'error' listener, and the previous stage is
+       * neither piped nor pumped into it */
+      s->st->pipeline_body = false;
+      if (ret_gen) {
+        scr_gen_release(ret_gen);
+        ret_gen = NULL;
+        h++;
+      }
+      ret = s;
+      i++;
+      continue;
+    }
     bool writing = j > 0;
     if (reading && !scr_pipe_is_stage(fs, j + 1) &&
         (streams[i + 1]->st->close_emitted || streams[i + 1]->st->destroyed)) {
@@ -5206,13 +5312,31 @@ static void scr_sp_value_inv(ScrClosure *cb, ScrError *err, ScrDyn *value, ScrPr
   scr_promise_release(p);
 }
 
+/* scr_sp_value_inv for an untyped destination (SCR_PIPE_DEST_DYN), whose
+ * result promise carries a dyn value: when the destination returned an
+ * async iterable (no promise), or its promise carries no payload, the
+ * result is undefined, as in Node. */
+static void scr_sp_dyn_value_inv(ScrClosure *cb, ScrError *err, ScrDyn *value,
+                                 ScrPromise *value_p) {
+  if (err != NULL || (value_p != NULL && scr_promise_payload_kind(value_p) != SCR_EXC_NONE)) {
+    scr_sp_value_inv(cb, err, value, value_p);
+    return;
+  }
+  ScrPromise *p = scr_box_get_ref(cb->caps[0]); /* +1 */
+  scr_promise_fulfill_ref(p, scr_dyn_retain(scr_dyn_undefined()), scr_dyn_retain_v,
+                          scr_dyn_release_v, NULL);
+  scr_promise_release(p);
+}
+
 ScrPromise *scr_sp_pipeline_stages(double n, ScrStream **streams, double count,
                                    ScrClosure **stages, double positions, double flags,
                                    double mask, ScrClosure **helpers, ScrClosure *box,
                                    ScrDyn *signal, ScrClosure *abort) {
   ScrPromise *p = scr_promise_new();
   ScrPipeStages fs = scr_pipe_stages_of(count, stages, positions, flags, mask, helpers, box, signal);
-  ScrPipeValInv vi = fs.dest != SCR_PIPE_DEST_STREAM ? &scr_sp_value_inv : NULL;
+  ScrPipeValInv vi = fs.dest == SCR_PIPE_DEST_STREAM ? NULL
+                     : fs.dest == SCR_PIPE_DEST_DYN  ? &scr_sp_dyn_value_inv
+                                                     : &scr_sp_value_inv;
   ScrStream *dst = scr_stream_pipeline_ex((size_t)n, streams, scr_sp_watcher(p), &scr_sp_settle_inv,
                                           true, NULL, NULL, &fs, abort, vi);
   if (dst) scr_stream_release(dst);
@@ -5264,7 +5388,9 @@ ScrPromise *scr_sp_pipeline_stages_opts(double n, ScrStream **streams, double co
   ScrPromise *p = scr_promise_new();
   if (!scr_sp_opts_signal(p, &outer)) return p;
   ScrPipeStages fs = scr_pipe_stages_of(count, stages, positions, flags, mask, helpers, box, signal);
-  ScrPipeValInv vi = fs.dest != SCR_PIPE_DEST_STREAM ? &scr_sp_value_inv : NULL;
+  ScrPipeValInv vi = fs.dest == SCR_PIPE_DEST_STREAM ? NULL
+                     : fs.dest == SCR_PIPE_DEST_DYN  ? &scr_sp_dyn_value_inv
+                                                     : &scr_sp_value_inv;
   ScrStream *dst = scr_stream_pipeline_ex((size_t)n, streams, scr_sp_watcher(p), &scr_sp_settle_inv,
                                           end, outer, add, &fs, abort, vi);
   if (dst) scr_stream_release(dst);
@@ -8587,10 +8713,90 @@ ScrStream *scr_stream_unbox_dyn(const ScrDyn *value, const ScrStr *message) {
   return NULL;
 }
 
-/* pipeline.js's first stage: a value with pipe() and on() methods is a
- * readable node stream, which the stage ladder tests before isIterable;
- * a string, or a value with a Symbol.asyncIterator or Symbol.iterator
- * method, is an iterable the pipeline pumps into the next stage. */
+/* Whether a checked-dynamic object's member is of type "object". */
+static bool scr_stream_dyn_member_object(const ScrDyn *value, const char *key) {
+  ScrDyn *m = scr_dyn_obj_read(value, key, strlen(key));
+  if (!m) return false;
+  ScrStr *t = scr_dyn_typeof(m);
+  bool object = t->len == 6 && memcmp(t->data, "object", 6) == 0;
+  scr_str_release(t);
+  scr_dyn_release(m);
+  return object;
+}
+
+/* pipeline.js's isTransformStream for a value that is not a stream: an
+ * object whose readable and writable members are both of type "object". */
+static bool scr_stream_dyn_transform_like(const ScrDyn *value) {
+  if (value->kind == SCR_DYN_HANDLE) return value->v.handle.tag == SCR_DYNH_WEB_TRANSFORM;
+  return value->kind == SCR_DYN_OBJ && scr_stream_dyn_member_object(value, "readable") &&
+         !scr_exc_pending() && scr_stream_dyn_member_object(value, "writable");
+}
+
+/* Whether a checked-dynamic object has a function member `key`. */
+static bool scr_stream_dyn_has_method(const ScrDyn *value, const char *key) {
+  ScrDyn *m = scr_dyn_obj_read(value, key, strlen(key));
+  if (!m) return false;
+  bool fn = m->kind == SCR_DYN_FUNC;
+  scr_dyn_release(m);
+  return fn;
+}
+
+/* pipeline.js's isNodeStream and isWebStream for a checked-dynamic value
+ * that is not a native stream: a stream-like object or a web stream, which
+ * the pipeline would pipe or pump into and has no lowering for. */
+static bool scr_stream_dyn_stream_like(const ScrDyn *value) {
+  if (value->kind == SCR_DYN_HANDLE) {
+    int tag = value->v.handle.tag;
+    return tag == SCR_DYNH_WEB_STREAM || tag == SCR_DYNH_WEB_TRANSFORM || tag == SCR_DYNH_WEB_WRITABLE;
+  }
+  if (value->kind != SCR_DYN_OBJ) return false;
+  static const char *const state_keys[] = {"_readableState", "_writableState"};
+  for (size_t i = 0; i < 2; i++) {
+    ScrDyn *v = scr_dyn_obj_read(value, state_keys[i], strlen(state_keys[i]));
+    bool set = v && scr_dyn_truthy(v);
+    if (v) scr_dyn_release(v);
+    if (set) return true;
+  }
+  bool on = scr_stream_dyn_has_method(value, "on");
+  if (on && (scr_stream_dyn_has_method(value, "write") || scr_stream_dyn_has_method(value, "pipe")))
+    return true;
+  if (scr_stream_dyn_has_method(value, "pipeThrough") &&
+      scr_stream_dyn_has_method(value, "getReader") && scr_stream_dyn_has_method(value, "cancel"))
+    return true;
+  if (scr_stream_dyn_has_method(value, "getWriter") && scr_stream_dyn_has_method(value, "abort"))
+    return true;
+  return scr_stream_dyn_transform_like(value);
+}
+
+/* A checked-dynamic pipeline() stage that the pipeline takes as a stream
+ * (the stream.unboxDynStage libCall): a boxed native stream or a stream
+ * handle answers its stream (+1). Any other value that is not stream-like
+ * or a function takes pipelineImpl's last branch, Duplex.from(stream):
+ * an iterable answers a readable Duplex the pipeline uses without piping
+ * the previous stage into it, and values Duplex.from rejects throw its
+ * ERR_INVALID_ARG_TYPE. Stream-like objects, web streams and functions
+ * throw `message` as the not-supported Error. */
+ScrStream *scr_stream_unbox_dyn_stage(const ScrDyn *value, const ScrStr *message) {
+  ScrStream *stream = scr_stream_of_handle(value);
+  if (!stream) stream = scr_stream_boxed(value);
+  if (stream) return stream;
+  if (value->kind == SCR_DYN_FUNC || scr_stream_dyn_stream_like(value)) {
+    if (!scr_exc_pending())
+      scr_throw_error_msg_code(SCR_ERR_ERROR, message->data, message->len, "SC2020");
+    return NULL;
+  }
+  if (scr_exc_pending()) return NULL;
+  ScrStream *d = scr_stream_duplex_from_dyn((ScrDyn *)value);
+  if (d) d->st->pipeline_body = true;
+  return d;
+}
+
+/* pipeline.js's first stage: a function is a source function, which the
+ * pipeline calls; a value with pipe() and on() methods is a readable node
+ * stream, which the stage ladder tests before isIterable; a string, a
+ * value with a Symbol.asyncIterator or Symbol.iterator method, or a
+ * { readable, writable } pair is an iterable the pipeline pumps into the
+ * next stage. */
 bool scr_stream_dyn_iterable_source(const ScrDyn *value) {
   ScrStream *stream = scr_stream_of_handle(value);
   if (!stream) stream = scr_stream_boxed(value);
@@ -8598,7 +8804,8 @@ bool scr_stream_dyn_iterable_source(const ScrDyn *value) {
     scr_stream_release(stream);
     return false;
   }
-  if (value->kind == SCR_DYN_STR) return true;
+  if (value->kind == SCR_DYN_STR || value->kind == SCR_DYN_FUNC) return true;
+  if (value->kind == SCR_DYN_HANDLE && value->v.handle.tag == SCR_DYNH_WEB_TRANSFORM) return true;
   if (value->kind == SCR_DYN_OBJ) {
     ScrDyn *pipe = scr_dyn_obj_read(value, "pipe", 4);
     if (!pipe) return false;
@@ -8611,6 +8818,79 @@ bool scr_stream_dyn_iterable_source(const ScrDyn *value) {
       scr_dyn_release(on);
       if (streamish) return false;
     }
+    if (scr_stream_dyn_transform_like(value)) return true;
+    if (scr_exc_pending()) return false;
   }
   return scr_dyn_iterable_kind(value) > 0;
+}
+
+/* Untyped web streams as pipeline stages have no lowering. */
+static void scr_stream_throw_web_stage(void) {
+  static const char msg[] = "pipeline stages that are untyped web streams are not supported yet";
+  scr_throw_error_msg_code(SCR_ERR_ERROR, msg, sizeof msg - 1, "SC2020");
+}
+
+/* A native stream returned by an untyped pipeline function, which Node
+ * pipes or passes on as the stream: throws the not-supported Error. */
+static bool scr_stream_dyn_stage_returned_stream(const ScrDyn *value) {
+  ScrStream *stream = scr_stream_of_handle(value);
+  if (!stream) stream = scr_stream_boxed(value);
+  if (!stream) return false;
+  scr_stream_release(stream);
+  static const char msg[] = "pipeline function stages that return a stream are not supported yet";
+  scr_throw_error_msg_code(SCR_ERR_ERROR, msg, sizeof msg - 1, "SC2020");
+  return true;
+}
+
+/* Node's ERR_INVALID_RETURN_VALUE TypeError: "Expected <expected> to be
+ * returned from the "<name>" function but got <the value's type>." */
+static void scr_stream_throw_invalid_return(const char *expected, const char *name,
+                                           const ScrDyn *got) {
+  char detail[160];
+  const char *type = scr_dyn_specific_type(got, detail, sizeof detail);
+  char msg[384];
+  int n = snprintf(msg, sizeof msg, "Expected %s to be returned from the \"%s\" function but got %s.",
+                   expected, name, type);
+  if (n < 0) n = 0;
+  if ((size_t)n >= sizeof msg) n = (int)sizeof msg - 1;
+  scr_throw_error_msg_code(SCR_ERR_TYPE, msg, (size_t)n, "ERR_INVALID_RETURN_VALUE");
+}
+
+/* An untyped pipeline function stage's result before the last stage
+ * (pipelineImpl's `isIterable(ret, true)` check): an async iterable
+ * answers itself (+1); other values throw ERR_INVALID_RETURN_VALUE naming
+ * the stage, as `label` ("transform[i]") does. */
+ScrDyn *scr_stream_dyn_transform_result(const ScrDyn *value, const ScrStr *label) {
+  if (scr_stream_dyn_stage_returned_stream(value)) return NULL;
+  int kind = scr_dyn_iterable_kind(value);
+  if (kind < 0) return NULL;
+  if (kind != 2) {
+    scr_stream_throw_invalid_return("AsyncIterable", label->data, value);
+    return NULL;
+  }
+  return scr_dyn_retain((ScrDyn *)value);
+}
+
+/* The value a checked-dynamic first stage pumps (pipelineImpl's i === 0
+ * branch): for `returned`, a source function's result, which must be
+ * iterable; otherwise a { readable, writable } pair's readable side, or
+ * the value itself. +1, or NULL with an exception pending. */
+ScrDyn *scr_stream_dyn_source_value(const ScrDyn *value, bool returned) {
+  if (!returned) {
+    if (value->kind == SCR_DYN_HANDLE && value->v.handle.tag == SCR_DYNH_WEB_TRANSFORM) {
+      scr_stream_throw_web_stage();
+      return NULL;
+    }
+    if (scr_stream_dyn_transform_like(value)) return scr_dyn_obj_read(value, "readable", 8);
+    if (scr_exc_pending()) return NULL;
+    return scr_dyn_retain((ScrDyn *)value);
+  }
+  if (scr_stream_dyn_stage_returned_stream(value)) return NULL;
+  int kind = scr_dyn_iterable_kind(value);
+  if (kind < 0) return NULL;
+  if (kind == 0) {
+    scr_stream_throw_invalid_return("Iterable, AsyncIterable or Stream", "source", value);
+    return NULL;
+  }
+  return scr_dyn_retain((ScrDyn *)value);
 }

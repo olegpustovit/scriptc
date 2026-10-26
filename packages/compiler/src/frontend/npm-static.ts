@@ -23,6 +23,7 @@ import {
   trackedRealpath,
 } from "./input-tracker.js";
 import { npmBuiltinAliasOf } from "./builtin-modules.js";
+import { packageSourceText, typePatchSuppliesTypes } from "./type-patches/layer.js";
 
 let activePackages: ReadonlySet<string> = new Set();
 let declarationOverloads: ReadonlyMap<string, NpmStaticDeclarationOverloads> = new Map();
@@ -82,7 +83,7 @@ export function setNpmStaticTypeExports(
 function withTypeExportTypedefs(path: string, text: string | null): string | null {
   const typedefs = typeExportTypedefs.get(path.split("\\").join("/"));
   if (typedefs === undefined) return text;
-  const source = text ?? trackedReadFile(path);
+  const source = text ?? packageSourceText(path);
   return source === null ? text : `${source}\n${typedefs}\n`;
 }
 
@@ -373,6 +374,7 @@ function packageIsUntyped(path: string): boolean {
     /* no package.json — keep probing */
   }
   if (untyped && trackedExists(`${pkgDir}/index.d.ts`)) untyped = false;
+  if (untyped && typePatchSuppliesTypes(pkgDir)) untyped = false;
   if (untyped) {
     // the @types twin, hoisted anywhere up the realm chain
     const mangled = mangledTypesName(dirName);
@@ -467,7 +469,11 @@ export function npmStaticFsShadow(services: FrontendServices): NpmStaticFsShadow
         if (hit !== undefined) return hit ?? undefined;
         let rewritten: string | null = null;
         try {
-          let original = trackedReadFile(path);
+          // A project type patch (type-patches/layer.ts) edits the text
+          // as the package wrote it, before any rewrite reads its JSDoc
+          // (unrewritten files fall through to the host, which serves the
+          // patched text too).
+          let original = packageSourceText(path);
           // A bundle's CommonJS chunks move to their own modules first, so
           // every later pass (and this shadow, for each chunk) sees plain
           // CommonJS module text.

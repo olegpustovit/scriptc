@@ -296,18 +296,31 @@ function unwrapFromDyn(e: IrExpr | null | undefined): IrExpr | null {
   return e;
 }
 
-/** Whether a function holds a cache site: a call to a classified helper or
- * a method dispatch. */
+/** Whether a function holds a cache site: a call to a classified helper,
+ * a method dispatch, or an object literal member with a constant key. */
 export function hasJsIcSite(fn: IrFunction, sites: JsIcSites): boolean {
   const methods = jsIcMethodSites(fn.name);
   return !everyStmtList(fn.body, {
     expr: (e) =>
       !(
         (methods && e.kind === "dynInvoke") ||
+        (methods &&
+          e.kind === "dynObjLit" &&
+          (e.fields ?? []).some((f) => jsIcLiteralKey(f.key) !== null)) ||
         (e.kind === "call" && sites.site(e.callee) !== null)
       ),
     stmt: () => true,
   });
+}
+
+/** The key of an object literal member that its site adds through the
+ * store cache: a constant string other than `__proto__`, or null. The
+ * literal starts as an empty object with the default prototype, so each
+ * such member appends one data property, and the site caches the shape
+ * transition and shares the key bytes the shape holds. Module
+ * initializers have no literal sites (jsIcMethodSites). */
+export function jsIcLiteralKey(key: IrExpr): string | null {
+  return key.kind === "strLit" && key.value !== "__proto__" ? key.value : null;
 }
 
 /** Whether method dispatch in a function goes through caches. Module

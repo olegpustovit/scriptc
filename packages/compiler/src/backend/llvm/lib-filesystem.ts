@@ -1027,6 +1027,54 @@ function emitPowerOfTwo(host: LlvmEmitterContext, n: string): string {
   return out;
 }
 
+/** `base ** exponent` and `Math.pow(base, exponent)` as V8's math::pow
+ * answers them: a literal exponent 2 is `base * base`, a literal 0.5 is
+ * `sqrt(base + 0)` (+Infinity for an infinite base), and every other
+ * exponent calls scr_math_pow, which applies V8's other special cases
+ * before the platform pow. The platform pow is never called by its libm
+ * name, which LLVM would rewrite (pow(2, x) to exp2(x), pow(x, -1) to 1/x)
+ * into answers that can differ from V8's. */
+export function emitPowF64(
+  host: LlvmEmitterContext,
+  base: string,
+  exponent: string,
+  exponentExpr: IrExpr,
+): string {
+  const B = host.B;
+  const literal =
+    exponentExpr.kind === "numLit"
+      ? exponentExpr.value
+      : exponentExpr.kind === "unary" &&
+          exponentExpr.op === "-" &&
+          exponentExpr.operand.kind === "numLit"
+        ? -exponentExpr.operand.value
+        : null;
+  const out = B.tmp();
+  if (literal === 2) {
+    B.line(`${out} = fmul double ${base}, ${base}`);
+    return out;
+  }
+  if (literal === 0.5) {
+    host.declare(`declare double @llvm.sqrt.f64(double)`);
+    host.declare(`declare double @llvm.fabs.f64(double)`);
+    const plus = B.tmp(),
+      root = B.tmp(),
+      magnitude = B.tmp(),
+      infinite = B.tmp();
+    B.line(`${plus} = fadd double ${base}, ${f64Lit(0)}`);
+    B.line(`${root} = call double @llvm.sqrt.f64(double ${plus})`);
+    B.line(`${magnitude} = call double @llvm.fabs.f64(double ${base})`);
+    B.line(`${infinite} = fcmp oeq double ${magnitude}, 0x7FF0000000000000`);
+    B.line(`${out} = select i1 ${infinite}, double 0x7FF0000000000000, double ${root}`);
+    return out;
+  }
+  host.declare(`declare double @scr_math_pow(double, double)`);
+  B.line(
+    `${out} = call double @scr_math_pow(double ${base}, double ${exponent}) nounwind willreturn`,
+  );
+  return out;
+}
+
 /** `Math.pow(2, n)`, the divisor emitPowerOfTwoQuotient takes. */
 export function isPowerOfTwoCall(e: IrExpr): boolean {
   return (
@@ -1098,6 +1146,11 @@ export function emitPrimitiveLibCall(host: LlvmEmitterContext, e: LibCallExpr): 
   if (e.fn === "math.pow" && e.args[0]!.kind === "numLit" && e.args[0]!.value === 2) {
     const v = host.emitExpr(e.args[1]!);
     return { name: emitPowerOfTwo(host, v.name), type: e.type };
+  }
+  if (e.fn === "math.pow") {
+    const base = host.emitExpr(e.args[0]!);
+    const exponent = host.emitExpr(e.args[1]!);
+    return { name: emitPowF64(host, base.name, exponent.name, e.args[1]!), type: e.type };
   }
   if (e.fn === "math.floor" || e.fn === "math.ceil") {
     const intr = e.fn === "math.floor" ? "floor" : "ceil";

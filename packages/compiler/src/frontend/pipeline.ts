@@ -47,6 +47,7 @@ import { THREADS_MODULE } from "./threads-import.js";
 import { erasedTypeOnlyImport } from "./type-only-imports.js";
 import { EXPERIMENTAL_MODULE } from "./experimental-import.js";
 import { readProjectConfig } from "../project-config.js";
+import { typePatchDiagnostics } from "./type-patches/layer.js";
 import { packageDirOf } from "../node-islands/origin.js";
 import {
   scanFiles,
@@ -735,10 +736,14 @@ function loadFrontend(
   const projectConfig = readProjectConfig(entryPath);
   const configDiagnostics = projectConfig.diagnostics;
   const report = options.nodeIslands === true;
+  // Type patches that did not apply as written (SC8030–SC8033) warn; the
+  // build goes on with the packages' own declarations there.
+  const patchDiagnostics = typePatchDiagnostics()?.diagnostics ?? [];
+  const buildWarnings = [...(report ? [] : configDiagnostics), ...patchDiagnostics];
   return {
     preflight:
       report && configDiagnostics.length > 0 ? [...configDiagnostics, ...preflight] : preflight,
-    ...(!report && configDiagnostics.length > 0 ? { warnings: configDiagnostics } : {}),
+    ...(buildWarnings.length > 0 ? { warnings: buildWarnings } : {}),
     entryText: () => finalLoad.entry.text,
     entryExports: () => entryFunctionExports(finalLoad.entry),
     // The contract scans the PROGRAM's source files, not the runtime
@@ -773,9 +778,10 @@ function loadFrontend(
           ...finalLoad.program.getImplementationSourceFiles().filter((sf) => !sf.isDeclarationFile),
         ].map((sf) => [sf.fileName, sf.text]),
       );
-      // SC8004 diagnostics point into the project's package.json.
+      // SC8004 and type patch diagnostics point into the project's
+      // package.json.
       if (
-        configDiagnostics.length > 0 &&
+        (configDiagnostics.length > 0 || patchDiagnostics.length > 0) &&
         projectConfig.manifest !== null &&
         projectConfig.manifestText !== null
       )

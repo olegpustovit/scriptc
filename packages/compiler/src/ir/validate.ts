@@ -127,6 +127,12 @@ export function validateModule(mod: IrModule): IrValidationError[] {
     errors.push({ message: "worker execution mode must be a boolean", loc: moduleLoc });
   if (mod.declBoundary !== undefined && mod.declBoundary !== true)
     errors.push({ message: "declBoundary must be true when present", loc: moduleLoc });
+  const declOrigins = mod.declOrigins;
+  if (
+    declOrigins !== undefined &&
+    (!Array.isArray(declOrigins) || declOrigins.some((o) => typeof o !== "string"))
+  )
+    errors.push({ message: "declOrigins must be an array of strings", loc: moduleLoc });
   if (mod.untypedIntegrity !== undefined && mod.untypedIntegrity !== true)
     errors.push({ message: "untypedIntegrity must be true when present", loc: moduleLoc });
   if (mod.lifetimeRegions !== undefined && mod.lifetimeRegions !== true)
@@ -1001,6 +1007,7 @@ export function validateModule(mod: IrModule): IrValidationError[] {
       mod.workers === true,
       mod.lifetimeRegions === true,
       new Set(mod.threadSlotKeys ?? []),
+      mod.declOrigins?.length ?? 0,
     );
   }
   return errors;
@@ -1020,6 +1027,7 @@ function validateFunction(
   workers: boolean,
   lifetimeRegions: boolean,
   threadSlotKeys: ReadonlySet<string>,
+  declOriginCount: number,
 ): void {
   const locals = new Map(fn.locals.map((l) => [l.id, l]));
   const err = (message: string, loc: SrcLoc) =>
@@ -4313,7 +4321,9 @@ function validateFunction(
     if (
       e.fn === "array.namedKeys" ||
       e.fn === "array.hasNamedKey" ||
-      e.fn === "array.hasProperties"
+      e.fn === "array.hasProperties" ||
+      e.fn === "array.foreign" ||
+      e.fn === "array.foreignThrow"
     ) {
       if (e.args[0]?.type.kind !== "array") {
         err(`libCall ${e.fn} arg 0: expected an array, got ${e.args[0]?.type.kind}`, e.loc);
@@ -5759,7 +5769,7 @@ function validateFunction(
         }
         const lastIsFunction = Math.floor(positions! / 2 ** (total - 1)) % 2 === 1;
         const helperCount = 3 * pipelinePumpedRuns(total, positions!, flags!);
-        const groups = helperCount + (destKind === 2 ? 1 : 0) + (flags! & 32 ? 2 : 0);
+        const groups = helperCount + (destKind >= 2 ? 1 : 0) + (flags! & 32 ? 2 : 0);
         const cbArgs =
           e.fn === "sp.pipelineStagesOpts"
             ? 1 + (flags! & 64 ? 1 : 0)
@@ -5774,7 +5784,7 @@ function validateFunction(
           total > 52 ||
           positions! >= 2 ** total ||
           functions !== k ||
-          destKind === 3 ||
+          (destKind === 3 && e.fn === "stream.composeStages") ||
           (destKind !== 0) !== lastIsFunction ||
           total < 2 ||
           e.args.length !== 5 + n! + k! + groups + cbArgs
@@ -5793,7 +5803,7 @@ function validateFunction(
             err(`libCall ${e.fn} stage function ${i} must be a func`, e.loc);
         }
         at2 += k!;
-        const helpers = helperCount + (destKind === 2 ? 1 : 0);
+        const helpers = helperCount + (destKind >= 2 ? 1 : 0);
         for (let i = at2; i < at2 + helpers; i++) {
           if (e.args[i]?.type.kind !== "func")
             err(`libCall ${e.fn} helper ${i} must be a func`, e.loc);
@@ -6152,6 +6162,11 @@ function validateFunction(
       case "dynCheck": {
         checkExpr(e.value);
         expectType(e.value, DYN, "dynCheck operand");
+        if (
+          e.origin !== undefined &&
+          (!Number.isInteger(e.origin) || e.origin < 0 || e.origin >= declOriginCount)
+        )
+          err(`dynCheck origin ${e.origin} is not an index of declOrigins`, e.loc);
         // The target drives the emitted validator/builder: non-dyn,
         // non-void, JSON-representable (closures/class instances can never
         // be found inside a JSON dyn — the frontend rejects those casts).

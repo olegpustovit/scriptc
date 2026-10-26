@@ -8,7 +8,7 @@ import { alwaysExactInteger, exactInteger } from "./integer-values.js";
 import { byteNumberAccess } from "../../ir/byte-numbers.js";
 import { emitByteNumber } from "./byte-numbers.js";
 import { integerOrNaNIndex, integerOrNaNRange } from "./wrapping-sums.js";
-import { bytesElementAlias, bytesHeaderAlias } from "./bytes-alias.js";
+import { bytesElementAlias, bytesHeaderAlias, bytesHeaderValueAlias } from "./bytes-alias.js";
 
 const BYTES_NUM_KIND: Record<string, { kind: number; le: boolean } | undefined> = {
   u8: { kind: 0, le: false },
@@ -160,12 +160,19 @@ export function emitBytesIndex(
   return idx;
 }
 
-/** The element count of a typed array, in the target's size type. */
-export function emitBytesHeaderLength(host: LlvmEmitterContext, receiver: string): string {
+/** The element count of a typed array, in the target's size type. `value`:
+ * the program reads the count itself (bytesHeaderValueAlias), rather than
+ * only bounding an access. */
+export function emitBytesHeaderLength(
+  host: LlvmEmitterContext,
+  receiver: string,
+  value = false,
+): string {
   const p = host.B.tmp();
   const len = host.B.tmp();
+  const alias = value ? bytesHeaderValueAlias(host) : bytesHeaderAlias(host);
   host.B.line(`${p} = getelementptr inbounds %ScrBytes, ptr ${receiver}, i64 0, i32 1`);
-  host.B.line(`${len} = load ${host.sizeType}, ptr ${p}${bytesHeaderAlias(host)}`);
+  host.B.line(`${len} = load ${host.sizeType}, ptr ${p}${alias}`);
   return len;
 }
 
@@ -184,7 +191,7 @@ export function emitBytesLength(
   bytes: boolean,
 ): LlValue {
   const B = host.B;
-  const len = emitBytesHeaderLength(host, receiver);
+  const len = emitBytesHeaderLength(host, receiver, true);
   const size = BYTES_ELEMENT_SIZE[elem];
   const count = bytes && size !== 1 ? B.tmp() : len;
   if (count !== len) B.line(`${count} = shl ${host.sizeType} ${len}, ${Math.log2(size)}`);
@@ -296,7 +303,7 @@ function emitScopedBytesGet(
   const signed = elem === "i8" || elem === "i16" || elem === "i32";
   B.line(`${number} = ${signed ? "sitofp" : "uitofp"} i32 ${u32} to double`);
   B.line(`${out} = select i1 ${valid}, double ${number}, double ${f64Lit(NaN)}`);
-  return { name: out, type: F64, uint32: u32 };
+  return { name: out, type: F64, uint32: u32, ordered: valid };
 }
 
 function emitBytesLoad(

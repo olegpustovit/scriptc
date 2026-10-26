@@ -386,7 +386,7 @@ globals: undefined fenced
     const run = runProbe(probe);
     expect(run.signal).toBeNull();
     expect(run.status).toBe(0);
-    expect(run.stdout).toBe("run: 20000\n".repeat(3));
+    expect(run.stdout).toBe("run: 40000\n".repeat(3));
   });
 
   /* ── K5/K6/K7: the trap channel ──────────────────────────────────────── */
@@ -614,7 +614,7 @@ survived, sink_calls=1
     const run = runProbe(probe);
     expect(run.signal).toBeNull();
     expect(run.status).toBe(0);
-    expect(run.stdout).toBe("run: 20000\n".repeat(3));
+    expect(run.stdout).toBe("run: 40000\n".repeat(3));
   });
 
   platformTest("K10: K5/K7 under ASan", async () => {

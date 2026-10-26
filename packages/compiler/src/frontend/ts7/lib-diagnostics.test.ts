@@ -4,9 +4,14 @@ import { join } from "node:path";
 import { afterAll, afterEach, expect, test } from "vitest";
 import type { SourceFile } from "./ast-types.js";
 import {
+  prebuiltLibDiagnosticsText,
+  readPrebuiltLibDiagnostics,
+  recordPrebuiltLibDiagnostics,
+  reusedKeptLibDiagnostics,
   reusedLibDiagnostics,
   setLibDiagnosticsStore,
   type LibDiagnosticsStore,
+  type PrebuiltLibDiagnostics,
 } from "./lib-diagnostics.js";
 import type { Ts7DiagnosticData } from "./session-schema.generated.js";
 import type { Ts7CheckedFileDiagnosticData, Ts7SessionProgram } from "./session.js";
@@ -23,7 +28,10 @@ const main = join(dir, "main.ts");
 const util = join(dir, "\u{1F600}.ts");
 const other = join(dir, "�.ts");
 
-afterEach(() => setLibDiagnosticsStore(null));
+afterEach(() => {
+  setLibDiagnosticsStore(null);
+  recordPrebuiltLibDiagnostics(null);
+});
 afterAll(() => {
   closeSourceParser();
   rmSync(dir, { recursive: true, force: true });
@@ -116,6 +124,45 @@ test("a stored answer stands in for checking the supplied files, merged by file 
     global: [],
   });
   expect(full?.semantic).toEqual(reused?.semantic);
+});
+
+test("with kept files, a stored answer needs checking only the kept other files", () => {
+  const store = memoryStore();
+  setLibDiagnosticsStore(store, "checker");
+  const pkg = join(dir, "node_modules", "pkg", "index.d.ts");
+  const semantic = new Map([
+    [lib, [diagnostic(lib, 1)]],
+    [fallback, []],
+    [main, [diagnostic(main, 5)]],
+    [pkg, [diagnostic(pkg, 3)]],
+  ]);
+  const withPackage = files({
+    [main]: "export const n: number = 'x';\n",
+    [pkg]: "export declare const p: number;\n",
+  });
+  const all = [lib, fallback, main, pkg];
+  const keep = new Set([lib, fallback, main]);
+  // Without a stored answer nothing is checked or stored.
+  const cold = sessionProgram({ semantic });
+  expect(reusedKeptLibDiagnostics(cold, all, supplied, withPackage, keep)).toBeNull();
+  expect(cold.asked).toEqual([]);
+  expect(store.entries.size).toBe(0);
+  reusedLibDiagnostics(sessionProgram({ semantic }), all, supplied, withPackage);
+  expect(store.entries.size).toBe(1);
+  const warm = sessionProgram({ semantic });
+  expect(reusedKeptLibDiagnostics(warm, all, supplied, withPackage, keep)).toEqual({
+    semantic: [diagnostic(lib, 1), diagnostic(main, 5)],
+    global: [],
+  });
+  expect(warm.asked).toEqual([`checked ${main}`]);
+  // A left-out file that can declare something global still prevents reuse.
+  const augmenting = files({
+    [main]: "export const n: number = 'x';\n",
+    [pkg]: "export {};\ndeclare global {\n  var NaN: number;\n}\n",
+  });
+  const blocked = sessionProgram({ semantic });
+  expect(reusedKeptLibDiagnostics(blocked, all, supplied, augmenting, keep)).toBeNull();
+  expect(blocked.asked).toEqual([]);
 });
 
 test("files merge in code point order, which differs from UTF-16 order", () => {
@@ -268,4 +315,70 @@ test("a script that uses an answer stored without global names collects and stor
   expect(clash.asked[0]).toBe("getGlobalDiagnostics");
   expect(store.entries.size).toBe(1);
   expect(JSON.parse([...store.entries.values()][0]!).globals).not.toBeNull();
+});
+
+/** The content keys a full check of the program records, with checker release `checker`. */
+function recorded(
+  checker: string,
+  semantic: Map<string, Ts7DiagnosticData[]>,
+): PrebuiltLibDiagnostics {
+  const keys = new Set<string>();
+  recordPrebuiltLibDiagnostics({ checker, record: (key) => keys.add(key) });
+  setLibDiagnosticsStore(memoryStore(), "build-time checker");
+  reusedLibDiagnostics(sessionProgram({ semantic }), names, supplied, moduleFile);
+  recordPrebuiltLibDiagnostics(null);
+  return { checker, keys };
+}
+
+test("a prebuilt answer stands in for checking the supplied files in an empty store", () => {
+  const semantic = new Map([[main, [diagnostic(main, 5)]]]);
+  const prebuilt = recorded("1.0.0", semantic);
+  expect(prebuilt.keys.size).toBe(1);
+  // Another installation: its own store, its own checker identity.
+  const store = memoryStore();
+  setLibDiagnosticsStore(store, "installed checker", () => prebuilt);
+  const program = sessionProgram({ semantic });
+  expect(reusedLibDiagnostics(program, names, supplied, moduleFile)).toEqual({
+    semantic: [diagnostic(main, 5)],
+    global: [],
+  });
+  expect(program.asked).toEqual([`checked ${main}`]);
+  // The answer is stored, so the next build reads it from the store.
+  expect(store.entries.size).toBe(1);
+  const next = sessionProgram({ semantic });
+  setLibDiagnosticsStore(store, "installed checker", () => {
+    throw new Error("the store answers first");
+  });
+  reusedLibDiagnostics(next, names, supplied, moduleFile);
+  expect(next.asked).toEqual([`checked ${main}`]);
+});
+
+test("prebuilt answers apply only to the same checker release and file contents", () => {
+  const semantic = new Map([[main, []]]);
+  const prebuilt = recorded("1.0.0", semantic);
+  const other: PrebuiltLibDiagnostics = { checker: "1.0.1", keys: prebuilt.keys };
+  setLibDiagnosticsStore(memoryStore(), "installed checker", () => other);
+  const release = sessionProgram({ semantic });
+  reusedLibDiagnostics(release, names, supplied, moduleFile);
+  expect(release.asked[0]).toBe("getGlobalDiagnostics");
+  writeFileSync(fallback, fallbackText + "// edited\n");
+  setLibDiagnosticsStore(memoryStore(), "installed checker", () => prebuilt);
+  const edited = sessionProgram({ semantic });
+  reusedLibDiagnostics(edited, names, supplied, moduleFile);
+  expect(edited.asked[0]).toBe("getGlobalDiagnostics");
+  writeFileSync(fallback, fallbackText);
+});
+
+test("a full check that reports diagnostics in a supplied file records no prebuilt answer", () => {
+  const prebuilt = recorded("1.0.0", new Map([[lib, [diagnostic(lib, 1)]]]));
+  expect(prebuilt.keys.size).toBe(0);
+});
+
+test("prebuilt answer files round-trip, and a malformed one is no answer", () => {
+  const path = join(dir, "lib-diagnostics.json");
+  writeFileSync(path, prebuiltLibDiagnosticsText("1.0.0", ["b", "a", "b"]));
+  expect(readPrebuiltLibDiagnostics(path)).toEqual({ checker: "1.0.0", keys: new Set(["a", "b"]) });
+  writeFileSync(path, '{ "schema": "other", "checker": "1.0.0", "keys": [] }');
+  expect(readPrebuiltLibDiagnostics(path)).toBeNull();
+  expect(readPrebuiltLibDiagnostics(join(dir, "missing.json"))).toBeNull();
 });

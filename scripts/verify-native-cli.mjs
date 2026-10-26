@@ -41,6 +41,13 @@ for (const name of [
     throw new Error(`native toolchain needs a relative ${name}`);
   within(resolve(dirname(binary), hostPath(value)));
 }
+// Optional: a compiler this host could not run while building ships without it.
+if (toolchain.lib_diagnostics !== undefined) {
+  const value = toolchain.lib_diagnostics;
+  if (typeof value !== "string" || absolutePath(value))
+    throw new Error("native toolchain needs a relative lib_diagnostics");
+  within(resolve(dirname(binary), hostPath(value)));
+}
 const pack = JSON.parse(
   readFileSync(
     resolve(dirname(binary), hostPath(toolchain.runtime_pack), "runtime-pack.json"),

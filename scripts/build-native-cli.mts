@@ -1,12 +1,14 @@
 /** Build the production CLI seed and its relocatable compiler assets. */
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import { compile } from "../packages/compiler/src/index.js";
 import { NATIVE_TARGETS, nativeCodegenTarget } from "../packages/compiler/src/backend/targets.js";
 import { tsgoExecutable } from "../packages/compiler/src/frontend/ts7/rpc-api.js";
+import { prebuiltLibDiagnosticsText } from "../packages/compiler/src/frontend/ts7/lib-diagnostics.js";
 import { stageNativeCliAssets } from "./native-cli-assets.mjs";
 import type { NativeToolchainManifest } from "../packages/compiler/src/native/toolchain.js";
 
@@ -181,4 +183,60 @@ const manifest: NativeToolchainManifest = {
   comptime: relative(bin, comptime),
 };
 writeFileSync(executable + ".json", JSON.stringify(manifest, null, 2) + "\n");
+// The prebuilt lib diagnostics (frontend/ts7/lib-diagnostics.ts): the
+// declaration file sets the distribution's tsc-ts reports no diagnostics in
+// for programs without a tsconfig, recorded by the built compiler itself. A
+// compiler this host cannot run ships without them.
+const prebuiltKeys = recordPrebuiltLibDiagnostics(executable);
+if (prebuiltKeys === null) {
+  console.warn(
+    "warning: the built compiler did not run here; it ships without prebuilt lib diagnostics",
+  );
+} else {
+  const prebuilt = join(lib, "declarations", "lib-diagnostics.json");
+  const checker = (
+    JSON.parse(readFileSync(join(lib, "tsc-ts", "package.json"), "utf8")) as { version: string }
+  ).version;
+  writeFileSync(prebuilt, prebuiltLibDiagnosticsText(checker, prebuiltKeys));
+  manifest.lib_diagnostics = relative(bin, prebuilt);
+  writeFileSync(executable + ".json", JSON.stringify(manifest, null, 2) + "\n");
+}
 console.log(executable);
+
+/** The content keys the built compiler records building, each in an empty
+ * cache, a module without imports (the program it lowers) and a module with
+ * a type error (which also checks the program without scriptc's overrides);
+ * null when it cannot run. */
+function recordPrebuiltLibDiagnostics(compiler: string): string[] | null {
+  const work = mkdtempSync(join(tmpdir(), "scriptc-lib-diagnostics-"));
+  try {
+    const record = join(work, "keys.txt");
+    const probes = [
+      { name: "clean", source: "export {};\n", status: 0 },
+      { name: "error", source: 'export const n: number = "x";\n', status: 1 },
+    ];
+    for (const probe of probes) {
+      const dir = join(work, probe.name);
+      mkdirSync(dir);
+      writeFileSync(join(dir, "main.ts"), probe.source);
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        SCRIPTC_CACHE_DIR: join(dir, "cache"),
+        SCRIPTC_LIB_DIAGNOSTICS_RECORD: record,
+      };
+      delete env["SCRIPTC_TIMING"];
+      const run = spawnSync(
+        compiler,
+        ["build", join(dir, "main.ts"), "--optimization", "dev", "-o", join(dir, "main")],
+        { cwd: dir, env, encoding: "utf8" },
+      );
+      if (run.status !== probe.status) return null;
+    }
+    if (!existsSync(record)) return null;
+    return readFileSync(record, "utf8")
+      .split("\n")
+      .filter((key) => key !== "");
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+}

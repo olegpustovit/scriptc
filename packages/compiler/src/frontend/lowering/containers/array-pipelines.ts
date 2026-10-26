@@ -34,6 +34,7 @@ import {
   arrayValueRead,
   arrayValueStore,
   arrayValueType,
+  elementMayBeForeign,
 } from "../array-values.js";
 import type { Lowerer } from "../lowerer.js";
 
@@ -156,7 +157,8 @@ const PURE_STRING = new Set<string>([
   "toUpperCase",
   "isWellFormed",
   "toWellFormed",
-  "cpAt",
+  "byteLength",
+  "cpAtByte",
 ]);
 
 function primitive(t: IrType): boolean {
@@ -1643,7 +1645,9 @@ class FusedLoop {
         ];
       }
       const valueT = arrayValueType(this.lowerer, arrT.elem);
-      if (stage.fast) {
+      // A foreign element is neither the plain element nor undefined: the
+      // ordinary read below converts it.
+      if (stage.fast && !elementMayBeForeign(this.lowerer, arrT.elem)) {
         // The split visit: a value goes on as the plain element, a present
         // undefined as the undefined arm.
         const missing = this.lowerer.wrappedUndefined(valueT, loc);
