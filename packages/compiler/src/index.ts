@@ -1548,6 +1548,7 @@ async function compileTracked(
       ...checkerField(),
       ...(youngNurseryRequested() ? { youngNursery: true as const } : {}),
       npmStatic: opts.npmStatic ?? null,
+      ...(opts.define !== undefined ? { define: JSON.stringify(opts.define) } : {}),
       ffiProfile:
         opts.ffiProfilePath === undefined || ffiProfileBytes === null
           ? null
