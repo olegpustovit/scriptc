@@ -9,12 +9,17 @@ const hex = Buffer.from(pass).toString("hex");
 const pem = privateKey.export({ format: "pem", type: "pkcs8", cipher: "aes-256-cbc", passphrase: hex, encoding: "hex" });
 const der = privateKey.export({ format: "der", type: "pkcs8", cipher: "aes-128-cbc", passphrase: pass });
 
+// A wrong passphrase usually fails the decryption's padding check
+// (ERR_OSSL_BAD_DECRYPT); with a fresh key and IV each run, Node's
+// OpenSSL now and then accepts the padding and rejects the decrypted
+// structure instead (ERR_OSSL_UNSUPPORTED). Both are reported as one.
 function attempt(label, options) {
   try {
     const key = c.createPrivateKey(options);
     console.log(label, key.asymmetricKeyType, key.equals(privateKey));
   } catch (e) {
-    console.log(label, "throws", e.code);
+    const wrong = e.code === "ERR_OSSL_BAD_DECRYPT" || e.code === "ERR_OSSL_UNSUPPORTED";
+    console.log(label, "throws", wrong ? "a decryption error" : e.code);
   }
 }
 

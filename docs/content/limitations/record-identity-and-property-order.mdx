@@ -25,3 +25,10 @@ Index-signature records list declared fields before the other keys.
 
 Optional fields and properties added through a record's `unknown` view can be deleted.
 A required field has no absent state, so deleting it through the view throws `TypeError: Cannot delete property 'x' of #<Object>` and leaves the record unchanged, where Node.js removes the property.
+
+Records inherit `toString`, `toLocaleString`, `valueOf`, `hasOwnProperty`, `isPrototypeOf` and `propertyIsEnumerable` from `Object.prototype`.
+A call of one of these methods by name runs the built-in with the record as its receiver, unless the record holds an own function under that name.
+A keyed read such as `handlers[name]` of a record whose values are functions answers the built-in when the record lacks the key, so truthiness, `typeof` and calls match Node.js.
+A keyed read of a record whose values are not functions, such as `counts["toString"]` on a `Record<string, number>`, answers `undefined` where Node.js answers the inherited function, so `counts[word] ?? 0` counts such a word as new.
+Calling a built-in read from a record of functions throws a `TypeError` when its answer does not fit the record's function type, for example `valueOf` read from a `Record<string, (x: number) => number>`.
+Other inherited names, such as `constructor`, read `undefined` from typed records.

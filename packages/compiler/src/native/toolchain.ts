@@ -30,6 +30,9 @@ export interface NativeToolchain {
   declarationsRoot?: string;
   comptimeExecutable?: string;
   wasiNodeRunner?: string;
+  /** The prebuilt lib diagnostics the distribution ships, present while the
+   * checker is the distribution's own tsc-ts (lib-diagnostics.ts). */
+  prebuiltLibDiagnostics?: string;
 }
 
 /** Distribution paths are relative to this manifest, so moving an installed
@@ -54,6 +57,8 @@ export interface NativeToolchainManifest {
   relocatable_linker?: string;
   comptime?: string;
   wasi_node_runner?: string;
+  /** Answers for the supplied declaration files, computed with `tsc_ts`. */
+  lib_diagnostics?: string;
 }
 
 function pathFrom(root: string, value: string): string {
@@ -120,6 +125,7 @@ export function loadNativeToolchain(
     "relocatable_linker",
     "comptime",
     "wasi_node_runner",
+    "lib_diagnostics",
   ]) {
     if (value[name] !== undefined && (typeof value[name] !== "string" || value[name] === ""))
       throw new Error(`native toolchain requires a nonempty string for ${name}`);
@@ -221,5 +227,11 @@ export function loadNativeToolchain(
     ...(manifest.wasi_node_runner === undefined
       ? {}
       : { wasiNodeRunner: pathFrom(root, manifest.wasi_node_runner) }),
+    // The prebuilt answers are the distribution's tsc-ts's.
+    ...(manifest.lib_diagnostics === undefined ||
+    manifest.tsc_ts === undefined ||
+    checkerBackend(env) === "tsgo"
+      ? {}
+      : { prebuiltLibDiagnostics: pathFrom(root, manifest.lib_diagnostics) }),
   };
 }

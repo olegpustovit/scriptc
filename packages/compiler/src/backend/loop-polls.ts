@@ -110,8 +110,8 @@ export function loopTestsEveryIteration(loop: Loop, tested: (call: IrExpr) => bo
 /** True when the body of `loop`, outside its nested loops and closures,
  * reads or writes a typed-array element: the loops whose cancellation poll
  * the emitter moves between blocks of iterations, so that LLVM can
- * vectorize them. Other loops keep the budget in their body, which costs
- * less in a loop of a few iterations. */
+ * vectorize them. Outside another loop, other loops keep the budget in
+ * their body, which costs less in a loop of a few iterations. */
 export function loopAccessesTypedArrays(loop: Loop): boolean {
   const inExpr = (e: IrExpr): boolean => {
     if (e.kind === "bytesIntrinsic" && e.method === "get") return true;

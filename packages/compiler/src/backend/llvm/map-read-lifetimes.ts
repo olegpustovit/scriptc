@@ -12,13 +12,18 @@ import type { CallLifetimes } from "./call-lifetimes.js";
 import type { ReferenceEffects } from "./reference-effects.js";
 import type { LlValue, LlvmEmitterContext } from "./expr-context.js";
 import {
+  emitCompactMapSlot,
   emitNumberMapGetRef,
   emitNumberMapGetScalar,
+  emitNumberMapSlot,
+  emitStringMapEntry,
   emitStringMapGetScalar,
   emitStringMapGetRef,
   compactMapValues,
   noteNumberMapKey,
 } from "./map-number-lookup.js";
+import { InternalCompilerError } from "../../errors.js";
+import { undefinedArmTag } from "../../ir/analysis.js";
 import { mapKeyAccess, mapKeyParamType } from "./shapes.js";
 import { rememberMapEntry } from "./map-entry-fusion.js";
 
@@ -489,4 +494,63 @@ export function emitStackMapRead(host: LlvmEmitterContext, read: LocalMapRead): 
   B.line(`${selected} = select i1 ${found}, i32 ${read.presentTag}, i32 ${read.missingTag}`);
   B.line(`store i32 ${selected}, ptr ${tag}`);
   return { value: { name: box, type: read.type }, owner };
+}
+
+/** A string-keyed Map.get whose result is a nullable-pointer union over the
+ * map's own value type (`Map<string, F>` read as `F | undefined`): a hit is
+ * the stored pointer itself and a miss the immortal undefined encoding, so
+ * the read can lend the stored value (emitBorrowedMapGet). */
+export function pointerMapGet(host: LlvmEmitterContext, e: IrExpr): boolean {
+  if (
+    e.kind !== "mapIntrinsic" ||
+    e.method !== "get" ||
+    e.args.length !== 1 ||
+    e.type.kind !== "union" ||
+    e.receiver.type.kind !== "map" ||
+    e.receiver.type.key.kind !== "string" ||
+    !borrowsMapReadInputs(e)
+  )
+    return false;
+  const nullable = host.nullableUnions.single(e.type.unionId);
+  return (
+    nullable !== null &&
+    typeEquals(nullable.arm, e.receiver.type.value) &&
+    undefinedArmTag(e.type, host.unionsById) >= 0
+  );
+}
+
+/** A pointerMapGet read without a reference: the map (and through it the
+ * stored value) must stay unchanged and alive until the consumer is done
+ * with the pointer (canBorrowReceiver). */
+export function emitBorrowedMapGet(
+  host: LlvmEmitterContext,
+  e: IrExpr & { kind: "mapIntrinsic" },
+): LlValue {
+  const B = host.B;
+  const mapType = e.receiver.type;
+  if (e.type.kind !== "union" || mapType.kind !== "map")
+    throw new InternalCompilerError("llvm emitter bug: borrowed Map.get shape");
+  const receiver = host.emitReadReceiver(e.receiver);
+  const keyExpr = e.args[0]!;
+  const key = host.canBorrowReceiver(keyExpr)
+    ? host.emitReadReceiver(keyExpr)
+    : host.emitExpr(keyExpr);
+  const compact = compactMapValues(host, mapType.key, mapType.value);
+  const entry = emitStringMapEntry(host, receiver.name, key.name, compact);
+  const found = B.tmp();
+  B.line(`${found} = icmp ne ptr ${entry}, null`);
+  const hit = B.newLabel("mapb.hit"),
+    miss = B.newLabel("mapb.miss"),
+    join = B.newLabel("mapb.join");
+  B.condBr(found, hit, miss);
+  B.startBlock(hit);
+  const value = compact ? emitCompactMapSlot(host, entry) : emitNumberMapSlot(host, entry, "ptr");
+  B.br(join);
+  B.startBlock(miss);
+  B.br(join);
+  B.startBlock(join);
+  const absent = host.unitInstanceRef(e.type.unionId, undefinedArmTag(e.type, host.unionsById));
+  const result = B.tmp();
+  B.line(`${result} = phi ptr [ ${value}, %${hit} ], [ ${absent}, %${miss} ]`);
+  return { name: result, type: e.type };
 }

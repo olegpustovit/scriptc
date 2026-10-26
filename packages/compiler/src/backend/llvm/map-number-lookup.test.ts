@@ -168,8 +168,10 @@ test("hashed number-key lookups probe inline and call the runtime only for wide 
     expect(hashed).toContain("select i1 %nan, i64 9221120237041090560, i64 %kzb");
     expect(hashed).toContain("mul i64 %x1, -4658895280553007687");
     expect(hashed).toContain("mul i64 %x3, -7723592293110705685");
-    // Filter (field 10), small-map scan of the entry count (field 8), and
-    // compact buckets (fields 13 and 14) tagged with the hash's top byte.
+    // Filter (field 10) before the small-map scan of the entry count (field
+    // 8) only, and compact buckets (fields 13 and 14) tagged with the hash's
+    // top byte.
+    expect(hashed).toContain("br i1 %linear, label %filter, label %buckets");
     expect(hashed).toContain("getelementptr inbounds %ScrMapIx, ptr %m, i32 0, i32 10");
     expect(hashed).toContain(`load i32, ptr %nep`);
     expect(hashed).toContain(`load i32, ptr %nbp`);
@@ -192,11 +194,23 @@ test("a key with an integer view tests the direct index on the integer", () => {
         integral.module,
       )![0];
     // An unsigned compare also rejects negative keys; the hashed probe takes
-    // the double.
+    // the integer.
     expect(helper).toContain("icmp ult i64 %ki, %nd");
     expect(helper).toContain(`getelementptr inbounds i32, ptr %dense, ${sz} %i`);
-    expect(helper).toContain("call ptr @sc_map_entry_f64_hashed(ptr %m, double %k)");
+    expect(helper).toContain("call ptr @sc_map_entry_f64_hashed_int(ptr %m, i64 %ki)");
     expect(helper).not.toContain("fptosi");
+    // Its key word is the integer's double, which needs no NaN or -0
+    // normalization; the runtime lookup gets that double.
+    const hashed =
+      /^define internal ptr @sc_map_entry_f64_hashed_int\(ptr %m, i64 %ki\) noinline [^]*?^}/m.exec(
+        integral.module,
+      )![0];
+    expect(hashed).toContain("sitofp i64 %ki to double");
+    expect(hashed).not.toContain("fcmp");
+    expect(hashed).toContain("mul i64 %x1, -4658895280553007687");
+    expect(hashed).toContain(
+      "call ptr @scr_map_entry_f64(ptr %m, double %kf) memory(read) nounwind willreturn",
+    );
     // A fractional key and a key without a proof keep the double lookup.
     for (const key of [{ kind: "numLit", value: 0.5, type: F64, loc } as IrExpr, ref("k", F64)]) {
       const { work } = emitted(lookupFixture(key), bits);

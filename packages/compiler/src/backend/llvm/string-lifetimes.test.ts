@@ -341,7 +341,7 @@ const methodCases: {
   { method: "normalize", args: [ref("argument")], result: STRING, target: "normalize" },
   { method: "isWellFormed", args: [], result: BOOL, target: "is_well_formed" },
   { method: "toWellFormed", args: [], result: STRING, target: "to_well_formed" },
-  { method: "cpAt", args: [num(1)], result: STRING, target: "cp_at" },
+  { method: "cpAtByte", args: [num(1)], result: STRING, target: "cp_at_byte", inline: true },
 ];
 
 test.each(methodCases)(

@@ -52,7 +52,7 @@ import { InternalCompilerError } from "./errors.js";
 import { frontendProcessExecArgv } from "./frontend-process-args.js";
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -119,6 +119,7 @@ import {
   ffiNativeBuildDiag,
   iceDiag,
   nativeCodegenDiag,
+  isTypePatchCode,
   type ScrDiagnostic,
 } from "./diagnostics/diagnostic.js";
 import { loadLibraryProfile, type LibraryProfile } from "./library/library-profile.js";
@@ -485,12 +486,31 @@ interface CompileWarningSink {
   sourceTexts: Map<string, string> | null;
 }
 
+/** The package.json texts type patch warnings point into, re-read for a
+ * cache hit's code frames (performance warnings need none). */
+function cachedWarningSources(warnings: readonly ScrDiagnostic[]): Map<string, string> {
+  const texts = new Map<string, string>();
+  for (const w of warnings) {
+    if (!isTypePatchCode(w.code) || texts.has(w.loc.file)) continue;
+    try {
+      texts.set(w.loc.file, readFileSync(w.loc.file, "utf8"));
+    } catch {
+      // The frame is omitted; the message stands alone.
+    }
+  }
+  return texts;
+}
+
 /** The build's performance warnings (SC61xx), stored with its cache entry
  * so a cache hit repeats them. */
 function performanceWarnings(sink: CompileWarningSink | undefined): {
   performance?: ScrDiagnostic[];
 } {
-  const performance = (sink?.warnings ?? []).filter((d) => isPerformanceCode(d.code));
+  // Type patch warnings (SC8030–SC8033) describe the same unchanged inputs,
+  // so a hit repeats them too.
+  const performance = (sink?.warnings ?? []).filter(
+    (d) => isPerformanceCode(d.code) || isTypePatchCode(d.code),
+  );
   return performance.length === 0 ? {} : { performance };
 }
 
@@ -630,8 +650,11 @@ async function compileExecutableNative(
     ...(features.declAdopt ? { declAdopt: true } : {}),
     ...(features.dynForAwait ? { dynForAwait: true } : {}),
     ...(features.eventsOnceSignal ? { eventsOnceSignal: true } : {}),
+    ...(features.mime ? { mime: true } : {}),
+    ...(features.utilTiming ? { utilTiming: true } : {}),
     ...(features.dynBuffer ? { dynBuffer: true } : {}),
     ...(features.builtinValues ? { builtinValues: true } : {}),
+    ...(features.computedRequire ? { computedRequire: true } : {}),
     events: features.events,
     emitter: features.emitter,
     symbol: features.symbol,
@@ -834,6 +857,7 @@ async function prepareExecutableInput(
         // the pending flag, since their link may not add an unwinder.
         unwindAbi: buildPlatform === "linux" && outputKind !== "obj",
         objectAudit: opts.sanitize === true,
+        sanitizeAttributes: opts.sanitize === true,
         lowRegion: lowRegionTarget(buildPlatform, opts.sanitize === true),
         ...(opts.sanitize === true ? { wasmBoundsChecks: true } : {}),
         ...inlineRcOption(opts.optimization, opts.sanitize === true),
@@ -905,6 +929,7 @@ async function prepareExecutableInput(
       runtimeAbiMarker: useRuntimePack,
       unwindAbi: buildPlatform === "linux",
       objectAudit: opts.sanitize === true,
+      sanitizeAttributes: opts.sanitize === true,
       lowRegion: lowRegionTarget(buildPlatform, opts.sanitize === true),
       ...(opts.sanitize === true ? { wasmBoundsChecks: true } : {}),
       ...inlineRcOption(opts.optimization, opts.sanitize === true),
@@ -1603,7 +1628,7 @@ async function compileTracked(
     // names is just as untyped as when it was built.
     if (warningSink !== undefined && earlyHit.performance !== undefined) {
       warningSink.warnings = earlyHit.performance;
-      warningSink.sourceTexts = new Map();
+      warningSink.sourceTexts = cachedWarningSources(earlyHit.performance);
     }
     const executableCacheOptions = earlyCacheOptions;
     // Route/proof metadata is independently evictable. A full-compiler
@@ -2338,6 +2363,7 @@ async function compileLibraryTracked(
       pointerBits: buildPlatform === "wasi" ? 32 : 64,
       wasi: buildPlatform === "wasi",
       objectAudit: opts.sanitize === true,
+      sanitizeAttributes: opts.sanitize === true,
       ...inlineRcOption(profile.optimization, opts.sanitize === true),
     });
     timing("llvm-emit", {

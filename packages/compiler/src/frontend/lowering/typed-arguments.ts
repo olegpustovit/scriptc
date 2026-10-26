@@ -2,7 +2,15 @@ import * as ts from "../ts7/adapter.js";
 import { bodyReadsArguments } from "../arguments-usage.js";
 import { isJsSourceFile, locOf } from "../program.js";
 import { restTupleElementTypes, unitOnlyUnion } from "../type-mapper.js";
-import { DYN, type IrExpr, type IrLocal, type IrStmt, type IrType, arrayOf } from "../../ir/ir.js";
+import {
+  DYN,
+  type IrExpr,
+  type IrLocal,
+  type IrParam,
+  type IrStmt,
+  type IrType,
+  arrayOf,
+} from "../../ir/ir.js";
 import type { Lowerer } from "./lowerer.js";
 import { captureContextArguments } from "./function-context.js";
 import { isThisParameter, type ParamShape } from "./call-signatures.js";
@@ -156,7 +164,7 @@ export function declareTypedArguments(
   lowerer: Lowerer,
   node: ts.FunctionExpression,
   shapes: readonly ParamShape[],
-  params: { localId: string; name: string; type: IrType }[],
+  params: IrParam[],
   prologue: IrStmt[],
 ): void {
   const loc = locOf(node);

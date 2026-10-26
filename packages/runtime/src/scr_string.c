@@ -3514,6 +3514,8 @@ ScrStr *scr_bool_to_scrstr(bool b) {
  * decode is a whole char; an i addressing the LOW half of an astral pair
  * (unreachable from the iterator, which only lands on char starts) answers
  * the containing char. Out of range → empty string. Borrows s; +1. */
+static ScrStr *scr_str_char_of(const char *bytes, size_t adv);
+
 ScrStr *scr_str_cp_at(ScrStr *s, double i) {
   double idx = scr_to_integer_or_infinity(i);
   if (!(idx >= 0)) return scr_str_empty();
@@ -3528,7 +3530,80 @@ ScrStr *scr_str_cp_at(ScrStr *s, double i) {
   if (off >= s->len) return scr_str_empty(); /* out of range */
   size_t adv;
   (void)scr_utf8_decode(s->data + off, &adv);
-  return scr_str_from_span(s->data + off, adv);
+  return scr_str_char_of(s->data + off, adv);
+}
+
+/* The one-character strings of U+0080..U+07FF (two-byte sequences, lead
+ * bytes 0xC2..0xDF), made immortal on first use and shared by every
+ * thread, as the ASCII ones are static: the string iterator returns them
+ * instead of a new string per character. A string is immortal before its
+ * slot publishes it; a thread that loses the race to fill a slot keeps its
+ * own immortal copy, so at most one extra string per slot and thread. The
+ * strings come from the system allocator, as other state that outlives a
+ * thread does: a worker's own memory goes back when it exits without
+ * sharing (scr_alloc.c), and the table outlives the worker that filled a
+ * slot. */
+static ScrStr *scr_two_byte_chars[0x800 - 0x80];
+
+static ScrStr *scr_two_byte_char(const char *bytes) {
+  uint32_t cp = ((uint32_t)((unsigned char)bytes[0] & 0x1F) << 6) | ((unsigned char)bytes[1] & 0x3F);
+  ScrStr **slot = &scr_two_byte_chars[cp - 0x80];
+  ScrStr *known = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+  if (known) return known;
+  ScrStr *made = calloc(1, sizeof(ScrStr) + 3);
+  if (!made) scr_oom();
+  made->len = 2;
+  made->cap = 2;
+  memcpy(made->data, bytes, 2);
+  scr_str_hash_prime(made);
+  made->rc = SIZE_MAX;
+  scr_lsan_immortal(made);
+  ScrStr *expected = NULL;
+  if (__atomic_compare_exchange_n(slot, &expected, made, false, __ATOMIC_ACQ_REL,
+                                  __ATOMIC_ACQUIRE))
+    return made;
+  return expected;
+}
+
+/* The character whose encoding starts at bytes and is adv bytes long (+1,
+ * or immortal). */
+static ScrStr *scr_str_char_of(const char *bytes, size_t adv) {
+  unsigned char lead = (unsigned char)bytes[0];
+  if (adv == 1 && lead < 0x80) return (ScrStr *)&scr_ascii1[lead];
+  if (adv == 2) return scr_two_byte_char(bytes);
+  return scr_str_from_span(bytes, adv);
+}
+
+ScrStr *scr_str_cp_at_byte(ScrStr *s, uint64_t b) {
+  if (b >= s->len) return scr_str_empty();
+  size_t adv;
+  (void)scr_utf8_decode(s->data + b, &adv);
+  return scr_str_char_of(s->data + b, adv);
+}
+
+ScrArr *scr_str_code_points(ScrStr *s) {
+  /* Every byte but a continuation byte starts one character; a lone
+   * surrogate's three bytes are one character. */
+  size_t count = s->len;
+  if (!s->ascii)
+    for (size_t b = 0; b < s->len; b++) count -= ((unsigned char)s->data[b] & 0xC0) == 0x80;
+  ScrArr *out = scr_arr_new_inline(SCR_ELEM_STR, count, false);
+  size_t k = 0;
+  for (size_t b = 0; b < s->len;) {
+    unsigned char c = (unsigned char)s->data[b];
+    if (c < 0x80) {
+      out->data[k++] = (uint64_t)(uintptr_t)&scr_ascii1[c];
+      b++;
+      continue;
+    }
+    size_t adv;
+    (void)scr_utf8_decode(s->data + b, &adv);
+    out->data[k++] = (uint64_t)(uintptr_t)scr_str_char_of(s->data + b, adv);
+    b += adv;
+  }
+  out->len = (uint32_t)count;
+  out->filled = (uint32_t)count;
+  return out;
 }
 
 /* ── the URI component codecs (encodeURIComponent/decodeURIComponent) ──

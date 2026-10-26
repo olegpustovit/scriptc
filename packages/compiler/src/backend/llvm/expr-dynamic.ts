@@ -11,7 +11,7 @@ import { bindLiveArrayOps } from "./expr-stream-bridges.js";
 /* Focused LLVM expression emission extracted from emitter.ts. */
 import { InternalCompilerError } from "../../errors.js";
 import { emitNullableIsTag, emitNullablePresent } from "./union-repr.js";
-import { isObjectArm } from "./nullable-unions.js";
+import { isPointerIdentityArm } from "./nullable-unions.js";
 import { streamTypedRefEligible } from "../../ir/analysis.js";
 import {
   DYN,
@@ -908,13 +908,13 @@ export function emitDynamicExpr(
       if (!def)
         throw new InternalCompilerError(`llvm emitter bug: equality of unknown union ${e.unionId}`);
       const nullable = host.nullableUnions.get(def.id);
-      if (nullable && isObjectArm(nullable)) {
+      if (nullable && isPointerIdentityArm(nullable)) {
         // Object identity, and NULL === NULL for the unit arm: one compare.
         const eq = B.tmp();
         B.line(`${eq} = icmp ${e.negated ? "ne" : "eq"} ptr ${l.name}, ${r.name}`);
         return { name: eq, type: e.type };
       }
-      if (nullable) {
+      if (nullable && nullable.repr === "single" && nullable.arm.kind === "string") {
         // String arm: identical pointers are equal (the same string or the
         // same unit encoding); otherwise equal only when both hold strings
         // with the same bytes.

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../cli/command.js";
@@ -19,6 +19,9 @@ import { NativeCompiler } from "./compiler.js";
 import { NATIVE_STRING_BYTES, openNativeCache } from "./cache.js";
 import {
   checkerExecutableIdentity,
+  checkerPackageVersion,
+  distributionPrebuiltLibDiagnostics,
+  recordPrebuiltLibDiagnostics,
   setLibDiagnosticsStore,
 } from "../frontend/ts7/lib-diagnostics.js";
 import { setCheckerFeatureStore } from "../frontend/ts7/checker-features.js";
@@ -67,7 +70,23 @@ async function main(): Promise<number> {
           write: (key, text) => store.write("lib-diagnostics", key, text),
         },
         checkerExecutableIdentity(toolchain.ts7Executable),
+        toolchain.prebuiltLibDiagnostics === undefined
+          ? null
+          : () =>
+              distributionPrebuiltLibDiagnostics(
+                toolchain.prebuiltLibDiagnostics!,
+                toolchain.ts7Executable,
+              ),
       );
+      // A distribution build records its prebuilt lib diagnostics (build-native-cli.mts).
+      const recordPath = process.env["SCRIPTC_LIB_DIAGNOSTICS_RECORD"];
+      const checkerVersion =
+        recordPath === undefined ? null : checkerPackageVersion(toolchain.ts7Executable);
+      if (recordPath !== undefined && checkerVersion !== null)
+        recordPrebuiltLibDiagnostics({
+          checker: checkerVersion,
+          record: (key) => appendFileSync(recordPath, `${key}\n`),
+        });
       setCheckerFeatureStore({
         read: (key) =>
           store.read("checker-features", key, NATIVE_STRING_BYTES)?.toString("utf8") ?? null,

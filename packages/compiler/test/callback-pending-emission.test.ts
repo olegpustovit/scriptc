@@ -40,9 +40,11 @@ try {
     const module = deserializeModule(readFileSync(output, "utf8"));
     expect(validateModule(module)).toEqual([]);
     const llvm = emitLlvmModule(module, {});
+    // The fallback calls the closure's entry, after giving it an undefined
+    // receiver when it reads one, so its edge comes from receiver.done then.
     const guards = [
       ...llvm.matchAll(
-        /(%t\d+) = phi i1 \[ false, %callback\.direct\d+ \], \[ true, %callback\.indirect\d+ \]/g,
+        /(%t\d+) = phi i1 \[ false, %callback\.direct\d+ \], \[ true, %(?:callback\.indirect|receiver\.done)\d+ \]/g,
       ),
     ];
     // The quiet every and map callbacks; not the throwing one.

@@ -167,6 +167,23 @@ function declareFunctionArguments(
   }
 }
 
+/** The type parameters a lambda without its own takes from a generic
+ * contextual signature, unbound in the current scope. */
+function contextualTypeParameterSymbols(
+  lowerer: Lowerer,
+  node: ts.ArrowFunction | ts.FunctionExpression,
+): ts.Symbol[] {
+  const signatures = lowerer.checker.getCallSignatures(lowerer.typeOf(node));
+  if (signatures.length !== 1) return [];
+  const symbols: ts.Symbol[] = [];
+  for (const parameter of signatures[0]!.getTypeParameters()) {
+    const symbol = parameter.getSymbol();
+    if (!symbol || lowerer.typeParamBindings?.has(symbol)) return [];
+    symbols.push(symbol);
+  }
+  return symbols;
+}
+
 /** Lifts an arrow function / function expression / nested declaration /
  * object-literal shorthand method to a module-level function and yields
  * the `closure` expression creating it. */
@@ -200,6 +217,31 @@ export function lowerLambda(
       lowerer.erasingDepth--;
       lowerer.erasingLambdas.delete(node);
       lowerer.typeParamBindings = previous;
+    }
+  }
+  // A lambda contextually typed by a GENERIC signature (`send: (m) => …`
+  // for `send<T>(m: Msg<T>): string`) takes that signature's type
+  // parameters as its own; it lowers once, erased, like a generic lambda.
+  if (
+    (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) &&
+    !node.typeParameters?.nodes.length &&
+    !lowerer.erasingLambdas.has(node)
+  ) {
+    const contextual = contextualTypeParameterSymbols(lowerer, node);
+    if (contextual.length > 0) {
+      const previous = lowerer.typeParamBindings;
+      const bindings = new Map(previous ?? []);
+      for (const symbol of contextual) bindings.set(symbol, DYN);
+      lowerer.typeParamBindings = bindings;
+      lowerer.erasingLambdas.add(node);
+      lowerer.erasingDepth++;
+      try {
+        return lowerLambda(lowerer, node, checkedReceiver);
+      } finally {
+        lowerer.erasingDepth--;
+        lowerer.erasingLambdas.delete(node);
+        lowerer.typeParamBindings = previous;
+      }
     }
   }
   const prepared =

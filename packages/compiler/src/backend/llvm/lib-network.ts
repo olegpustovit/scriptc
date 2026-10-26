@@ -165,7 +165,7 @@ export function emitNetworkHttpLibCall(host: LlvmEmitterContext, e: LibCallExpr)
         const funcTag = def ? def.arms.findIndex((a) => a.kind === "func") : -1;
         if (funcTag < 0)
           throw new InternalCompilerError(`llvm emitter bug: ${e.fn} union lacks its func arm`);
-        cb = host.unwrapNullableClosure(args[cbIndex]!.name, funcTag);
+        cb = host.unwrapNullableClosure(args[cbIndex]!.name, cbT.unionId, funcTag);
       }
     }
     const valueCount = reusePort ? 5 : 4;

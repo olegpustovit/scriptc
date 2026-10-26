@@ -216,8 +216,9 @@ export interface RegionHooks {
   classDefinitions(cls: IrClassDef, sizeOf: string): string[];
 }
 
-/** Every emitted function/helper carries #0 = { sanitize_address } — see
- * the emitter header. */
+/** Every emitted function/helper carries attribute group #0: the build's
+ * target CPU level, and `sanitize_address` in sanitized builds (see
+ * emit-module.ts functionAttributes). */
 export const FN_ATTRS = "#0";
 
 export { computeTraced } from "../cycle-analysis.js";

@@ -671,11 +671,13 @@ export function emitGenericLibCall(host: LlvmEmitterContext, e: LibCallExpr): Ll
         // which also takes those streams.
         e.fn === "stream.unboxDyn" && host.usesDynBuiltinStream
         ? "scr_dyn_builtin_stream_unbox"
-        : // for await over a checked-dynamic value iterates a native
-          // stream behind it (scr_dyn_for_await_stream.c)
-          e.fn === "dyn.asyncIteratorOpen" && host.dynForAwaitStreams
-          ? "scr_stream_dyn_async_iterator_open"
-          : LIB_FN_SYMS[e.fn]);
+        : e.fn === "stream.unboxDynStage" && host.usesDynBuiltinStream
+          ? "scr_dyn_builtin_stream_unbox_stage"
+          : // for await over a checked-dynamic value iterates a native
+            // stream behind it (scr_dyn_for_await_stream.c)
+            e.fn === "dyn.asyncIteratorOpen" && host.dynForAwaitStreams
+            ? "scr_stream_dyn_async_iterator_open"
+            : LIB_FN_SYMS[e.fn]);
   if (sym === undefined) throw new LlvmUnsupportedError(`libCall:${e.fn}`, e.loc);
   // The runtime's Date functions take and answer time values: a Date
   // operand passes its time value, read at once from the borrowed object,
@@ -1143,12 +1145,15 @@ export function emitLibCall(host: LlvmEmitterContext, e: LibCallExpr): LlValue {
     case "blob":
     case "wasm":
     case "array":
+      if (e.fn === "array.foreignThrow") return emitArrayForeignThrow(host, e);
+      return host.emitGenericLibCall(e);
     case "collection":
     case "record":
     case "disposable":
     case "punycode":
     case "constants":
     case "promise":
+    case "mime":
       return host.emitGenericLibCall(e);
     case "test":
       return emitTestLibCall(host, e);
@@ -1164,13 +1169,36 @@ export function emitLibCall(host: LlvmEmitterContext, e: LibCallExpr): LlValue {
   }
 }
 
+/** `array.foreignThrow`: the checked conversion's TypeError for a foreign
+ * element read into a typed result. Always throws; the result is a dummy
+ * of the replaced read's type (the error.argTypeThrow pattern). */
+function emitArrayForeignThrow(host: LlvmEmitterContext, e: LibCallExpr): LlValue {
+  const B = host.B;
+  const arr = host.emitExpr(e.args[0]!);
+  const index = host.emitExpr(e.args[1]!);
+  const want = host.emitExpr(e.args[2]!);
+  host.declare(`declare void @scr_arr_foreign_throw(ptr, double, ptr)`);
+  B.line(
+    `call void @scr_arr_foreign_throw(ptr ${arr.name}, double ${index.name}, ptr ${want.name})`,
+  );
+  const ty = host.llType(e.type);
+  if (ty === "void") {
+    host.emitAlwaysPendingUnwind();
+    return { name: "", type: e.type };
+  }
+  const dummy = ty === "double" ? "0.0" : ty === "i1" ? "false" : "null";
+  const out = host.own({ name: dummy, type: e.type });
+  host.emitAlwaysPendingUnwind();
+  return out;
+}
+
 /** The settlement adapter of Promise.all's tuple form for the builder
  * `fnName`, which fulfills the result with the builder's tuple. */
 function allTupleAdapterFor(host: LlvmEmitterContext, fnName: string, tuple: IrType): string {
   const key = `allTuple:${fnName}`;
   let adapter = host.resolveThunks.get(key);
   if (adapter !== undefined) return adapter;
-  adapter = `sc_all_tuple_${host.resolveThunks.size}`;
+  adapter = host.contentSymbol("sc_all_tuple_", key);
   host.resolveThunks.set(key, adapter);
   host.journal?.allocated(adapter, "allTupleAdapterFor", [fnName, tuple]);
   const rc = vAdapters(host.shapeHost, tuple);

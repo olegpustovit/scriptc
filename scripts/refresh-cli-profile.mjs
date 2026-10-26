@@ -7,8 +7,9 @@
  * Builds an instrumented native compiler for this Linux host, runs it on the
  * training builds below, and merges the raw profiles it writes into one
  * sparse indexed profile. The training builds are tsc-ts (a cold `speed`
- * build, then a rebuild after an edit), every seventh corpus program at the
- * default optimization and a further slice in `dev`, and the runtime
+ * build, then a rebuild after an edit), every seventh top-level corpus
+ * program (by number, or by a hash of the name of a program without one) at
+ * the default optimization and a further slice in `dev`, and the runtime
  * benchmark workloads. Run it on a quiet Linux x64 host after changes that
  * move much compiler code; a stale profile only loses part of its gain. A
  * refresh takes about 11 minutes on 16 cores.
@@ -126,16 +127,30 @@ async function pool(tasks) {
   return passed;
 }
 
-const programNumber = (name) => Number.parseInt(name, 10);
+/** A top-level corpus program's sampling key: its number, or, for a program
+ * named without one, a stable hash of its name (FNV-1a). */
+const programKey = (name) =>
+  /^\d+-/.test(name)
+    ? Number.parseInt(name, 10)
+    : [...name].reduce((h, c) => Math.imul(h ^ c.charCodeAt(0), 16777619) >>> 0, 2166136261);
+/** Numbered programs by number, then the named ones by name. */
+const programOrder = (a, b) =>
+  /^\d+-/.test(a) !== /^\d+-/.test(b)
+    ? /^\d+-/.test(a)
+      ? -1
+      : 1
+    : programKey(a) - programKey(b) || (a < b ? -1 : a > b ? 1 : 0);
 const corpus = readdirSync(join(root, "tests/corpus"))
-  .filter((name) => /^\d+-.*\.ts$/.test(name))
-  .sort((a, b) => programNumber(a) - programNumber(b));
+  .filter(
+    (name) => /^[\w-]+\.ts$/.test(name) && statSync(join(root, "tests/corpus", name)).isFile(),
+  )
+  .sort(programOrder);
 const training = [
   ...corpus
-    .filter((name) => programNumber(name) % 7 === 0)
+    .filter((name) => programKey(name) % 7 === 0)
     .map((name) => ({ file: join(root, "tests/corpus", name), optimization: "release" })),
   ...corpus
-    .filter((name) => programNumber(name) % 14 === 7)
+    .filter((name) => programKey(name) % 14 === 7)
     .map((name) => ({ file: join(root, "tests/corpus", name), optimization: "dev" })),
   ...readdirSync(join(root, "benchmarks/runtime/workloads"))
     .filter((name) => name.endsWith(".ts"))

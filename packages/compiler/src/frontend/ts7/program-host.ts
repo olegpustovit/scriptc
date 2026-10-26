@@ -46,8 +46,9 @@ import {
   trackedRealpath,
 } from "../input-tracker.js";
 import { packageShimDeclarationText } from "../package-shims.js";
+import { typePatchedText, typePatchFileExists } from "../type-patches/layer.js";
 import { ambientDtsPath, fallbackDtsPath, overridesDtsPath } from "../dts-paths.js";
-import { reusedLibDiagnostics } from "./lib-diagnostics.js";
+import { inFileOrder, reusedKeptLibDiagnostics, reusedLibDiagnostics } from "./lib-diagnostics.js";
 import { ts7Diagnostic } from "./diagnostic.js";
 import type { Ts7DiagnosticData } from "./session-schema.generated.js";
 
@@ -160,7 +161,7 @@ export class Ts7Host {
     const virtualFiles = this.virtualFiles;
     const shadow = options?.fsShadow ?? null;
     // A virtual file, a shadow's replacement, a package shim's declaration
-    // entry or the file on disk; null when shadowed out of existence or
+    // entry, a type-patched package file or the file on disk; null when shadowed out of existence or
     // missing.
     this.readSource = (fileName) => {
       const virtual = virtualFiles.get(tsgoPath(fileName));
@@ -175,6 +176,9 @@ export class Ts7Host {
       // program the host creates.
       const shim = packageShimDeclarationText(fileName);
       if (shim !== undefined) return shim;
+      // A package file a project type patch edits (type-patches/layer.ts).
+      const patched = typePatchedText(fileName);
+      if (patched !== undefined) return stripSourceBom(patched);
       const source = trackedReadFile(fileName);
       return source === null ? null : stripSourceBom(source);
     };
@@ -186,7 +190,7 @@ export class Ts7Host {
         fileExists: (fileName) => {
           if (virtualFiles.has(tsgoPath(fileName))) return true;
           if (shadow !== null && shadow.hideFile(fileName)) return false;
-          return trackedFileExists(fileName);
+          return trackedFileExists(fileName) || typePatchFileExists(fileName);
         },
         directoryExists: (path) => trackedDirectoryExists(path),
         realpath: (path) =>
@@ -419,17 +423,31 @@ export class Ts7Program {
   /** The semantic and global diagnostics with the stored diagnostics of the
    * declaration files scriptc supplies (lib-diagnostics.ts), or null. */
   reusedLibDiagnostics(): { semantic: Ts7DiagnosticData[]; global: Ts7DiagnosticData[] } | null {
+    return this.libDiagnostics(null);
+  }
+
+  /** reusedLibDiagnostics for the `kept` files only: null without a stored
+   * answer. */
+  reusedKeptLibDiagnostics(
+    kept: ReadonlySet<string>,
+  ): { semantic: Ts7DiagnosticData[]; global: Ts7DiagnosticData[] } | null {
+    return this.libDiagnostics(kept);
+  }
+
+  private libDiagnostics(
+    kept: ReadonlySet<string> | null,
+  ): { semantic: Ts7DiagnosticData[]; global: Ts7DiagnosticData[] } | null {
     this.snapshot.ensureActive();
     const program = this.project.program;
     const declarations = new Set([ambientDtsPath(), overridesDtsPath(), fallbackDtsPath()]);
-    return reusedLibDiagnostics(
-      program,
-      this.getSourceFileNames(),
-      (name) =>
-        declarations.has(tsgoPath(name)) ||
-        program.getSourceFileMetadataByPath(name)?.isDefaultLibrary === true,
-      (name) => this.getSourceFile(name),
-    );
+    const names = this.getSourceFileNames();
+    const supplied = (name: string): boolean =>
+      declarations.has(tsgoPath(name)) ||
+      program.getSourceFileMetadataByPath(name)?.isDefaultLibrary === true;
+    const sourceFile = (name: string): SourceFile | undefined => this.getSourceFile(name);
+    return kept === null
+      ? reusedLibDiagnostics(program, names, supplied, sourceFile)
+      : reusedKeptLibDiagnostics(program, names, supplied, sourceFile, kept);
   }
 
   isSourceFileDefaultLibrary(file: SourceFile): boolean {
@@ -460,10 +478,35 @@ export class Ts7Program {
 
 /** 5.9.3's getPreEmitDiagnostics, composed from 7.0.2's split surface (the
  * package dropped the aggregate). Order mirrors 5.9.3: config, options/
- * program, global, syntactic, semantic. */
-export function getPreEmitDiagnostics(program: Ts7Program): readonly Diagnostic[] {
+ * program, global, syntactic, semantic.
+ *
+ * With `keep`, a caller that discards every diagnostic of the other files
+ * asks for semantic diagnostics of the kept files only: the server checks
+ * only those (getDiagnosticsOfCheckedFiles), or only those not answered by
+ * stored diagnostics of the supplied declaration files, and their
+ * diagnostics come in the full check's order. A global diagnostic can come
+ * from checking any file, so when that partial check reports one, the full
+ * check answers. */
+export function getPreEmitDiagnostics(
+  program: Ts7Program,
+  keep?: (fileName: string) => boolean,
+): readonly Diagnostic[] {
   const config = program.getConfigFileParsingDiagnostics();
   const options = program.getProgramDiagnostics();
+  if (keep !== undefined) {
+    const kept = program.getSourceFileNames().filter((name) => keep(name));
+    if (kept.length < program.getSourceFileNames().length) {
+      const partial =
+        program.reusedKeptLibDiagnostics(new Set(kept)) ?? keptFileDiagnostics(program, kept);
+      if (partial !== null && partial.global.length === 0)
+        return [
+          ...config,
+          ...options,
+          ...program.getSyntacticDiagnostics(),
+          ...partial.semantic.map(ts7Diagnostic),
+        ];
+    }
+  }
   const reused = program.reusedLibDiagnostics();
   if (reused !== null)
     return [
@@ -480,6 +523,19 @@ export function getPreEmitDiagnostics(program: Ts7Program): readonly Diagnostic[
     ...program.getSyntacticDiagnostics(),
     ...program.getSemanticDiagnostics(),
   ];
+}
+
+/** The semantic diagnostics of the kept files, in the full check's order,
+ * and the global diagnostics of checking them; null when the server cannot
+ * check only some files. */
+function keptFileDiagnostics(
+  program: Ts7Program,
+  kept: readonly string[],
+): { semantic: Ts7DiagnosticData[]; global: Ts7DiagnosticData[] } | null {
+  const checked = program.project.program.checkedFileDiagnosticData(kept);
+  if (checked === null) return null;
+  const byFile = new Map(kept.map((name, index) => [name, checked.files[index] ?? []]));
+  return { semantic: inFileOrder(byFile), global: checked.global };
 }
 
 /** ts.findConfigFile: nearest configName walking up from searchPath. */

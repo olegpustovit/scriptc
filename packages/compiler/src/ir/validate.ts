@@ -4313,7 +4313,9 @@ function validateFunction(
     if (
       e.fn === "array.namedKeys" ||
       e.fn === "array.hasNamedKey" ||
-      e.fn === "array.hasProperties"
+      e.fn === "array.hasProperties" ||
+      e.fn === "array.foreign" ||
+      e.fn === "array.foreignThrow"
     ) {
       if (e.args[0]?.type.kind !== "array") {
         err(`libCall ${e.fn} arg 0: expected an array, got ${e.args[0]?.type.kind}`, e.loc);
@@ -5759,7 +5761,7 @@ function validateFunction(
         }
         const lastIsFunction = Math.floor(positions! / 2 ** (total - 1)) % 2 === 1;
         const helperCount = 3 * pipelinePumpedRuns(total, positions!, flags!);
-        const groups = helperCount + (destKind === 2 ? 1 : 0) + (flags! & 32 ? 2 : 0);
+        const groups = helperCount + (destKind >= 2 ? 1 : 0) + (flags! & 32 ? 2 : 0);
         const cbArgs =
           e.fn === "sp.pipelineStagesOpts"
             ? 1 + (flags! & 64 ? 1 : 0)
@@ -5774,7 +5776,7 @@ function validateFunction(
           total > 52 ||
           positions! >= 2 ** total ||
           functions !== k ||
-          destKind === 3 ||
+          (destKind === 3 && e.fn === "stream.composeStages") ||
           (destKind !== 0) !== lastIsFunction ||
           total < 2 ||
           e.args.length !== 5 + n! + k! + groups + cbArgs
@@ -5793,7 +5795,7 @@ function validateFunction(
             err(`libCall ${e.fn} stage function ${i} must be a func`, e.loc);
         }
         at2 += k!;
-        const helpers = helperCount + (destKind === 2 ? 1 : 0);
+        const helpers = helperCount + (destKind >= 2 ? 1 : 0);
         for (let i = at2; i < at2 + helpers; i++) {
           if (e.args[i]?.type.kind !== "func")
             err(`libCall ${e.fn} helper ${i} must be a func`, e.loc);

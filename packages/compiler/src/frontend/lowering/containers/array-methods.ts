@@ -1886,17 +1886,27 @@ function arraySearchHelper(
     },
     loc,
   };
-  const visitPresent: IrStmt[] = [
-    { kind: "varDecl", localId: "value.0", init: value, loc },
-    {
-      kind: "if",
-      cond: match,
-      then: [{ kind: "return", value: method === "includes" ? boolLit(true, loc) : indexRef, loc }],
-      else_: null,
-      loc,
-    },
-    advance,
-  ];
+  const found: IrStmt = {
+    kind: "if",
+    cond: directNeedle ? equal : match,
+    then: [{ kind: "return", value: method === "includes" ? boolLit(true, loc) : indexRef, loc }],
+    else_: null,
+    loc,
+  };
+  // A direct needle reads only value slots: an undefined or foreign
+  // element written through a dynamic view has no element-typed payload.
+  const visitPresent: IrStmt[] = directNeedle
+    ? [
+        {
+          kind: "if",
+          cond: { kind: "bin", op: "===", left: stateRef, right: numLit(1, loc), type: BOOL, loc },
+          then: [{ kind: "varDecl", localId: "value.0", init: value, loc }, found],
+          else_: null,
+          loc,
+        },
+        advance,
+      ]
+    : [{ kind: "varDecl", localId: "value.0", init: value, loc }, found, advance];
   const skipHole: IrStmt[] =
     method === "lastIndexOf"
       ? [advance]

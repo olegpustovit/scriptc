@@ -519,6 +519,41 @@ export function planDeclProjection(input: DeclProjectionInput): DeclProjection |
       return undefined;
     }
   };
+  const stringIndex = (checker: ts.TypeChecker, type: ts.Type): boolean => {
+    try {
+      return checker
+        .getIndexInfosOfType(type)
+        .some((info) => (info.keyType.flags & ts.TypeFlags.String) !== 0);
+    } catch {
+      return false;
+    }
+  };
+  /** Whether the JavaScript world types a package value as an object
+   * literal that lacks a member its declaration promises: a property (an
+   * expando `out.max = ...` on a non-empty literal, which the JavaScript
+   * checker does not add to the literal's type) or a string index
+   * signature (`Record<string, string>` over a literal). Lowering the value
+   * at the narrower literal type would drop the member or fix the key set,
+   * so it crosses at its declared type instead. */
+  const missesDeclaredMembers = (jsType: ts.Type, declType: ts.Type): boolean => {
+    if (!(jsType.flags & ts.TypeFlags.Object) || !(declType.flags & ts.TypeFlags.Object))
+      return false;
+    const literal = jsType.getSymbol();
+    if (literal === undefined || (literal.flags & ts.SymbolFlags.ObjectLiteral) === 0) return false;
+    try {
+      if (declChecker.isArrayType(declType) || declChecker.isTupleType(declType)) return false;
+      if (stringIndex(declChecker, declType) && !stringIndex(jsChecker, jsType)) return true;
+      return declChecker
+        .getPropertiesOfType(declType)
+        .some(
+          (prop) =>
+            !String(prop.escapedName).startsWith("__@") &&
+            jsChecker.getPropertyOfType(jsType, String(prop.escapedName)) === undefined,
+        );
+    } catch {
+      return false;
+    }
+  };
   const namesPackageSymbol = (node: ts.Node): boolean => {
     let found = false;
     const visit = (n: ts.Node): void => {
@@ -540,7 +575,7 @@ export function planDeclProjection(input: DeclProjectionInput): DeclProjection |
     const fileEdits: Edit[] = [];
     /** Candidate expressions (by js node) with their declared type, named
      * only for the casts that survive suppression. */
-    const exprCandidates = new Map<ts.Node, ts.Type>();
+    const exprCandidates = new Map<ts.Node, ts.Type | "any">();
     const exprOrder: ts.Node[] = [];
     /** Reads whose projectable receiver the JavaScript world types `any`:
      * kept only when nothing types the receiver. */
@@ -610,7 +645,14 @@ export function planDeclProjection(input: DeclProjectionInput): DeclProjection |
           return;
       }
       const jsType = typeAt(jsChecker, jsNode);
-      if (!isAnyish(jsType)) return;
+      if (jsType === null) return;
+      // A typed JavaScript value crosses only where its object type lacks a
+      // member the declaration promises (missesDeclaredMembers).
+      const typedJs = !isAnyish(jsType);
+      if (typedJs) {
+        const declType = typeAt(declChecker, declNode);
+        if (declType === null || !missesDeclaredMembers(jsType, declType)) return;
+      }
       // Package-produced?
       const d = declNode as ts.Expression;
       let produced = false;
@@ -686,7 +728,18 @@ export function planDeclProjection(input: DeclProjectionInput): DeclProjection |
         // no contextual type
       }
       const declType = typeAt(declChecker, d);
-      if (declType === null || !printer.projectable(declType)) return;
+      if (declType === null) return;
+      if (!printer.projectable(declType)) {
+        // An index signature over values that do not project (package
+        // interfaces): the literal's fixed key set would still answer for
+        // keys it lacks, so the value stays untyped and every read is the
+        // JavaScript read.
+        if (typedJs && stringIndex(declChecker, declType)) {
+          exprCandidates.set(jsNode, "any");
+          exprOrder.push(jsNode);
+        }
+        return;
+      }
       exprCandidates.set(jsNode, declType);
       exprOrder.push(jsNode);
     };
@@ -890,7 +943,8 @@ export function planDeclProjection(input: DeclProjectionInput): DeclProjection |
         )
           continue;
       }
-      const alias = printer.project(exprCandidates.get(e)!);
+      const candidate = exprCandidates.get(e)!;
+      const alias = candidate === "any" ? "any" : printer.project(candidate);
       if (alias === null) continue;
       const start = ts.tokenStartOfNode(e);
       const stmt = e.parent;

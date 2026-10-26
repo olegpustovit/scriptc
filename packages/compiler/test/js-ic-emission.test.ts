@@ -201,7 +201,7 @@ console.log(lib.total([1, 2, 3]));
     expect(fn).toContain("@scr_js_keyed_probe(");
     // The length read answers from the native array's length.
     expect(fn).toContain("icg.rest");
-    expect(fn).toContain("@scr_js_get_probe(");
+    expect(fn).toContain("@scr_js_get_probe_native(");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

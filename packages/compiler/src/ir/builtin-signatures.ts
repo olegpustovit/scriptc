@@ -385,6 +385,18 @@ function buildLibFnSignatures() {
     "module.parent": { argTypes: [F64], result: F64 },
     "module.loaded": { argTypes: [F64], result: BOOL },
     "module.cacheGet": { argTypes: [STRING], result: F64 },
+    /** createRequire's require(id) and require.resolve(request, options)
+     * with a specifier computed at run time (scr_require.c): the arguments,
+     * then the requiring file, the call's "file:line" and the builtin ids.
+     * Both resolve like Node at run time. requireComputed always throws
+     * (Node's argument errors or MODULE_NOT_FOUND), or ends the program with
+     * an SC2020 refusal when the specifier resolves; resolveComputed answers
+     * the resolved id or real path. */
+    "module.requireComputed": { argTypes: [DYN, STRING, STRING, arrayOf(STRING)], result: DYN },
+    "module.resolveComputed": {
+      argTypes: [DYN, DYN, STRING, STRING, arrayOf(STRING)],
+      result: STRING,
+    },
     "module.cacheHas": { argTypes: [STRING], result: BOOL },
     "module.cacheKeys": { argTypes: [], result: arrayOf(STRING) },
     "timers.setTimeout": { argTypes: [{ kind: "func", params: [], ret: VOID }, F64], result: VOID },
@@ -848,6 +860,7 @@ function buildLibFnSignatures() {
     // (subject, characters, NUL-separated replacement texts): the fused
     // chain of global one-character replacements.
     "str.replaceChars": { argTypes: [STRING, STRING, STRING], result: STRING },
+    "str.codePoints": { argTypes: [STRING], result: arrayOf(STRING) },
     /* ToNumber(string) — ECMA-262 7.1.4.1 StringToNumber (scr_string.c):
      * trim the JS StrWhiteSpace set, empty/whitespace-only → +0, then the
      * whole span must be one StrNumericLiteral — signed decimal (Infinity
@@ -1155,6 +1168,17 @@ function buildLibFnSignatures() {
     "util.inherits": { argTypes: [DYN, DYN], result: VOID },
     "util.inheritsPrototype": { argTypes: [DYN, DYN, DYN], result: VOID },
     "util.deprecate": { argTypes: [DYN, DYN, DYN, DYN], result: DYN },
+    "util.isArrayDeprecated": { argTypes: [DYN], result: BOOL },
+    "util.extend": { argTypes: [DYN, DYN], result: DYN },
+    "util.signalExitCode": { argTypes: [DYN], result: F64 },
+    "util.aborted": { argTypes: [DYN, DYN], result: DYN },
+    "util.diff": { argTypes: [DYN, DYN], result: DYN },
+    "util.debounce": { argTypes: [DYN, DYN, DYN], result: DYN },
+    "util.throttle": { argTypes: [DYN, DYN, DYN, DYN], result: DYN },
+    "mime.typeNew": { argTypes: [DYN, DYN], result: DYN },
+    "mime.typeParse": { argTypes: [DYN], result: DYN },
+    "mime.paramsNew": { argTypes: [], result: DYN },
+    "mime.is": { argTypes: [DYN, F64], result: BOOL },
     "util.callbackify": { argTypes: [DYN], result: DYN },
     /** util.promisify over an untyped function value: a native dyn function
      * whose calls answer a dyn promise the appended callback settles. */
@@ -2858,9 +2882,27 @@ function buildLibFnSignatures() {
       result: { kind: "object", className: "%Duplex" },
     },
     /** Whether pipeline() pumps a checked-dynamic first stage as an
-     * iterable (a string, or a value with an iterator method that is not a
-     * stream with pipe() and on()) instead of piping it as a stream. */
+     * iterable (a string, a value with an iterator method that is not a
+     * stream with pipe() and on(), a { readable, writable } pair, or a
+     * source function's result) instead of piping it as a stream. */
     "stream.dynIterableSource": { argTypes: [DYN], result: BOOL },
+    /** The value pipeline() pumps for a checked-dynamic first stage: a
+     * source function's result (the flag set), which must be iterable, else
+     * a { readable, writable } pair's readable side or the value itself. */
+    "stream.dynSourceValue": { argTypes: [DYN, BOOL], result: DYN },
+    /** An untyped pipeline function stage's result before the last stage,
+     * which must be async iterable: ERR_INVALID_RETURN_VALUE naming the
+     * stage ("transform[i]") otherwise. Answers the value (+1). */
+    "stream.dynTransformResult": { argTypes: [DYN, STRING], result: DYN },
+    /** A checked-dynamic pipeline() stage taken as a stream: a native stream
+     * (+1), or Duplex.from of a value that is not stream-like or a function
+     * (an iterable), which the pipeline uses without piping into it. Other
+     * values throw: Duplex.from's ERR_INVALID_ARG_TYPE, or the given
+     * not-supported message. */
+    "stream.unboxDynStage": {
+      argTypes: [DYN, STRING],
+      result: { kind: "object", className: "%Duplex" },
+    },
     /** The Transform a Cipheriv or Decipheriv reads and writes as a stream
      * (+1, created on first use and owned by the cipher). */
     "stream.handleStream": {
@@ -3989,6 +4031,15 @@ function buildLibFnSignatures() {
     // The string keys `for...in` visits on an array (args[0], any element
     // type) after its indices. Borrowed; never throws.
     "array.namedKeys": { argTypes: [null], result: arrayOf(STRING) },
+    // The value of the foreign element (SCR_ARR_FOREIGN) at args[1] of an
+    // array (args[0], any element type); callers test the element state
+    // first. Borrowed; never throws.
+    "array.foreign": { argTypes: [null, F64], result: DYN },
+    /** The checked conversion's TypeError for the foreign element at args[1]
+     * of an array (args[0]) read where a value described by args[2] is
+     * expected. ALWAYS THROWS; polymorphic result (the error.nodeThrow
+     * pattern). May-throw seed. */
+    "array.foreignThrow": { argTypes: [null, F64, STRING], result: VOID },
     // Whether the array (args[0]) still has the key (args[1]) from its
     // namedKeys list. Borrowed; never throws.
     "array.hasNamedKey": { argTypes: [null, STRING], result: BOOL },
@@ -4590,12 +4641,54 @@ function buildLibFnSignatures() {
     "insp.errorCause": { argTypes: [null, F64, F64], result: STRING },
     "insp.dyn": { argTypes: [DYN, F64, F64], result: STRING },
     "insp.dynS": { argTypes: [DYN, F64], result: STRING },
+    /** util.format over a dyn array of its arguments, and
+     * util.formatWithOptions(options, pack): the runtime formatter for format
+     * strings known at run time and spread arguments. */
+    "insp.format": { argTypes: [DYN], result: STRING },
+    /** insp.format over arguments that are all strings, numbers, booleans,
+     * null or undefined, without the checked-dynamic walk. */
+    "insp.formatPrimitives": { argTypes: [arrayOf(DYN)], result: STRING },
+    "insp.formatList": { argTypes: [arrayOf(DYN)], result: STRING },
+    "insp.formatWithOptions": { argTypes: [DYN, DYN], result: STRING },
+    /** util.inspect(value, options, depth, colors) with the call's argument
+     * count: the runtime reads the options and renders the checked-dynamic
+     * view. */
+    "insp.inspect": { argTypes: [DYN, DYN, DYN, DYN, F64], result: STRING },
+    /** A [util.inspect.custom] method's call: whether ctx.customInspect is
+     * set, its depth argument (the remaining depth at recursion r of depth
+     * d), its options object and util.inspect, then its result rendered: a
+     * string re-indented at the current level, or a checked-dynamic value
+     * (customIsSelf tests for the instance itself). customInspect sets the
+     * flag for the renders that follow and answers the previous value, and
+     * depthKind does the same for how an unbounded depth was given (0
+     * Infinity, 1 null, 2 undefined). */
+    "insp.customEnabled": { argTypes: [], result: BOOL },
+    /** Registers a class's compiled custom inspect function under its
+     * instances' typed-ref type key, for the checked-dynamic walk. */
+    "insp.registerCustom": { argTypes: [STRING, DYN], result: VOID },
+    "insp.customInspect": { argTypes: [BOOL], result: BOOL },
+    "insp.depthKind": { argTypes: [F64], result: F64 },
+    "insp.customDepth": { argTypes: [F64, F64], result: DYN },
+    "insp.customOptions": { argTypes: [F64], result: DYN },
+    "insp.inspectFunction": { argTypes: [], result: DYN },
+    "insp.customText": { argTypes: [STRING], result: STRING },
+    "insp.customIsSelf": { argTypes: [DYN, DYN], result: BOOL },
+    "insp.customResult": { argTypes: [DYN, F64, F64], result: STRING },
+    /** Around the method's call: the inspect and format calls it makes run
+     * in a fresh inspect context with the default options. begin answers the
+     * token end takes; end also discards what a call that threw left. */
+    "insp.customCallBegin": { argTypes: [], result: F64 },
+    "insp.customCallEnd": { argTypes: [F64], result: VOID },
+    /** Whether a runtime format string has a '%' before its last character. */
+    "insp.formatSpecifies": { argTypes: [STRING], result: BOOL },
+    "insp.formatSpecifiesDyn": { argTypes: [DYN], result: BOOL },
+    "insp.dynFormatS": { argTypes: [DYN, F64], result: STRING },
     /** util.format's %o over a checked-dynamic value: inspect with
      * showHidden. Kinds whose hidden entries have no rendering throw the
      * 'not supported yet' Error. */
     "insp.dynHidden": { argTypes: [DYN, F64], result: STRING },
     "insp.begin": { argTypes: [F64], result: VOID },
-    /** util.inspect's breakLength, compact (0 for false) and sorted for the
+    /** util.inspect's breakLength, compact (-1 for false) and sorted for the
      * renders that follow; the call site restores 80, 3 and false afterwards. */
     "insp.layout": { argTypes: [F64, F64, BOOL], result: VOID },
     "insp.entry": { argTypes: [STRING, BOOL], result: VOID },
@@ -5174,10 +5267,12 @@ export type IrLibFn = keyof ReturnType<typeof buildLibFnSignatures>;
 /** The function-stage runs of a pipeline of `total` stages that a stream
  * follows (positions bit j: stage j is a function), and an async
  * generator destination's run (flags bits 1-2 = 1, pumped into the
- * PassThrough pipeline() answers): each pumps its last generator through
- * one (next, read, return) triple. */
+ * PassThrough pipeline() answers, or 3, an untyped destination whose
+ * result may be pumped there): each pumps its last generator through one
+ * (next, read, return) triple. */
 export function pipelinePumpedRuns(total: number, positions: number, flags: number): number {
-  let runs = ((flags >> 1) & 3) === 1 ? 1 : 0;
+  const dest = (flags >> 1) & 3;
+  let runs = dest === 1 || dest === 3 ? 1 : 0;
   for (let j = 0; j + 1 < total; j++) {
     if (Math.floor(positions / 2 ** j) % 2 === 1 && Math.floor(positions / 2 ** (j + 1)) % 2 === 0)
       runs++;

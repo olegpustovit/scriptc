@@ -1481,6 +1481,7 @@ export function lowerAsExpression(
       target?.kind === "record" &&
       inner.type.shapeId !== target.shapeId
     ) {
+      lowerer.assertedValues.set(inner, target);
       return lowerer.coerceInto(expr, inner, target);
     }
     // `u as Arm` on a UNION value is `u!`'s spelling with a named arm
@@ -1515,6 +1516,15 @@ export function lowerAsExpression(
       const asserted = checkedClassUnionAssertion(lowerer, inner, target, locOf(expr));
       if (asserted) return asserted;
     }
+    // The erased value still answers to the assertion: a slot it cannot
+    // reach by an ordinary conversion converts it as asserted
+    // (assertedConversion).
+    if (
+      target &&
+      (target.kind === "union" || target.kind === "record" || target.kind === "array") &&
+      (inner.type.kind === "union" || inner.type.kind === "array")
+    )
+      lowerer.assertedValues.set(inner, target);
     return inner; // erasure, unchanged
   }
 

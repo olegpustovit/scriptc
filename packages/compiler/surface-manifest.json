@@ -2483,9 +2483,33 @@
       "note": "recognized module (bare and node:-prefixed specifiers)"
     },
     {
+      "id": "node-builtin.util._extend",
+      "kind": "node-builtin",
+      "name": "util._extend",
+      "status": "static"
+    },
+    {
+      "id": "node-builtin.util.aborted",
+      "kind": "node-builtin",
+      "name": "util.aborted",
+      "status": "static"
+    },
+    {
       "id": "node-builtin.util.callbackify",
       "kind": "node-builtin",
       "name": "util.callbackify",
+      "status": "static"
+    },
+    {
+      "id": "node-builtin.util.convertProcessSignalToExitCode",
+      "kind": "node-builtin",
+      "name": "util.convertProcessSignalToExitCode",
+      "status": "static"
+    },
+    {
+      "id": "node-builtin.util.debounce",
+      "kind": "node-builtin",
+      "name": "util.debounce",
       "status": "static"
     },
     {
@@ -2504,6 +2528,12 @@
       "id": "node-builtin.util.deprecate",
       "kind": "node-builtin",
       "name": "util.deprecate",
+      "status": "static"
+    },
+    {
+      "id": "node-builtin.util.diff",
+      "kind": "node-builtin",
+      "name": "util.diff",
       "status": "static"
     },
     {
@@ -2528,6 +2558,12 @@
       "id": "node-builtin.util.inherits",
       "kind": "node-builtin",
       "name": "util.inherits",
+      "status": "static"
+    },
+    {
+      "id": "node-builtin.util.isArray",
+      "kind": "node-builtin",
+      "name": "util.isArray",
       "status": "static"
     },
     {
@@ -2566,6 +2602,12 @@
       "id": "node-builtin.util.styleText",
       "kind": "node-builtin",
       "name": "util.styleText",
+      "status": "static"
+    },
+    {
+      "id": "node-builtin.util.throttle",
+      "kind": "node-builtin",
+      "name": "util.throttle",
       "status": "static"
     },
     {

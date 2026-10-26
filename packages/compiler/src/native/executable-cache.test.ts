@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import { contentDigest, NativeCache } from "./cache.js";
-import { NativeExecutableCache } from "./executable-cache.js";
+import { identity, NativeExecutableCache } from "./executable-cache.js";
 
 vi.mock("node:child_process", async (original) => ({
   ...(await original<typeof import("node:child_process")>()),
@@ -330,4 +330,44 @@ test("a Linux build that keeps its output does not read the deferred inputs", ()
   second.publish(f.output);
   expect(open().restore(f.destination)).toBe(true);
   expect(deferred).toHaveBeenCalledTimes(3);
+});
+
+test("a Linux link that runs as its linker job is traced from the job's run, and otherwise records it", () => {
+  const f = fixture();
+  const lib = join(f.root, "lib");
+  mkdirSync(lib);
+  const crt = join(lib, "Scrt1.o");
+  writeFileSync(crt, "startup object");
+  const program = join(f.stage, "program.o");
+  writeFileSync(program, "program");
+  const job = {
+    run: vi.fn((_args: string[], _list: boolean) => ({
+      output: [crt, program].join("\n") + "\n",
+      driverInputs: [identity(crt), identity(lib)],
+    })),
+    record: vi.fn(),
+  };
+  const open = () => new NativeExecutableCache(f.cache, f.key, "clang", false, [f.runtime], true);
+  const entry = open();
+  expect(entry.trace(["-o", f.output], f.stage, job)).toBe(true);
+  // The job runs the traced link, and the driver does not.
+  expect(job.run.mock.calls[0]).toEqual([["-o", f.output, "-v", "-Wl,-t"], false]);
+  expect(spawnSync).not.toHaveBeenCalled();
+  expect(job.record).not.toHaveBeenCalled();
+  entry.recordOutput(f.output);
+  const recorded = (
+    JSON.parse(f.cache.read("kept", f.key)!.toString()) as { inputs: { path: string }[] }
+  ).inputs.map((saved) => saved.path);
+  expect(recorded).toEqual(expect.arrayContaining([crt, lib]));
+  expect(recorded).not.toContain(program);
+  expect(open().keep(f.output)).toBe(true);
+  // A link without a job runs through the driver, and records the job from
+  // the driver's output.
+  const record = vi.fn();
+  expect(open().trace(["-o", f.output], f.stage, { run: () => null, record })).toBe(true);
+  expect(spawnSync).toHaveBeenCalledTimes(1);
+  expect(record).toHaveBeenCalledWith(["-o", f.output, "-v", "-Wl,-t"], f.library + "\n\n", [
+    identity(f.sdk),
+    identity(f.library),
+  ]);
 });

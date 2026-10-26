@@ -277,6 +277,10 @@ export function emitFieldAbsentTest(B: BlockBuilder, value: string, undefinedTag
   return absent;
 }
 
+/** ScrClosure.function_kind's SCR_FN_RECEIVER_FREE bit (scr_closure.h):
+ * the body never observes the ambient receiver. */
+export const CLOSURE_RECEIVER_FREE = 16;
+
 /** The right-hand side of a JS function-identity comparison: two closures
  * are one function when their identity roots match (a signature adapter
  * stands for the function it adapts). Both operands must be closures. */

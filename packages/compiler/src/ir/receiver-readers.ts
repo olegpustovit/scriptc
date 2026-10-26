@@ -1,6 +1,7 @@
 import { isBorrowSafeMath } from "./analysis.js";
 import type { IrExpr, IrFunction, IrLibFn, IrStmt } from "./ir.js";
 import { eachNodeOfKinds, type IrNodeIndex } from "./node-index.js";
+import { everyExprChild, everyStmtChild } from "./traverse.js";
 
 /** Expression kinds that run no user code of their own and never consult
  * the ambient receiver stack. Calls are admitted here and resolved through
@@ -151,6 +152,7 @@ function opaqueOperand(e: IrExpr): boolean {
  * this set needs no receiver bracket. */
 export class AmbientReceiverReaders {
   private readers: Set<string> | null = null;
+  private byMethod: Map<string, string[]> | null = null;
 
   constructor(
     private readonly functions: ReadonlyMap<string, IrFunction>,
@@ -163,8 +165,63 @@ export class AmbientReceiverReaders {
     return !this.compute().has(fn.name);
   }
 
-  private compute(): Set<string> {
-    if (this.readers) return this.readers;
+  /** A signature adapter body that observes the ambient receiver only by
+   * forwarding it, unchanged, to the original it captures (a callValue on
+   * that capture whose receiver is the plain `this` read). Such an adapter
+   * ignores the receiver exactly when its original does. */
+  forwardsOnly(fn: IrFunction): boolean {
+    if (fn.async || fn.generator) return false;
+    const original = fn.captures?.[0]?.localId;
+    if (original === undefined) return false;
+    const readers = this.compute();
+    const edge = (name: string): boolean => this.functions.has(name) && !readers.has(name);
+    const stmt = (node: IrStmt): boolean =>
+      RECEIVER_FREE_STMTS.has(node.kind) && everyStmtChild(node, expr, stmt);
+    const expr = (node: IrExpr): boolean => {
+      if (node.kind === "callValue" && node.receiver !== undefined) {
+        const receiver = node.receiver;
+        return (
+          receiver.kind === "libCall" &&
+          receiver.fn === "dyn.this" &&
+          receiver.args.length === 0 &&
+          node.callee.kind === "varRef" &&
+          node.callee.localId === original &&
+          node.args.every(expr)
+        );
+      }
+      return this.admits(node, edge) && everyExprChild(node, expr, stmt);
+    };
+    return fn.body.every(stmt);
+  }
+
+  /** Whether one expression node, apart from its children, leaves the
+   * ambient receiver alone; `edge` admits a direct callee. */
+  private admits(expr: IrExpr, edge: (name: string) => boolean): boolean {
+    if (!RECEIVER_FREE_EXPRS.has(expr.kind)) return false;
+    switch (expr.kind) {
+      case "call":
+        return edge(expr.callee);
+      case "new":
+        return edge(`%${expr.className}.constructor`);
+      case "virtualCall": {
+        // Any class's override may run: admit only when every
+        // same-named method is itself receiver-free.
+        const targets = this.methods().get(expr.method) ?? [];
+        return targets.length > 0 && targets.every(edge);
+      }
+      case "libCall":
+        return isBorrowSafeMath(expr.fn) || RECEIVER_FREE_LIB_FNS.has(expr.fn);
+      case "toString":
+        return !opaqueOperand(expr.operand);
+      default: {
+        const operands = dataIntrinsicOperands(expr);
+        return operands === null || !operands.some(opaqueOperand);
+      }
+    }
+  }
+
+  private methods(): Map<string, string[]> {
+    if (this.byMethod) return this.byMethod;
     const byMethod = new Map<string, string[]>();
     for (const name of this.functions.keys()) {
       const dot = name.lastIndexOf(".");
@@ -174,6 +231,12 @@ export class AmbientReceiverReaders {
       list.push(name);
       byMethod.set(method, list);
     }
+    this.byMethod = byMethod;
+    return byMethod;
+  }
+
+  private compute(): Set<string> {
+    if (this.readers) return this.readers;
     const readers = new Set<string>();
     const callers = new Map<string, string[]>();
     const scan = this.nodes?.scanExcept(TRIVIALLY_RECEIVER_FREE);
@@ -185,34 +248,11 @@ export class AmbientReceiverReaders {
         callees.add(name);
         return true;
       };
-      const expr = (expr: IrExpr): boolean => {
-        if (!RECEIVER_FREE_EXPRS.has(expr.kind)) return false;
-        switch (expr.kind) {
-          case "call":
-            return edge(expr.callee);
-          case "new":
-            return edge(`%${expr.className}.constructor`);
-          case "virtualCall": {
-            // Any class's override may run: admit only when every
-            // same-named method is itself receiver-free.
-            const targets = byMethod.get(expr.method) ?? [];
-            return targets.length > 0 && targets.every(edge);
-          }
-          case "libCall":
-            return isBorrowSafeMath(expr.fn) || RECEIVER_FREE_LIB_FNS.has(expr.fn);
-          case "toString":
-            return !opaqueOperand(expr.operand);
-          default: {
-            const operands = dataIntrinsicOperands(expr);
-            return operands === null || !operands.some(opaqueOperand);
-          }
-        }
-      };
       if (!reads)
         eachNodeOfKinds(fn, scan, (node, statement) => {
           const free = statement
             ? RECEIVER_FREE_STMTS.has((node as IrStmt).kind)
-            : expr(node as IrExpr);
+            : this.admits(node as IrExpr, edge);
           if (!free) reads = true;
           return free;
         });

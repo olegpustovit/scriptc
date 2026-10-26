@@ -1081,9 +1081,7 @@ export function lowerArrayFromCall(
   if ((args.length === 1 || args.length === 2) && !ts.isObjectLiteralExpression(args[0]!)) {
     const source = lowerer.lowerExpr(args[0]!);
     let src =
-      source.type.kind === "string" && args.length === 2
-        ? strCharsCall(lowerer, source, loc)
-        : source;
+      source.type.kind === "string" && args.length === 2 ? strCharsCall(source, loc) : source;
     if (src.type.kind === "array") {
       const arrT = src.type;
       if (args.length === 1) {
@@ -1171,7 +1169,7 @@ export function lowerArrayFromCall(
     }
     // String iteration advances by code point; the same helper serves
     // `[...s]` and both Array.from(s) forms.
-    if (src.type.kind === "string" && args.length === 1) return strCharsCall(lowerer, src, loc);
+    if (src.type.kind === "string" && args.length === 1) return strCharsCall(src, loc);
     if (src.type.kind === "dyn" && args.length === 1) {
       return lowerCheckedArrayFrom(lowerer, src, loc);
     }
@@ -1318,112 +1316,9 @@ function buildArrayFromArrayFn(
 }
 
 /** `Array.from(s)` / `[...s]` on a STRING: the code-point split into a
- * fresh string[], through one interned helper per module. */
-export function strCharsCall(lowerer: Lowerer, src: IrExpr, loc: SrcLoc): IrExpr {
-  const key = "strChars";
-  let helper = lowerer.arrHofHelpers.get(key);
-  if (!helper) {
-    helper = "%str.chars";
-    lowerer.arrHofHelpers.set(key, helper);
-    lowerer.liftedFns.push(buildStrCharsFn(helper, loc));
-  }
-  return { kind: "call", callee: helper, args: [src], type: arrayOf(STRING), loc };
-}
-
-/** The code-point split, from existing IR nodes — the string for-of
- * desugar's UTF-16 cursor as a function:
- *
- *   out = [];
- *   i = 0;
- *   while (i < s.length) { ch = cpAt(s, i); i += ch.length; out.push(ch); }
- *   return out;
- */
-function buildStrCharsFn(name: string, loc: SrcLoc): IrFunction {
-  const outT = arrayOf(STRING);
-
-  const sLen = (recv: IrExpr): IrExpr => ({
-    kind: "strIntrinsic",
-    method: "length",
-    receiver: recv,
-    args: [],
-    type: F64,
-    loc,
-  });
-  const body: IrStmt[] = [
-    {
-      kind: "varDecl",
-      localId: "out.0",
-      init: { kind: "arrayLit", elems: [], type: outT, loc },
-      loc,
-    },
-    { kind: "varDecl", localId: "i.0", init: { kind: "numLit", value: 0, type: F64, loc }, loc },
-    {
-      kind: "while",
-      cond: {
-        kind: "bin",
-        op: "<",
-        left: varRef("i.0", F64, loc),
-        right: sLen(varRef("s.0", STRING, loc)),
-        type: BOOL,
-        loc,
-      },
-      body: [
-        {
-          kind: "varDecl",
-          localId: "ch.0",
-          init: {
-            kind: "strIntrinsic",
-            method: "cpAt",
-            receiver: varRef("s.0", STRING, loc),
-            args: [varRef("i.0", F64, loc)],
-            type: STRING,
-            loc,
-          },
-          loc,
-        },
-        {
-          kind: "assign",
-          localId: "i.0",
-          value: {
-            kind: "bin",
-            op: "+",
-            left: varRef("i.0", F64, loc),
-            right: sLen(varRef("ch.0", STRING, loc)),
-            type: F64,
-            loc,
-          },
-          loc,
-        },
-        {
-          kind: "exprStmt",
-          expr: {
-            kind: "arrIntrinsic",
-            method: "push",
-            receiver: varRef("out.0", outT, loc),
-            args: [varRef("ch.0", STRING, loc)],
-            type: F64,
-            loc,
-          },
-          loc,
-        },
-      ],
-      loc,
-    },
-    { kind: "return", value: varRef("out.0", outT, loc), loc },
-  ];
-  return {
-    name,
-    params: [{ localId: "s.0", name: "s", type: STRING }],
-    returnType: outT,
-    locals: [
-      { id: "s.0", name: "s", type: STRING, mutable: true },
-      { id: "out.0", name: "out", type: outT, mutable: false },
-      { id: "i.0", name: "i", type: F64, mutable: true },
-      { id: "ch.0", name: "ch", type: STRING, mutable: false },
-    ],
-    body,
-    loc,
-  };
+ * fresh string[] (scr_str_code_points). */
+export function strCharsCall(src: IrExpr, loc: SrcLoc): IrExpr {
+  return { kind: "libCall", fn: "str.codePoints", args: [src], type: arrayOf(STRING), loc };
 }
 
 /** The lowered `length` value of the one-property source literal, or null

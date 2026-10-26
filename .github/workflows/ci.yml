@@ -346,6 +346,37 @@ jobs:
       - run: tar -xzf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
       - run: pnpm test tests/harness/effect.test.ts tests/harness/effect4.test.ts
 
+  # The sanitized three.js nodes build alone: beside the san corpus's other
+  # workers it took 860 to more than 1200 seconds of its shard
+  # (SCRIPTC_THREE_SANITIZED_NODES_JOB in scripts/ci-test-plan.mjs). It keeps
+  # the corpus's LeakSanitizer settings.
+  three_nodes_san:
+    needs: [validation_scope, lanes, native_linux]
+    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
+    name: test (Linux, san, three.js nodes)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SCRIPTC_SAN: "1"
+      ASAN_OPTIONS: detect_leaks=1
+      LSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/harness/lsan.supp:print_suppressions=0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-linux-x64-gnu
+          path: ${{ runner.temp }}
+      - run: tar -xzf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
+      - run: pnpm test tests/harness/three.test.ts -t "'nodes' runs statically through LLVM on 'native'"
+
   # Build each instrumented seed once. Downstream contracts retain the same
   # compiler and source artifacts without repeating seed construction.
   bootstrap_seed:
@@ -950,6 +981,7 @@ jobs:
         tests_macos,
         native_linux,
         effects,
+        three_nodes_san,
         bootstrap_seed,
         bootstrap,
         linux_host_clang,
@@ -982,6 +1014,7 @@ jobs:
               lane tests_macos "${{ needs.tests_macos.result }}" "${{ needs.lanes.outputs.macos }}"
               lane native_linux "${{ needs.native_linux.result }}" "${{ needs.lanes.outputs.linux }}"
               lane effects "${{ needs.effects.result }}" "${{ needs.lanes.outputs.effects }}"
+              lane three_nodes_san "${{ needs.three_nodes_san.result }}" "${{ needs.lanes.outputs.linux }}"
               lane bootstrap_seed "${{ needs.bootstrap_seed.result }}" "${{ needs.lanes.outputs.bootstrap }}"
               lane bootstrap "${{ needs.bootstrap.result }}" "${{ needs.lanes.outputs.bootstrap }}"
               lane linux_host_clang "${{ needs.linux_host_clang.result }}" "${{ needs.lanes.outputs.linux }}"

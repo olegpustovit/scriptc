@@ -149,6 +149,18 @@ ScrStream *scr_stream_unbox_dyn(const struct ScrDyn *value, const ScrStr *messag
  * to pump rather than as a stream (false with an exception pending when
  * reading the value's members throws). */
 bool scr_stream_dyn_iterable_source(const struct ScrDyn *value);
+/* A checked-dynamic pipeline() stage the pipeline takes as a stream: a
+ * native stream (+1), or Duplex.from of a value that is not stream-like
+ * or a function, which the pipeline uses without piping into it; NULL
+ * with an exception otherwise (`message` for the unsupported shapes). */
+ScrStream *scr_stream_unbox_dyn_stage(const struct ScrDyn *value, const ScrStr *message);
+/* The iterable pipeline() pumps for a checked-dynamic first stage: a
+ * source function's result when `returned`, else a { readable, writable }
+ * pair's readable side or the value (+1, or NULL with an exception). */
+struct ScrDyn *scr_stream_dyn_source_value(const struct ScrDyn *value, bool returned);
+/* An untyped function stage's result before the last pipeline stage: the
+ * async iterable itself (+1), or NULL with ERR_INVALID_RETURN_VALUE. */
+struct ScrDyn *scr_stream_dyn_transform_result(const struct ScrDyn *value, const ScrStr *label);
 /* Handles that are Transforms (ScrDynHandleOps.transform: Cipheriv and
  * Decipheriv). scr_stream_of_handle: the handle's Transform (+1), built on
  * first use, or NULL when the value is not such a handle.

@@ -15,7 +15,7 @@
  * version; renaming or removing a field, or changing a field's meaning,
  * bumps it. */
 import { readFileSync } from "node:fs";
-import type { ScrDiagnostic } from "./diagnostic.js";
+import { isTypePatchCode, type ScrDiagnostic } from "./diagnostic.js";
 import { isPerformanceCode } from "./dynamic-tier.js";
 import type { WasmModuleReport } from "../wasm/discover.js";
 
@@ -217,6 +217,7 @@ export function categoryOf(diag: ScrDiagnostic): DiagnosticCategory {
   if (code === "SC0002" || code === "SC0004") return "environment";
   if (/^SC[35]\d{3}$/.test(code)) return "environment";
   if (code === "SC8004" || code === "SC8005" || code === "SC8012") return "environment";
+  if (isTypePatchCode(code)) return "environment";
   if (/^SC9\d{3}$/.test(code)) return "internal";
   return "unsupported";
 }
@@ -335,7 +336,10 @@ export function locateDiagnostic(
     code: diag.code,
     category: categoryOf(diag),
     severity:
-      isDivergenceCode(diag.code) || isPerformanceCode(diag.code) || diag.code === "SC8004"
+      isDivergenceCode(diag.code) ||
+      isPerformanceCode(diag.code) ||
+      diag.code === "SC8004" ||
+      isTypePatchCode(diag.code)
         ? "warning"
         : "error",
     scope,

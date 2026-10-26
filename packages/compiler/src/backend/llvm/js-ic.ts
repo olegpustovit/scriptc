@@ -406,9 +406,13 @@ function emitGet(host: Host, e: ExprOf<"call">, callee: IrFunction, key: string)
   inlineLoad(host, receiver.name, ic, INLINE_WAYS, INLINE_PROTO, (cell) => cell, hits, hit, probe);
   B.startBlock(probe);
   // The read's probe also answers keys the receiver's plain chain lacks.
-  host.declare(`declare ptr @scr_js_get_probe(ptr, ptr, ptr)`);
+  // Only `length` and `next` reads can be answered for a native array or
+  // iterator, so only those sites take the probe that tests them.
+  const probeFn =
+    key === "length" || key === "next" ? "scr_js_get_probe_native" : "scr_js_get_probe";
+  host.declare(`declare ptr @${probeFn}(ptr, ptr, ptr)`);
   const probed = B.tmp();
-  B.line(`${probed} = call ptr @scr_js_get_probe(ptr ${receiver.name}, ptr ${name}, ptr ${ic})`);
+  B.line(`${probed} = call ptr @${probeFn}(ptr ${receiver.name}, ptr ${name}, ptr ${ic})`);
   const found = B.tmp();
   B.line(`${found} = icmp ne ptr ${probed}, null`);
   const probeEnd = B.currentLabel();

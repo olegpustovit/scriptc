@@ -743,7 +743,7 @@ export function lowerStringIteratorValue(
             left: index,
             right: {
               kind: "strIntrinsic",
-              method: "length",
+              method: "byteLength",
               receiver: text,
               args: [],
               type: F64,
@@ -758,7 +758,7 @@ export function lowerStringIteratorValue(
               localId: "point.0",
               init: {
                 kind: "strIntrinsic",
-                method: "cpAt",
+                method: "cpAtByte",
                 receiver: text,
                 args: [index],
                 type: STRING,
@@ -775,7 +775,7 @@ export function lowerStringIteratorValue(
                 left: index,
                 right: {
                   kind: "strIntrinsic",
-                  method: "length",
+                  method: "byteLength",
                   receiver: point,
                   args: [],
                   type: F64,

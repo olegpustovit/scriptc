@@ -150,6 +150,15 @@ ScrStr *scr_str_char_at(ScrStr *s, double i);
  * (two units); the consuming loop advances by the result's length.
  * Out of range → empty string. Returns +1. */
 ScrStr *scr_str_cp_at(ScrStr *s, double i);
+/* The string iterator's step over the WTF-8 bytes: the code-point
+ * character whose encoding starts at byte offset b, a character start
+ * below s->len (a lone surrogate is its own three-byte character). The
+ * compiler answers ASCII bytes inline and calls this for the rest.
+ * Returns +1. */
+ScrStr *scr_str_cp_at_byte(ScrStr *s, uint64_t b);
+/* [...s] and Array.from(s): the code-point characters of s in order, as a
+ * fresh string array of exactly that length. Returns +1. */
+struct ScrArr *scr_str_code_points(ScrStr *s);
 
 /* trimStart()/trimEnd(): the one-sided halves of trim. Returns +1. */
 ScrStr *scr_str_trim_start(ScrStr *s);

@@ -211,6 +211,19 @@ test("a target CPU level reaches every function attribute group and nothing else
   expect(emitLlvmModule(module, { targetCpu: "baseline" })).toBe(plain);
 });
 
+test("only sanitized builds mark the emitted functions sanitize_address", () => {
+  const module = moduleFor([call()]);
+  const sanitized = emitLlvmModule(module);
+  expect(emitLlvmModule(module, { sanitizeAttributes: true })).toBe(sanitized);
+  expect(sanitized).toMatch(/^attributes #0 = \{ sanitize_address \}$/m);
+  const plain = emitLlvmModule(module, { sanitizeAttributes: false });
+  expect(plain).not.toContain("sanitize_address");
+  // A group needs an attribute: an ignored string attribute stands in.
+  expect(plain).toMatch(/^attributes #0 = \{ "scriptc-function" \}$/m);
+  const v3 = emitLlvmModule(module, { sanitizeAttributes: false, targetCpu: "x86-64-v3" });
+  expect(v3).toMatch(/^attributes #0 = \{ "target-cpu"="x86-64-v3" \}$/m);
+});
+
 test("inline RC inlines every fast path at speed and keeps box releases as calls in release", () => {
   for (const boxed of [false, true]) {
     const module = moduleFor(Array.from({ length: 4 }, call), { boxed });

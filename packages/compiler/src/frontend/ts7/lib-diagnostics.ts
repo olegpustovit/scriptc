@@ -17,9 +17,17 @@
  * which a program of modules does not otherwise read (about 4 MB at the
  * peak of a small build). An answer stored by such a program leaves them
  * out; the first program with scripts that uses the answer collects them
- * and stores them with it. */
+ * and stores them with it.
+ *
+ * A native distribution also ships prebuilt answers: the content keys of
+ * the supplied file sets the checker reports no diagnostics in, recorded when
+ * the distribution was built. A build whose store has no answer uses a
+ * prebuilt one when the checker is the distribution's own and the files'
+ * content key is among them, and stores it, so builds with an empty cache
+ * skip the check of the supplied files too. */
 import { createHash } from "node:crypto";
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import type { Node, SourceFile } from "./ast-types.js";
 import type { Ts7DiagnosticData } from "./session-schema.generated.js";
 import type { Ts7SessionProgram } from "./session.js";
@@ -32,15 +40,108 @@ export interface LibDiagnosticsStore {
   write(key: string, text: string): void;
 }
 
-const SCHEMA = "scriptc.lib-diagnostics.v2";
+/** The answers a distribution ships: the content keys (contentKey) of the
+ * supplied file sets whose full check reported no diagnostics with the
+ * checker release `checker`. */
+export interface PrebuiltLibDiagnostics {
+  checker: string;
+  keys: ReadonlySet<string>;
+}
 
-let configured: { store: LibDiagnosticsStore; checker: string } | null = null;
+const SCHEMA = "scriptc.lib-diagnostics.v2";
+const PREBUILT_SCHEMA = "scriptc.lib-diagnostics-prebuilt.v1";
+
+let configured: {
+  store: LibDiagnosticsStore;
+  checker: string;
+  /** Read on the first store miss; null when there are none. */
+  prebuilt: (() => PrebuiltLibDiagnostics | null) | null;
+} | null = null;
 
 /** Has later builds of this process reuse the diagnostics of the supplied
  * declaration files through `store`, for the checker identified by
- * `checker` (its executable's identity), or stop reusing them (null). */
-export function setLibDiagnosticsStore(store: LibDiagnosticsStore | null, checker = ""): void {
-  configured = store === null ? null : { store, checker };
+ * `checker` (its executable's identity), or stop reusing them (null).
+ * `prebuilt` reads the answers the distribution ships for that checker. */
+export function setLibDiagnosticsStore(
+  store: LibDiagnosticsStore | null,
+  checker = "",
+  prebuilt: (() => PrebuiltLibDiagnostics | null) | null = null,
+): void {
+  if (store === null) {
+    configured = null;
+    return;
+  }
+  let loaded: PrebuiltLibDiagnostics | null | undefined;
+  configured = {
+    store,
+    checker,
+    prebuilt:
+      prebuilt === null ? null : () => (loaded === undefined ? (loaded = prebuilt()) : loaded),
+  };
+}
+
+let prebuiltRecorder: { checker: string; record: (key: string) => void } | null = null;
+
+/** Has later full checks that report no diagnostics in the supplied files
+ * pass their content key (contentKey, for the checker release `checker`) to
+ * `record`, or stop (null). A distribution build collects its prebuilt
+ * answers this way. */
+export function recordPrebuiltLibDiagnostics(
+  recorder: { checker: string; record: (key: string) => void } | null,
+): void {
+  prebuiltRecorder = recorder;
+}
+
+/** Reads a prebuilt answers file (`{ schema, checker, keys }`); null when
+ * it is missing or malformed. */
+export function readPrebuiltLibDiagnostics(path: string): PrebuiltLibDiagnostics | null {
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8")) as {
+      schema?: unknown;
+      checker?: unknown;
+      keys?: unknown;
+    };
+    if (
+      value.schema !== PREBUILT_SCHEMA ||
+      typeof value.checker !== "string" ||
+      !Array.isArray(value.keys) ||
+      !value.keys.every((key) => typeof key === "string")
+    )
+      return null;
+    return { checker: value.checker, keys: new Set(value.keys as string[]) };
+  } catch {
+    return null;
+  }
+}
+
+/** A distribution's prebuilt answers at `path`, for its tsc-ts at `checker`
+ * (`<package>/lib/tsc-ts`): null unless their checker release is the
+ * version of the package the executable belongs to. */
+export function distributionPrebuiltLibDiagnostics(
+  path: string,
+  checker: string,
+): PrebuiltLibDiagnostics | null {
+  const prebuilt = readPrebuiltLibDiagnostics(path);
+  return prebuilt !== null && checkerPackageVersion(checker) === prebuilt.checker ? prebuilt : null;
+}
+
+/** The version of the tsc-ts package whose executable is `checker`
+ * (`<package>/lib/tsc-ts`), or null when it cannot be read. */
+export function checkerPackageVersion(checker: string): string | null {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(join(dirname(dirname(checker)), "package.json"), "utf8"),
+    ) as { version?: unknown };
+    return typeof pkg.version === "string" ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The text of a prebuilt answers file holding `keys` for the checker
+ * release `checker`. */
+export function prebuiltLibDiagnosticsText(checker: string, keys: Iterable<string>): string {
+  return `${JSON.stringify({ schema: PREBUILT_SCHEMA, checker, keys: [...new Set(keys)].sort() }, null, 1)}\n`;
 }
 
 /** A checker executable's identity for the stored diagnostics' key: its
@@ -64,6 +165,31 @@ export function reusedLibDiagnostics(
   fileNames: readonly string[],
   supplied: (fileName: string) => boolean,
   sourceFile: (fileName: string) => SourceFile | undefined,
+): { semantic: Ts7DiagnosticData[]; global: Ts7DiagnosticData[] } | null {
+  return reuse(program, fileNames, supplied, sourceFile, () => true, false);
+}
+
+/** reusedLibDiagnostics for a caller that keeps only the diagnostics of the
+ * `kept` files: a stored answer then needs checking only the kept other
+ * files, and without a stored answer the result is null (nothing is checked
+ * or stored). */
+export function reusedKeptLibDiagnostics(
+  program: Ts7SessionProgram,
+  fileNames: readonly string[],
+  supplied: (fileName: string) => boolean,
+  sourceFile: (fileName: string) => SourceFile | undefined,
+  kept: ReadonlySet<string>,
+): { semantic: Ts7DiagnosticData[]; global: Ts7DiagnosticData[] } | null {
+  return reuse(program, fileNames, supplied, sourceFile, (name) => kept.has(name), true);
+}
+
+function reuse(
+  program: Ts7SessionProgram,
+  fileNames: readonly string[],
+  supplied: (fileName: string) => boolean,
+  sourceFile: (fileName: string) => SourceFile | undefined,
+  keep: (fileName: string) => boolean,
+  storedOnly: boolean,
 ): { semantic: Ts7DiagnosticData[]; global: Ts7DiagnosticData[] } | null {
   if (configured === null || process.env["SCRIPTC_LIB_DIAGNOSTICS"] === "0") return null;
   const { store, checker } = configured;
@@ -95,7 +221,7 @@ export function reusedLibDiagnostics(
   const options = { ...program.getCompilerOptions(), configFilePath: undefined };
   const key = entryKey(checker, options, libs);
   if (key === null) return null;
-  const stored = readEntry(store, key, libs);
+  const stored = readEntry(store, key, libs) ?? prebuiltEntry(store, key, options, libs);
   // An answer stored without the supplied files' global names: a program
   // with scripts collects them and stores them with the answer.
   let globals = stored?.globals ?? null;
@@ -104,12 +230,16 @@ export function reusedLibDiagnostics(
     if (globals !== null) writeEntry(store, key, globals, Object.fromEntries(stored.files));
   }
   if (stored !== null && (scripts.length === 0 || (globals !== null && !collides(globals)))) {
-    const checked = program.checkedFileDiagnosticData(own);
+    const checkedNames = storedOnly ? own.filter(keep) : own;
+    const checked = program.checkedFileDiagnosticData(checkedNames);
     if (checked === null) return null;
-    const byFile = new Map<string, Ts7DiagnosticData[]>(stored.files);
-    own.forEach((name, index) => byFile.set(name, checked.files[index] ?? []));
+    const byFile = new Map<string, Ts7DiagnosticData[]>(
+      storedOnly ? [...stored.files].filter(([name]) => keep(name)) : stored.files,
+    );
+    checkedNames.forEach((name, index) => byFile.set(name, checked.files[index] ?? []));
     return { semantic: inFileOrder(byFile), global: checked.global };
   }
+  if (storedOnly) return null;
   // The full check, as before. Its answers for the supplied files are stored
   // when it reports no global diagnostics and the program's scripts declare
   // none of the supplied files' globals (so nothing of the program reached
@@ -123,6 +253,10 @@ export function reusedLibDiagnostics(
       const files: Record<string, Ts7DiagnosticData[]> = {};
       for (const name of libs) files[name] = program.diagnosticData("getSemanticDiagnostics", name);
       writeEntry(store, key, names, files);
+      if (prebuiltRecorder !== null && Object.values(files).every((list) => list.length === 0)) {
+        const content = contentKey(prebuiltRecorder.checker, options, libs);
+        if (content !== null) prebuiltRecorder.record(content);
+      }
     }
   }
   return { semantic, global };
@@ -301,6 +435,42 @@ function entryKey(checker: string, options: unknown, libs: readonly string[]): s
     .digest("hex");
 }
 
+/** The supplied files' answer from the distribution's prebuilt answers,
+ * stored under `key` for later builds: every file without diagnostics, when
+ * they hold the files' content key; null otherwise. */
+function prebuiltEntry(
+  store: LibDiagnosticsStore,
+  key: string,
+  options: unknown,
+  libs: readonly string[],
+): { files: Map<string, Ts7DiagnosticData[]>; globals: Set<string> | null } | null {
+  const prebuilt = configured?.prebuilt?.() ?? null;
+  if (prebuilt === null || prebuilt.keys.size === 0) return null;
+  const content = contentKey(prebuilt.checker, options, libs);
+  if (content === null || !prebuilt.keys.has(content)) return null;
+  const files: Record<string, Ts7DiagnosticData[]> = {};
+  for (const name of libs) files[name] = [];
+  writeEntry(store, key, null, files);
+  return { files: new Map(Object.entries(files)), globals: null };
+}
+
+/** A supplied file set's key independent of where the files are installed:
+ * the checker release, the compiler options and each file's name and
+ * content digest, in program order; null when a file cannot be read. */
+function contentKey(checker: string, options: unknown, libs: readonly string[]): string | null {
+  const files: [string, string][] = [];
+  for (const name of libs) {
+    try {
+      files.push([basename(name), createHash("sha256").update(readFileSync(name)).digest("hex")]);
+    } catch {
+      return null;
+    }
+  }
+  return createHash("sha256")
+    .update(JSON.stringify({ schema: PREBUILT_SCHEMA, checker, options, files }))
+    .digest("hex");
+}
+
 function readEntry(
   store: LibDiagnosticsStore,
   key: string,
@@ -339,7 +509,7 @@ function readEntry(
 
 /** Each file's diagnostics (already in the checker's order) in the order the
  * checker sorts files: by file name, compared by code point. */
-function inFileOrder(byFile: ReadonlyMap<string, Ts7DiagnosticData[]>): Ts7DiagnosticData[] {
+export function inFileOrder(byFile: ReadonlyMap<string, Ts7DiagnosticData[]>): Ts7DiagnosticData[] {
   const names = [...byFile.keys()].sort(compareCodePoints);
   const out: Ts7DiagnosticData[] = [];
   for (const name of names) for (const d of byFile.get(name)!) out.push(d);

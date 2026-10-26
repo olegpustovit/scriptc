@@ -173,6 +173,23 @@ void limitProfileImports() {
   (void)Limited;
 }
 
+// Drops the names of a partition's struct types before its summary is
+// written. Every partition declares the program's types under the same
+// names, and a thin link loads the importing partition and the partitions
+// it imports from into one context, which tells same-named types apart by
+// appending a counter that runs across the whole link. An edit that adds a
+// type anywhere shifts the counter, so the module after importing, the
+// object cache key, changed in partitions whose code had not. Unnamed types
+// carry no such suffix; importing still matches them by their bodies.
+struct UnnameStructTypes : PassInfoMixin<UnnameStructTypes> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    for (StructType *Type : M.getIdentifiedStructTypes())
+      Type->setName("");
+    return PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
 // How the --profile-use profile matched the functions it annotated, summed
 // over partitions: functions that received its counts, functions whose
 // control flow changed since it was collected (hash mismatch), and functions
@@ -733,6 +750,7 @@ compileOptimizedPartitions(const EmitOptions &Options,
       if (Annotating)
         P.countAnnotated(PartitionMatch.Annotated);
       ModulePassManager MPM = P.PB.buildThinLTOPreLinkDefaultPipeline(Level);
+      MPM.addPass(UnnameStructTypes());
       MPM.addPass(BitcodeWriterPass(Stream, /*ShouldPreserveUseListOrder=*/false,
                                     /*EmitSummaryIndex=*/true,
                                     /*EmitModuleHash=*/true));

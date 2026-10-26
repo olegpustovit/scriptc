@@ -23,6 +23,7 @@ import {
   trackedRealpath,
 } from "./input-tracker.js";
 import { npmBuiltinAliasOf } from "./builtin-modules.js";
+import { packageSourceText, typePatchSuppliesTypes } from "./type-patches/layer.js";
 import type { Defines } from "./defines.js";
 
 let activePackages: ReadonlySet<string> = new Set();
@@ -83,7 +84,7 @@ export function setNpmStaticTypeExports(
 function withTypeExportTypedefs(path: string, text: string | null): string | null {
   const typedefs = typeExportTypedefs.get(path.split("\\").join("/"));
   if (typedefs === undefined) return text;
-  const source = text ?? trackedReadFile(path);
+  const source = text ?? packageSourceText(path);
   return source === null ? text : `${source}\n${typedefs}\n`;
 }
 
@@ -374,6 +375,7 @@ function packageIsUntyped(path: string): boolean {
     /* no package.json — keep probing */
   }
   if (untyped && trackedExists(`${pkgDir}/index.d.ts`)) untyped = false;
+  if (untyped && typePatchSuppliesTypes(pkgDir)) untyped = false;
   if (untyped) {
     // the @types twin, hoisted anywhere up the realm chain
     const mangled = mangledTypesName(dirName);
@@ -468,7 +470,11 @@ export function npmStaticFsShadow(services: FrontendServices): NpmStaticFsShadow
         if (hit !== undefined) return hit ?? undefined;
         let rewritten: string | null = null;
         try {
-          let original = trackedReadFile(path);
+          // A project type patch (type-patches/layer.ts) edits the text
+          // as the package wrote it, before any rewrite reads its JSDoc
+          // (unrewritten files fall through to the host, which serves the
+          // patched text too).
+          let original = packageSourceText(path);
           const defined = original === null ? null : withDefinedBranches(services, path, original);
           if (defined !== null) original = defined;
           // A bundle's CommonJS chunks move to their own modules first, so
@@ -651,7 +657,7 @@ export function definedSource(services: FrontendServices, path: string): string 
   if (activeDefines === undefined || !/\.[cm]?jsx?$/.test(path)) return null;
   const hit = definedSourceCache.get(path);
   if (hit !== undefined) return hit;
-  const source = trackedReadFile(path);
+  const source = packageSourceText(path);
   return source === null ? null : withDefinedBranches(services, path, source);
 }
 

@@ -867,6 +867,8 @@ export function analyzeIntegerRangeFacts(
         );
         if (e.type.kind === "f64") {
           if (e.method === "length") range = { min: 0, max: STRING_MAX_UNITS };
+          // A string holds at most SCR_STR_MAX_CAP (0x7fffffff) bytes.
+          else if (e.method === "byteLength") range = { min: 0, max: STRING_MAX_UNITS };
           // An empty needle is found at the clamped position, up to the length.
           else if (e.method === "indexOf") range = { min: -1, max: STRING_MAX_UNITS };
         }

@@ -407,6 +407,11 @@ ScrDyn *scr_js_get_probe(ScrDyn *receiver, const ScrStr *key, ScrJsIc *ic) {
   return scr_js_probe_load(receiver, key, ic, true);
 }
 
+ScrDyn *scr_js_get_probe_native(ScrDyn *receiver, const ScrStr *key, ScrJsIc *ic) {
+  if (receiver->kind != SCR_DYN_OBJ) return scr_dyn_tier_unshaped_get(receiver, key);
+  return scr_js_probe_load(receiver, key, ic, true);
+}
+
 /* ── stores ───────────────────────────────────────────────────────────── */
 
 /* The generic store keeps a native Error's fields in sync with these keys

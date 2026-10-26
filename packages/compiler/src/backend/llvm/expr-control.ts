@@ -2,11 +2,12 @@ import { emitBorrowedInput } from "./borrowed-inputs.js";
 /* Focused LLVM expression emission extracted from emitter.ts. */
 import { InternalCompilerError } from "../../errors.js";
 import { undefinedArmTag } from "../../ir/analysis.js";
-import { isRefCounted, isUnitType, typeEquals, type IrExpr } from "../../ir/ir.js";
+import { isRefCounted, isUnitType, typeEquals, type IrExpr, type IrType } from "../../ir/ir.js";
 import { DYN_KIND } from "./dyn.js";
 import { LlvmUnsupportedError } from "./unsupported.js";
 import type { LlvmEmitterContext, ExprOf, LlValue } from "./expr-context.js";
 import { f64Lit } from "./common.js";
+import { emitRecordKeyGetOr } from "./expr-records.js";
 import { NULLABLE_NULL, SHAPE_WORD_INDEX, shapeWordHeader } from "./nullable-unions.js";
 import { emitUnionTag } from "./union-repr.js";
 
@@ -398,6 +399,13 @@ export function emitControlExpr(
       const fused = emitNullishOptionalChain(host, e);
       if (fused) return fused;
       if (
+        e.left.kind === "recordKeyGet" &&
+        e.left.missNaN !== true &&
+        typeEquals(e.type, e.left.type) &&
+        storesNoUnit(host, e.left)
+      )
+        return emitRecordKeyGetOr(host, e.left, e.right);
+      if (
         !typeEquals(e.type, e.left.type) &&
         (e.left.kind === "varRef" ||
           host.isStackUnionSource(e.left) ||
@@ -491,10 +499,7 @@ export function emitOptionalChainReceiver(
   // needs no reference of its own while the body cannot remove an edge
   // (so nothing can overwrite the projection before the body finishes).
   const borrowReceiver =
-    !multiple &&
-    isRefCounted(narrowed) &&
-    host.canBorrowReceiver(e.receiver) &&
-    host.referenceEffects.preserves(e.body);
+    !multiple && isRefCounted(narrowed) && borrowsChainReceiver(host, e.receiver, e.body);
   // An optional array read of a nullable-pointer union is the element
   // pointer itself, read inline and owned by the statement frame until
   // the body finishes; the bind slot borrows it like an emitExpr value.
@@ -554,6 +559,16 @@ export function emitOptionalChainReceiver(
   };
 }
 
+/** An optional chain's receiver can lend its payload to the bind slot when
+ * the body leaves the receiver's locations alone: it removes no edge at
+ * all, or it writes none of the locations the receiver reads. */
+function borrowsChainReceiver(host: LlvmEmitterContext, receiver: IrExpr, body: IrExpr): boolean {
+  if (!host.canBorrowReceiver(receiver)) return false;
+  if (host.referenceEffects.preserves(body)) return true;
+  const writes = host.referenceWrites;
+  return writes !== null && host.unwrittenRead(receiver, writes.expr(body));
+}
+
 /** `a?.b ?? d` narrowed to the chain body's present arm. The body wraps a
  * value of the result type in a non-unit arm, so the default runs exactly
  * when the receiver is nullish and the intermediate result box is never
@@ -580,16 +595,21 @@ function emitNullishOptionalChain(host: LlvmEmitterContext, e: ExprOf<"nullish">
   if (unitTags.length === 0 || present.length !== 1) return null;
   const B = host.B;
   const narrowed = receiverDef.arms[present[0]!]!;
-  const r = host.canStackReceiver(chain.receiver)
-    ? host.emitReadReceiver(chain.receiver)
-    : host.emitExpr(chain.receiver);
+  // A receiver read from a location the body cannot write lends its
+  // payload to the bind slot for the whole body (`table[k]?.(…) ?? d`).
+  const borrowed =
+    isRefCounted(narrowed) && borrowsChainReceiver(host, chain.receiver, chain.body.value);
+  const r =
+    borrowed || host.canStackReceiver(chain.receiver)
+      ? host.emitReadReceiver(chain.receiver)
+      : host.emitExpr(chain.receiver);
   const bindTy = host.llType(narrowed);
   const bind = B.slot();
   B.entryAllocas.push(`${bind} = alloca ${bindTy}`);
   B.line(
     `store ${bindTy} ${bindTy === "ptr" ? "null" : bindTy === "double" ? f64Lit(0) : "false"}, ptr ${bind}`,
   );
-  host.ownSlot(bind, narrowed);
+  if (!borrowed) host.ownSlot(bind, narrowed);
   const isUnit = host.tagInSet(r.name, receiverDef.id, unitTags);
   const ty = host.llType(e.type);
   const slot = B.slot();
@@ -602,7 +622,10 @@ function emitNullishOptionalChain(host: LlvmEmitterContext, e: ExprOf<"nullish">
   host.emitBranchInto(slot, e.right);
   B.br(lj);
   B.startBlock(lb);
-  B.line(`store ${bindTy} ${host.unionExtract(r.name, receiverDef.id, narrowed)}, ptr ${bind}`);
+  const payload = borrowed
+    ? host.unionPeek(r.name, receiverDef.id)
+    : host.unionExtract(r.name, receiverDef.id, narrowed);
+  B.line(`store ${bindTy} ${payload}, ptr ${bind}`);
   host.chainSlots.set(chain.id, { name: bind, type: narrowed, slot: true });
   host.emitBranchInto(slot, chain.body.value);
   host.chainSlots.delete(chain.id);
@@ -699,4 +722,16 @@ function emitUnionTagSet(host: LlvmEmitterContext, set: TagSet): string {
   const t = B.tmp();
   B.line(`${t} = phi i1 [ true, %${yes} ], [ false, %${no} ]`);
   return t;
+}
+
+/** Every value a keyed read can hit is present (no stored undefined or
+ * null), so only a missing key yields the read's unit arm. */
+function storesNoUnit(host: LlvmEmitterContext, e: ExprOf<"recordKeyGet">): boolean {
+  const shape = host.recordShape(e.shapeId);
+  const holdsUnit = (t: IrType): boolean =>
+    isUnitType(t) ||
+    t.kind === "dyn" ||
+    (t.kind === "union" && (host.unionsById.get(t.unionId)?.arms ?? []).some(isUnitType));
+  if (shape.indexValue !== undefined && holdsUnit(shape.indexValue)) return false;
+  return e.overflowOnly === true || !shape.fields.some((f) => holdsUnit(f.type));
 }

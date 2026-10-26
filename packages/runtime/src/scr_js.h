@@ -235,6 +235,10 @@ ScrDyn *scr_js_load_probe(ScrDyn *receiver, const ScrStr *key, ScrJsIc *ic);
  * a key that the receiver and its plain prototype chain lack, and caches
  * that answer. A method read uses scr_js_load_probe. */
 ScrDyn *scr_js_get_probe(ScrDyn *receiver, const ScrStr *key, ScrJsIc *ic);
+/* scr_js_get_probe for a site whose key is `length` or `next`, which also
+ * answers a native array's length and a native iterator's next
+ * (scr_dyn_tier_unshaped_get). */
+ScrDyn *scr_js_get_probe_native(ScrDyn *receiver, const ScrStr *key, ScrJsIc *ic);
 /* `receiver.key = value` (value borrowed) when it replaces a writable own
  * data property or adds one the prototype chain lacks: true when done. */
 bool scr_js_store_probe(ScrDyn *receiver, const ScrStr *key, ScrDyn *value, ScrJsIc *ic);

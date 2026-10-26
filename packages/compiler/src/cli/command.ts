@@ -19,7 +19,12 @@ import {
 } from "../node-islands/policy.js";
 import { TIER_MODES, type TierMode } from "../frontend/tier-analysis.js";
 import { buildEnvelope } from "../diagnostics/envelope.js";
-import { renderConfigWarnings, renderWarnings } from "../diagnostics/render.js";
+import {
+  renderConfigWarnings,
+  renderTypePatchWarnings,
+  renderWarnings,
+} from "../diagnostics/render.js";
+import { isTypePatchCode } from "../diagnostics/diagnostic.js";
 import { isPerformanceCode, renderPerformanceWarnings } from "../diagnostics/dynamic-tier.js";
 import { isNativeOptimization } from "../backend/optimization.js";
 import {
@@ -675,20 +680,30 @@ async function main(args: string[], host: CliHost): Promise<number> {
       // keeps stderr for the program's own output.
       const color = process.stderr.isTTY ?? false;
       const config = warnings.filter((d) => d.code === "SC8004");
-      const divergences = warnings.filter((d) => !isPerformanceCode(d.code) && d.code !== "SC8004");
+      const patches = warnings.filter((d) => isTypePatchCode(d.code));
+      const divergences = warnings.filter(
+        (d) => !isPerformanceCode(d.code) && d.code !== "SC8004" && !isTypePatchCode(d.code),
+      );
       const performance = warnings.filter((d) => isPerformanceCode(d.code));
       if (config.length > 0)
         process.stderr.write(
           renderConfigWarnings(config, result.sourceTexts ?? new Map(), { color }) + "\n",
         );
-      if (divergences.length > 0) {
+      if (patches.length > 0) {
         if (config.length > 0) process.stderr.write("\n");
+        process.stderr.write(
+          renderTypePatchWarnings(patches, result.sourceTexts ?? new Map(), { color }) + "\n",
+        );
+      }
+      if (divergences.length > 0) {
+        if (config.length > 0 || patches.length > 0) process.stderr.write("\n");
         process.stderr.write(
           renderWarnings(divergences, result.sourceTexts ?? new Map(), { color }) + "\n",
         );
       }
       if (performance.length > 0) {
-        if (divergences.length > 0 || config.length > 0) process.stderr.write("\n");
+        if (divergences.length > 0 || config.length > 0 || patches.length > 0)
+          process.stderr.write("\n");
         process.stderr.write(renderPerformanceWarnings(performance) + "\n");
       }
     }

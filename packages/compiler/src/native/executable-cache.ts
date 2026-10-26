@@ -14,8 +14,9 @@ import type { NativeOptimization } from "../backend/optimization.js";
 import type { NativeRuntimeSelection } from "../backend/runtime-pack-native.js";
 import type { NativeToolchain } from "./toolchain.js";
 import { contentDigest, NativeCache } from "./cache.js";
+import type { LinkerJobLink } from "./linker-job.js";
 
-interface InputIdentity {
+export interface InputIdentity {
   path: string;
   canonical: string;
   kind: "file" | "directory";
@@ -33,7 +34,7 @@ interface ExecutableEntry {
   symbols: string | null;
 }
 
-function identity(path: string): InputIdentity {
+export function identity(path: string): InputIdentity {
   path = resolve(path);
   const info = statSync(path);
   if (!info.isFile() && !info.isDirectory())
@@ -63,7 +64,7 @@ function sameIdentity(a: InputIdentity, b: InputIdentity): boolean {
   );
 }
 
-function stillMatches(inputs: InputIdentity[]): boolean {
+export function stillMatches(inputs: InputIdentity[]): boolean {
   try {
     return inputs.every((input) => sameIdentity(identity(input.path), input));
   } catch {
@@ -71,7 +72,7 @@ function stillMatches(inputs: InputIdentity[]): boolean {
   }
 }
 
-function commandPath(command: string): string {
+export function commandPath(command: string): string {
   if (command.includes("/") || command.includes("\\")) return resolve(command);
   for (const directory of (process.env["PATH"] ?? "/usr/bin:/bin").split(delimiter)) {
     const candidate = join(directory || process.cwd(), command);
@@ -92,7 +93,7 @@ function toolOutput(executable: string, args: string[]): string {
   return result.stdout + "\n" + result.stderr;
 }
 
-function tracePaths(output: string, driver: boolean, roots: string[]): string[] {
+export function tracePaths(output: string, driver: boolean, roots: string[]): string[] {
   const paths = new Set<string>();
   for (const line of output.split(/\r?\n/)) {
     for (const candidate of driver ? driverTraceCandidates(line) : linkTraceCandidate(line)) {
@@ -134,7 +135,7 @@ interface KeptEntry {
   inputs: InputIdentity[];
 }
 
-function validIdentity(input: InputIdentity): boolean {
+export function validIdentity(input: InputIdentity): boolean {
   return (
     input !== null &&
     typeof input === "object" &&
@@ -290,8 +291,10 @@ export class NativeExecutableCache {
    * Private build inputs already belong to the LLVM/runtime cache identity.
    * A true result means the requested output was linked successfully and its
    * inputs remained stable. The caller can publish that output directly. On
-   * false, the caller links the output itself. */
-  trace(args: string[], stage: string): boolean {
+   * false, the caller links the output itself. On Linux, `job` runs the
+   * traced link as its recorded linker job when it can, and otherwise records
+   * the job the driver ran (see LinkerJobs). */
+  trace(args: string[], stage: string, job?: LinkerJobLink): boolean {
     this.traced = false;
     try {
       this.addDeferredInputs();
@@ -300,8 +303,13 @@ export class NativeExecutableCache {
         ? []
         : tracePaths(toolOutput(this.linker, [...args, "-###"]), true, roots).map(identity);
       // On Linux, -v prints the jobs that -### would, while the link runs.
-      const linked = toolOutput(this.linker, [...args, ...(this.linux ? ["-v"] : []), "-Wl,-t"]);
-      if (this.linux) driverInputs = tracePaths(linked, true, roots).map(identity);
+      const traced = [...args, ...(this.linux ? ["-v"] : []), "-Wl,-t"];
+      const direct = this.linux ? (job?.run(traced, false) ?? null) : null;
+      const linked = direct?.output ?? toolOutput(this.linker, traced);
+      if (this.linux) {
+        driverInputs = direct?.driverInputs ?? tracePaths(linked, true, roots).map(identity);
+        if (direct === null) job?.record(traced, linked, driverInputs);
+      }
       const paths = tracePaths(linked, false, roots);
       if (paths.length === 0 || !stillMatches(this.inputs) || !stillMatches(driverInputs))
         return false;

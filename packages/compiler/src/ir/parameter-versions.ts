@@ -184,7 +184,8 @@ export function versionLoopBoundParameters(
   symbolName: (name: string) => string = (name) => name,
 ): IrModule {
   const candidates: { fn: IrFunction; params: Set<string> }[] = [];
-  const sites = callSites(mod);
+  // Call sites are read only for functions with loop-bound parameters.
+  let sites: ReturnType<typeof callSites> | null = null;
   const functions = new Map(mod.functions.map((fn) => [fn.name, fn]));
   const members = new Set((mod.classes ?? []).flatMap((cls) => cls.methods ?? []));
   for (const fn of mod.functions) {
@@ -207,7 +208,11 @@ export function versionLoopBoundParameters(
       const local = locals.get(id);
       if (!local || local.boxed || local.tdz) params.delete(id);
     }
-    if (params.size === 0 || size(fn) > MAX_FUNCTION_NODES || keepsSingleBody(fn, sites, functions))
+    if (
+      params.size === 0 ||
+      size(fn) > MAX_FUNCTION_NODES ||
+      keepsSingleBody(fn, (sites ??= callSites(mod)), functions)
+    )
       continue;
     candidates.push({ fn, params });
   }

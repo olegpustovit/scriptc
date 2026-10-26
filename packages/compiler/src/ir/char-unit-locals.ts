@@ -300,6 +300,8 @@ function rewriteFunction(fn: IrFunction): IrFunction {
   // or as copies of another such local (a switch's discriminant temp).
   const reads = new Map<string, OptionalCharRead>();
   const copyOf = new Map<string, string>();
+  // Whether a candidate string is declared from a charAt.
+  let charAtDeclared = false;
   const collect = (value: unknown): void => {
     if (Array.isArray(value)) for (const item of value) collect(item);
     else if (value !== null && typeof value === "object") {
@@ -307,6 +309,7 @@ function rewriteFunction(fn: IrFunction): IrFunction {
       if (node.kind === "varDecl" && candidates.has(node.localId as string) && node.init) {
         const id = node.localId as string;
         const init = node.init as IrExpr;
+        if (locals.get(id)?.type.kind === "string" && isCharAt(init)) charAtDeclared = true;
         const read = optionalCharRead(init);
         if (read) reads.set(id, read);
         else if (init.kind === "varRef" && reads.has(init.localId)) {
@@ -317,7 +320,8 @@ function rewriteFunction(fn: IrFunction): IrFunction {
       for (const key in node) if (key !== "loc") collect(node[key]);
     }
   };
-  collect(fn.body);
+  // Both walks only record candidates: a function without one holds none.
+  if (candidates.size > 0) collect(fn.body);
   const localTags = (operand: IrExpr): OptionalCharRead | null =>
     operand.kind === "varRef" ? (reads.get(operand.localId) ?? null) : null;
 
@@ -344,7 +348,9 @@ function rewriteFunction(fn: IrFunction): IrFunction {
       for (const key in node) if (key !== "loc") count(node[key]);
     }
   };
-  count(fn.body);
+  // Only candidates declared from a charAt or an optional read can be held
+  // (understoodMention), and count() only decides which are.
+  if (reads.size > 0 || charAtDeclared) count(fn.body);
   // A copy is held only with its source, and the source's mention in the
   // copy's initializer is understood only while the copy is held.
   const held = new Set<string>();

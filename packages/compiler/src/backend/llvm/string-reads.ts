@@ -43,6 +43,10 @@ export const STRING_CHAR_CODE_AT_INT_MARKER = "; uses @sc_str_char_code_at_int";
 export const STRING_CHAR_AT_DECL = "declare ptr @scr_str_char_at(ptr, double)";
 /** Requests the integer-index charAt helper, as the marker above does. */
 export const STRING_CHAR_AT_INT_MARKER = "; uses @sc_str_char_at_int";
+/** The code-point character starting at a byte offset (the string
+ * iterator's step). Requested together with STRING_CHAR_AT_DECL, which
+ * defines the ASCII table. */
+export const STRING_CP_AT_BYTE_DECL = "declare ptr @scr_str_cp_at_byte(ptr, i64)";
 
 /** The proven-ASCII flag of string `s`, as an i1. */
 export function emitStringAsciiFlag(host: LlvmEmitterContext, s: string): string {
@@ -350,6 +354,29 @@ export const STRING_READ_HELPERS: readonly StringReadHelper[] = [
         `}`,
       ];
     },
+  },
+  {
+    // The string iterator's step at byte `%b`, a character start below the
+    // byte count: an ASCII byte is the table entry for it; any other lead
+    // byte takes the runtime, which copies the character's bytes.
+    decl: STRING_CP_AT_BYTE_DECL,
+    define: (sz, attrs) => [
+      `define internal ptr @sc_str_cp_at_byte(ptr %s, i64 %b) ${attrs} {`,
+      `entry:`,
+      `  %data = getelementptr inbounds %ScrStr, ptr %s, i32 1`,
+      `  %p = getelementptr inbounds i8, ptr %data, i64 %b`,
+      `  %byte = load i8, ptr %p`,
+      `  %ascii = icmp sge i8 %byte, 0`,
+      `  br i1 %ascii, label %read, label %slow`,
+      `read:`,
+      `  %code = zext i8 %byte to i64`,
+      `  %char = getelementptr inbounds [128 x { ${sz}, ${sz}, ${sz}, [2 x i8] }], ptr @sc_ascii_chars, i64 0, i64 %code`,
+      `  ret ptr %char`,
+      `slow:`,
+      `  %r = call ptr @scr_str_cp_at_byte(ptr %s, i64 %b) nounwind willreturn`,
+      `  ret ptr %r`,
+      `}`,
+    ],
   },
   {
     // An exact integer index, as for sc_str_char_code_at_int. Requested

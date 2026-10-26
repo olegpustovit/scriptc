@@ -4,7 +4,7 @@
  * longer than FRAME_MAX_WIDTH (minified sources) shows a window of that
  * width around the diagnostic's column, with "…" where text is cut.
  */
-import type { ScrDiagnostic } from "./diagnostic.js";
+import { isTypePatchCode, type ScrDiagnostic } from "./diagnostic.js";
 
 export interface RenderOptions {
   color?: boolean;
@@ -157,7 +157,20 @@ export function renderDiagnostics(
  * settings in the project's scriptc configuration (SC8004), which builds do
  * not use. */
 export function isWarningCode(code: string): boolean {
-  return /^SC6\d{3}$/.test(code) || code === "SC8004";
+  return /^SC6\d{3}$/.test(code) || code === "SC8004" || isTypePatchCode(code);
+}
+
+/** A build's type patch warnings (SC8030–SC8033). */
+export function renderTypePatchWarnings(
+  diags: readonly ScrDiagnostic[],
+  sourceTextByFile: Map<string, string>,
+  opts: RenderOptions = {},
+): string {
+  const n = diags.length;
+  return (
+    renderDiagnostics([...diags], sourceTextByFile, opts) +
+    `\n\n${n} warning${n === 1 ? "" : "s"}: ${n === 1 ? "this type patch" : "these type patches"} did not apply as written; the build uses the package's own declarations there.`
+  );
 }
 
 /** A build's SC8004 warnings: the unknown scriptc settings it ignored. */

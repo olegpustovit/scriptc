@@ -618,6 +618,28 @@ function writesLocal(body: IrStmt[], localId: string): boolean {
   });
 }
 
+/** The counter of a `for` loop that its condition reads and its update
+ * steps by a constant, when nothing else in the loop writes it: each test
+ * of the condition then sees a different value. The local must not be
+ * boxed (a closure could write it). */
+export function steppedLoopCounter(
+  stmt: IrStmt & { kind: "for" },
+  locals: ReadonlyMap<string, IrLocal>,
+): { ref: IrExpr & { kind: "varRef" }; step: number } | null {
+  const cond = stmt.cond;
+  if (cond?.kind !== "bin") return null;
+  for (const side of [cond.left, cond.right]) {
+    if (side.kind !== "varRef") continue;
+    const local = locals.get(side.localId);
+    if (local === undefined || local.boxed) continue;
+    const step = constantStep(stmt.update, side.localId);
+    if (step === null || writesLocal(stmt.body, side.localId)) continue;
+    if (writesLocal([{ kind: "exprStmt", expr: cond, loc: cond.loc }], side.localId)) continue;
+    return { ref: side, step };
+  }
+  return null;
+}
+
 function isUnitIncrement(update: IrStmt | null, localId: string): boolean {
   // The frontend normally lowers `i++` to `i = i + 1` before backend
   // emission. Accept the incDec form too so this analysis remains valid for
