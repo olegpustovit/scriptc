@@ -264,6 +264,8 @@ export function forkTargetPaths(program: ts.Program, files: readonly ts.SourceFi
   const seen = new Set<string>();
   for (const sourceFile of files) {
     if (sourceFile.isDeclarationFile || sourceFile.fileName.endsWith(".json")) continue;
+    // A fork call names a child_process import (forkCallModulePath): skip files without one.
+    if (!sourceFile.text.includes("child_process")) continue;
     ts.walkPreorder(sourceFile, (node) => {
       if (!ts.isCallExpression(node)) return undefined;
       const target = forkCallModulePath(program, node);
