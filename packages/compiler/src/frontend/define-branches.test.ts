@@ -112,6 +112,32 @@ if (process.env.OTHER === "production") f();
 if (process.env.NODE_ENV === "production") f();
 `),
   ).toBeNull();
+  // An imported binding named process shadows the global too.
+  for (const binding of [
+    `import process from "./fake-process.js";`,
+    `import * as process from "./fake-process.js";`,
+    `import { process } from "./fake-process.js";`,
+    `import { fake as process } from "./fake-process.js";`,
+  ]) {
+    expect(
+      nodeFrontendServices().definedBranches(
+        `${binding}
+if (process.env.NODE_ENV === "production") f();
+`,
+        "/pkg/index.mjs",
+        defines,
+      ),
+    ).toBeNull();
+  }
+  expect(
+    nodeFrontendServices().definedBranches(
+      `import { other } from "./fake-process.js";
+if (process.env.NODE_ENV === "production") f();
+`,
+      "/pkg/index.mjs",
+      defines,
+    ),
+  ).not.toBeNull();
 });
 
 test("an untaken branch's var names stay declared", () => {

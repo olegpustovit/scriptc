@@ -34,7 +34,7 @@ export function mayReadDefine(source: string, defines: Defines): boolean {
 
 /** The module text with each decided `if` resolved, or null when none is. */
 export function resolveDefinedBranches(sf: ts.SourceFile, defines: Defines): string | null {
-  if (countDeclarations(sf, "process") > 0) return null;
+  if (countDeclarations(sf, "process") > 0 || importsBinding(sf, "process")) return null;
   const edits: { start: number; end: number; text: string }[] = [];
   const replace = (start: number, end: number, text: string): void => {
     edits.push({ start, end, text });
@@ -91,6 +91,23 @@ function padded(replaced: string, text: string): string {
   const blank = replaced.replace(/[^\r\n]/g, " ");
   const at = blank.indexOf(" ".repeat(text.length));
   return at < 0 ? text + blank : blank.slice(0, at) + text + blank.slice(at + text.length);
+}
+
+/** Whether a top-level import binds `name` locally (`import name from`,
+ * `import * as name from`, `import { x as name } from`), which shadows the
+ * global as a declaration does. */
+function importsBinding(sf: ts.SourceFile, name: string): boolean {
+  return sf.statements.nodes.some((s) => {
+    if (ts.isImportEqualsDeclaration(s)) return s.name.text === name;
+    if (!ts.isImportDeclaration(s) || s.importClause === undefined) return false;
+    const clause = s.importClause;
+    if (clause.name?.text === name) return true;
+    const bindings = clause.namedBindings;
+    if (bindings === undefined) return false;
+    return ts.isNamespaceImport(bindings)
+      ? bindings.name.text === name
+      : bindings.elements.nodes.some((element) => element.name.text === name);
+  });
 }
 
 /** The value of a condition operand `--define` decides, or null. */
