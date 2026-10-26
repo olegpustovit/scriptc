@@ -1,9 +1,9 @@
 /* Cold throw stubs for tail-called throw paths (LlEmitter.tailThrow).
  *
  * A throw path that leaves the function right after the runtime throw call
- * (`call void @scr_throw_*(…)`, then `ret <dummy>` or the unwinding raise)
- * becomes `tail call @stub(…)` + `ret`: the stub makes the same call and
- * ends with the same terminator. The site compiles to a jump, so the path
+ * (one of the scr_throw_* functions, then `ret <dummy>` or the unwinding
+ * raise) becomes `tail call @stub(…)` + `ret`: the stub makes the same call
+ * and ends with the same terminator. The site compiles to a jump, so the path
  * needs no stack frame of its own. */
 
 /** One stub: the runtime throw it calls, its parameter types, and how it
@@ -46,7 +46,7 @@ function splitArgs(text: string): string[] | null {
   return out;
 }
 
-/** The runtime throw call on an emitted line (`  call void @scr_throw_x(…)`,
+/** The runtime throw call on an emitted line (a call of a scr_throw_* function,
  * optionally `nounwind`, a debug attachment and a comment), or null when the
  * line is something else or its arguments are not plain typed values. */
 export function parseThrowCall(
